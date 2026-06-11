@@ -65,35 +65,46 @@ Two files per vault (paths from passless-key, as today):
   <config_dir>/Photon/<derived>.vsf       mirror A
   <data_dir>/Photon/<derived>.vsf         mirror B
 
-Inside each file, block-addressed geometry (4KB blocks):
+Inside each file, block-addressed geometry (4KB blocks). NO SUPERBLOCK —
+geometry is constant, exactly like the kernel layout ("hardcoded
+power-of-two-aligned geometry from byte zero", RING.md):
 
 Block range        Size      Purpose
 ──────────────────────────────────────────────
-0                  4KB       Superblock: full-spec VSF document
-                             (z y b l hp — no rolling hash). l = total
-                             vault file length; geometry fields declare
-                             spine N + tract blocks. Written at format,
-                             never rewritten. vsfinfo-inspectable.
-1 .. 256           1MB       Spine ring (N = 256, matches kernel STEM)
-257 .. end         64MB      Tract (plow-managed), default 16384 blocks
+0 .. 255           1MB       Spine ring (N = 256, matches kernel STEM)
+256 .. end         64MB+     Tract (plow-managed); capacity = file size,
+                             default 16384 blocks, grows by fallocate
+
+Every former superblock job has a better home:
+  spine N           constant (256, spec law — same as kernel STEM)
+  tract capacity    the file's own length (fs metadata; kernel profile
+                    reads partition offsets — geometry from context in
+                    both worlds)
+  format version    per-entry schema id (d("custodes.spine")) — dialect
+                    bumps can land at a generation boundary instead of
+                    demanding a fresh file
+  truncation guard  spine head's plow position implies minimum file
+                    size; plow ≤ file_end checked at open
+  identity          every block is RÅ-or-Empty, as everywhere else
 
 No custom magic anywhere: every block is a VSF document and RÅ is the
-magic — superblock included. One identity system, one liveness scan,
-one deletion rule (zero the magic). Interior blocks use the vsf-mini
-profile per RING.md/VAULT.md (RÅ<hp ...> + EWE fields, no z/y/b/l);
-the file's dialect is declared once by the superblock's z and inherited.
-Geometry authority is the superblock, never the filesystem — fs st_size
-is a cross-check (shorter than l → truncated → loud error). The kernel
-profile has no filesystem to ask; self-declared length is the only model
-that works in both worlds.
+magic. One identity system, one liveness scan, one deletion rule (zero
+the magic). All blocks use the vsf-mini profile per RING.md/VAULT.md
+(RÅ<hp ...> + EWE fields, no z/y/b/l).
+
+Anti-clobber rule (the protection the superblock implicitly provided,
+now explicit): genesis/auto-format is legal ONLY when the ring region
+is all-Empty and the file size is sane. A ring full of Corrupt blocks
+means "not ours, or wrecked" → refuse loudly, never format over it.
+The Corrupt ≠ Empty distinction doing one more job.
 
 No seed/stem/state/ledger regions — host vaults are vaults, not boot
-devices. The superblock is the only fixed-position block; written once
-at format time, never rewritten (geometry changes = resize, below).
+devices. No privileged block of any kind: ring slots 0..255, then
+tract, uniform rules everywhere.
 ```
 
 Differences from kernel profile, exhaustively:
-- Superblock instead of hardcoded partition offsets (file has no GPT).
+- Tract capacity from file size instead of partition offsets.
 - Spine N=256 not 65536 (host vaults commit less; head search 8 reads).
   256 commit generations of rollback depth + wear rotation; long version
   history is the ledger's job, not the spine's. Matches the kernel STEM
@@ -329,8 +340,8 @@ verified_replicate(src, dst):                ← the ONE primitive
             for each live node/object/furrow block:
               read src → verify → compare dst at same lba → skip or
               write-verify to dst
-  plow/superblock: write-verify dst superblock at format only;
-            dst plow position = src plow (recorded in spine head)
+  plow:   dst plow position = src plow (recorded in spine head);
+          dst file preallocated to src's size before replication
 
 Properties:
   I/O proportional to LIVE + DIVERGED data, not device size.
@@ -344,8 +355,10 @@ Three situations, one primitive:
 
 ```
 Catch-up      (gen_A ≠ gen_B):        verified_replicate(winner, loser)
-Fresh mirror  (file missing/corrupt): format superblock, then same
-Resize        (bigger tract needed):  format new file with new geometry,
+Fresh mirror  (file missing/corrupt): preallocate empty file, then same
+Grow tract    (the common resize):    fallocate more zeroed blocks —
+                                      no replication needed at all
+Shrink tract  (rare):                 new smaller file,
                                       verified_replicate(old, new),
                                       atomic rename into place
 ```
