@@ -72,8 +72,9 @@ power-of-two-aligned geometry from byte zero", RING.md):
 Block range        Size      Purpose
 ──────────────────────────────────────────────
 0 .. 255           1MB       Spine ring (N = 256, matches kernel STEM)
-256 .. end         64MB+     Tract (plow-managed); capacity = file size,
-                             default 16384 blocks, grows by fallocate
+256 .. end         64MB+     Tract (plow-managed), disjoint from ring,
+                             lbas tract-relative; default 16384 blocks,
+                             grows by fallocate + commit
 
 Every former superblock job lives in the spine entries themselves —
 each entry is a complete commit object carrying its own geometry
@@ -119,10 +120,15 @@ RÅ<hp{entry_hash}>                  SELF hash: BLAKE3 of body, padding
   [gen(u{generation})]              full EWE, arbitrary, no ceiling
   [prev_hash(hp{hash})]             chain; genesis = hp([0u8;32])
   [ring(u{r})]                      N = 1<<r        r=8 host & kernel STEM
-  [tract(u{t})]                     blocks = 1<<t   t=14 default (64MB)
+  [tract(u{blocks})]                tract length in blocks — full EWE,
+                                    ARBITRARY (kernel tract = "rest of
+                                    device", never a power of two)
   [hamt_root(h{hash} u{lba})]       CONTENT hash: Merkle root of the
-                                    entire vault state + its location
-  [plow(u{lba})]                    tract write head
+                                    entire vault state + its location.
+                                    lba is TRACT-RELATIVE
+  [plow(u{lba})]                    tract write head, TRACT-RELATIVE;
+                                    wraps at tract length (one compare
+                                    per rotation — masks not needed here)
   [eagle_time(e{t})]                caller clock
 
 ~160 bytes of 4096. Kernel profile appends ledger_head / kernel_hash /
@@ -130,15 +136,22 @@ kernel_sig to the same format — EWE named fields, readers skip unknown
 fields, one format both worlds.
 ```
 
-**Exponent rule**: any quantity that is power-of-two BY LAW (ring size,
-tract capacity) is stored as its log2 in a tiny EWE uint — u3{8} not
-u4{256}, 2 bytes flat forever, and invalid geometries are
-UNREPRESENTABLE: there is no encoding for a non-power-of-two ring.
-Same trick EWE itself plays one level down (its size characters are
-log2 of bit-widths). Quantities arbitrary by nature (generation, lbas,
-plow, counts) stay full EWE, no ceiling. The tract being 2^t is law in
-its own right: the tract is a ring too, and the plow wraps by AND-mask
-exactly like slot placement in the spine.
+**Exponent rule**: quantities that are power-of-two BY LAW are stored
+as their log2 in a tiny EWE uint — u3{8} not u4{256}, 2 bytes flat
+forever, invalid values UNREPRESENTABLE. Same trick EWE itself plays
+one level down (its size characters are log2 of bit-widths). The ring
+is the only such quantity: N's power-of-two-ness is load-bearing
+(bisect + g & (N-1) placement on every access). The tract length is
+ARBITRARY — the kernel tract is "whatever remains of the device"
+(~230GB, never a power of two), and the plow wraps once per rotation
+(a compare, not a hot mask). Generation, lbas, counts: full EWE.
+
+**Tract-relative addressing**: every lba in spine entries, HAMT nodes,
+and extent lists is 0-based WITHIN the tract. A tract pointer that
+addresses the ring region is unrepresentable, not merely invalid.
+Device offset = tract_base + lba (tract_base = N on host, G#C0000 on
+ferros) — so entry/node/extent bytes carry no absolute device offsets
+and are identical wherever the tract physically sits.
 
 **Bootstrap, OS-free** (9 reads to full knowledge):
 ```
@@ -146,17 +159,17 @@ exactly like slot placement in the spine.
    Corrupt? walk forward to first Valid. All Empty? pre-genesis →
    profile defaults, format (anti-clobber rule applies).
 2. head_search over N = 1<<r                                  (8 reads)
-3. Head entry → tract t, plow, hamt_root
-4. Cross-checks: gen & (N-1) == slot; plow < 1<<t;
-   host-only: fs_len ≥ ((1<<r) + (1<<t)) × 4096 → else loud
+3. Head entry → tract length, plow, hamt_root
+4. Cross-checks: gen & (N-1) == slot; plow < tract_blocks;
+   host-only: fs_len ≥ ((1<<r) + tract_blocks) × 4096 → else loud
    truncation error. The fs is a witness, never the authority.
 ```
 
-**Growth is a transaction**: fallocate to 2^(t+1), THEN commit a spine
-entry carrying tract(t+1). Power loss between the two → unclaimed
-zeroed space, committed geometry still old, nothing dangles. Geometry
-changes inherit the same killswitch semantics as every other write —
-which a write-once superblock could never offer.
+**Growth is a transaction**: fallocate any increment, THEN commit a
+spine entry carrying the new tract length. Power loss between the two
+→ unclaimed zeroed space, committed geometry still old, nothing
+dangles. Geometry changes inherit the same killswitch semantics as
+every other write — which a write-once superblock could never offer.
 
 Differences from kernel profile, exhaustively:
 - Tract capacity from file size instead of partition offsets.
@@ -411,8 +424,8 @@ Three situations, one primitive:
 ```
 Catch-up      (gen_A ≠ gen_B):        verified_replicate(winner, loser)
 Fresh mirror  (file missing/corrupt): preallocate empty file, then same
-Grow tract    (the common resize):    fallocate to 2^(t+1), then commit
-                                      entry with tract(t+1) — no
+Grow tract    (the common resize):    fallocate any increment, commit
+                                      entry with new tract length — no
                                       replication (Spine Entry Format)
 Shrink tract  (rare):                 new smaller file,
                                       verified_replicate(old, new),
