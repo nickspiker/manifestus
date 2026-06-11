@@ -1,4 +1,4 @@
-//! Error type for vsf-db Layer 0.
+//! Error type for custodes Layer 0.
 
 use std::io;
 
@@ -23,7 +23,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Io(e) => write!(f, "I/O: {}", e),
-            Error::BadMagic => write!(f, "not a vsf-db file (bad magic)"),
+            Error::BadMagic => write!(f, "not a custodes file (bad magic)"),
             Error::UnsupportedVersion(v) => write!(f, "unsupported format version: {}", v),
             Error::Hmac => write!(f, "HMAC verification failed"),
             Error::Corrupt(s) => write!(f, "corrupt: {}", s),

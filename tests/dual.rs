@@ -1,7 +1,7 @@
 //! Dual-ring behavior: healing, divergence, degraded tracking.
 
 use tempfile::TempDir;
-use vsf_db::DualStore;
+use custodes::DualStore;
 
 const ANCHOR: [u8; 32] = [0xCDu8; 32];
 
@@ -29,7 +29,7 @@ fn both_rings_written() {
     }
     // Open each ring individually as a single Store — both must hold the value.
     for p in &paths {
-        let mut s = vsf_db::Store::open_or_create(p, &ANCHOR).unwrap();
+        let mut s = custodes::Store::open_or_create(p, &ANCHOR).unwrap();
         assert_eq!(s.get(&[2u8; 32]).unwrap(), Some(b"both".to_vec()), "ring {:?} missing the write", p);
     }
 }
@@ -47,7 +47,7 @@ fn missing_ring_heals_on_open() {
     assert_eq!(d.get(&[3u8; 32]).unwrap(), Some(b"survives".to_vec()));
     // Healed ring 1 must now hold the data too.
     drop(d);
-    let mut s1 = vsf_db::Store::open_or_create(&paths[1], &ANCHOR).unwrap();
+    let mut s1 = custodes::Store::open_or_create(&paths[1], &ANCHOR).unwrap();
     assert_eq!(s1.get(&[3u8; 32]).unwrap(), Some(b"survives".to_vec()));
 }
 
@@ -71,7 +71,7 @@ fn torn_tail_ring_heals_via_seq() {
     assert_eq!(d.get(&[5u8; 32]).unwrap(), Some(b"second".to_vec()));
     // And ring 1 must be healed to hold both as well.
     drop(d);
-    let mut s1 = vsf_db::Store::open_or_create(&paths[1], &ANCHOR).unwrap();
+    let mut s1 = custodes::Store::open_or_create(&paths[1], &ANCHOR).unwrap();
     assert_eq!(s1.get(&[5u8; 32]).unwrap(), Some(b"second".to_vec()));
 }
 
@@ -82,14 +82,14 @@ fn garbage_ring_repaired_from_survivor() {
         let mut d = DualStore::open_or_create(paths.clone(), &ANCHOR).unwrap();
         d.put([6u8; 32], b"good", 0, None, 0).unwrap();
     }
-    // Replace ring 1 with a non-vsf-db file (bad magic).
+    // Replace ring 1 with a non-custodes file (bad magic).
     std::fs::write(&paths[1], b"this is not a vault").unwrap();
 
     let mut d = DualStore::open_or_create(paths.clone(), &ANCHOR).unwrap();
     assert!(d.degraded(), "hard repair should flag degraded");
     assert_eq!(d.get(&[6u8; 32]).unwrap(), Some(b"good".to_vec()));
     drop(d);
-    let mut s1 = vsf_db::Store::open_or_create(&paths[1], &ANCHOR).unwrap();
+    let mut s1 = custodes::Store::open_or_create(&paths[1], &ANCHOR).unwrap();
     assert_eq!(s1.get(&[6u8; 32]).unwrap(), Some(b"good".to_vec()), "ring 1 rebuilt from survivor");
 }
 
@@ -102,13 +102,13 @@ fn divergent_seqs_converge_to_higher() {
     }
     // Write extra records to ring 0 only (simulates crash between ring writes).
     {
-        let mut s0 = vsf_db::Store::open_or_create(&paths[0], &ANCHOR).unwrap();
+        let mut s0 = custodes::Store::open_or_create(&paths[0], &ANCHOR).unwrap();
         s0.put([8u8; 32], b"only-in-0", 0, None, 0).unwrap();
     }
     let mut d = DualStore::open_or_create(paths.clone(), &ANCHOR).unwrap();
     assert_eq!(d.get(&[8u8; 32]).unwrap(), Some(b"only-in-0".to_vec()));
     drop(d);
-    let mut s1 = vsf_db::Store::open_or_create(&paths[1], &ANCHOR).unwrap();
+    let mut s1 = custodes::Store::open_or_create(&paths[1], &ANCHOR).unwrap();
     assert_eq!(s1.get(&[8u8; 32]).unwrap(), Some(b"only-in-0".to_vec()), "lower-seq ring caught up");
 }
 
@@ -121,7 +121,7 @@ fn delete_applies_to_both_rings() {
         d.delete(&[9u8; 32], 0).unwrap();
     }
     for p in &paths {
-        let mut s = vsf_db::Store::open_or_create(p, &ANCHOR).unwrap();
+        let mut s = custodes::Store::open_or_create(p, &ANCHOR).unwrap();
         assert_eq!(s.get(&[9u8; 32]).unwrap(), None, "ring {:?} should have the tombstone", p);
     }
 }

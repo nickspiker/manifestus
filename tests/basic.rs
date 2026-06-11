@@ -1,7 +1,7 @@
 //! Layer 0 storage behavior under no-clean-shutdown assumptions.
 
 use tempfile::TempDir;
-use vsf_db::Store;
+use custodes::Store;
 
 const ANCHOR: [u8; 32] = [0xABu8; 32];
 
