@@ -10,10 +10,12 @@
 //! - **Sub-100 MB target**: the in-memory pointer table is rebuilt on every open by scanning the file. Fine for vault-scale data; if vsf-db ever grows past that scale we'll persist the index.
 //! - **No encryption in this layer**: bodies are opaque bytes. Encrypt at the caller level if you want it (e.g. photon-vault layers per-entry AEAD on top).
 
+pub mod dual;
 pub mod error;
 pub mod record;
 pub mod store;
 
+pub use dual::DualStore;
 pub use error::{Error, Result};
 pub use record::{EntryKey, FLAG_EXPIRES, FLAG_PINNED, FLAG_TOMBSTONE};
 pub use store::{EntryMeta, Store};
