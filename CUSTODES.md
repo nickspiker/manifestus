@@ -129,6 +129,9 @@ RÅ<hp{entry_hash}>                  SELF hash: BLAKE3 of body, padding
   [plow(u{lba})]                    tract write head, TRACT-RELATIVE;
                                     wraps at tract length (one compare
                                     per rotation — masks not needed here)
+  [live(u{blocks})]                 live tract blocks — every COW edit
+                                    knows its delta, so the counter is
+                                    free; feeds the spin trigger
   [eagle_time(e{t})]                caller clock
 
 ~160 bytes of 4096. Kernel profile appends ledger_head / kernel_hash /
@@ -164,6 +167,16 @@ and are identical wherever the tract physically sits.
    host-only: fs_len ≥ ((1<<r) + tract_blocks) × 4096 → else loud
    truncation error. The fs is a witness, never the authority.
 ```
+
+**Spin (proactive compaction)**: dead = used − live, where used =
+tract length after first wrap (else plow). When dead exceeds 25% of
+the tract, spin: one full proactive plow rotation — relocate live
+forward, trample dead — leaving live data compacted behind the plow
+and free space as one contiguous run ahead. Spinning IS ordinary plow
+operation: relocations batch into ordinary spine commits, so power
+loss mid-spin keeps committed progress and needs no special recovery.
+Trigger evaluated after each commit, never on shutdown. The 25% floor
+bounds write amplification at ~3x worst case.
 
 **Growth is a transaction**: fallocate any increment, THEN commit a
 spine entry carrying the new tract length. Power loss between the two
