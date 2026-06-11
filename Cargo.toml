@@ -1,0 +1,12 @@
+[package]
+name = "vsf-db"
+version = "0.0.0"
+edition = "2021"
+description = "Layer 0 storage primitive: self-validating records, crash-safe append, scan-rebuild on open. Foundation for vault and DB consumers."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+blake3 = "1"
+
+[dev-dependencies]
+tempfile = "3"
