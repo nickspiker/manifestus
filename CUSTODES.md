@@ -75,16 +75,17 @@ Block range        Size      Purpose
 256 .. end         64MB+     Tract (plow-managed); capacity = file size,
                              default 16384 blocks, grows by fallocate
 
-Every former superblock job has a better home:
-  spine N           constant (256, spec law — same as kernel STEM)
-  tract capacity    the file's own length (fs metadata; kernel profile
-                    reads partition offsets — geometry from context in
-                    both worlds)
+Every former superblock job lives in the spine entries themselves —
+each entry is a complete commit object carrying its own geometry
+(see Spine Entry Format below):
+  spine N           ring(u{r}) field, N = 1<<r — bootstrap reads slot 0
+  tract capacity    tract(u{t}) field, blocks = 1<<t — committed
+                    geometry, never trusted from the OS (on ferros we
+                    ARE the OS); fs length is a sanity witness only
   format version    per-entry schema id (d("custodes.spine")) — dialect
                     bumps can land at a generation boundary instead of
                     demanding a fresh file
-  truncation guard  spine head's plow position implies minimum file
-                    size; plow ≤ file_end checked at open
+  truncation guard  fs_len ≥ (1<<r) + (1<<t) blocks at open, else loud
   identity          every block is RÅ-or-Empty, as everywhere else
 
 No custom magic anywhere: every block is a VSF document and RÅ is the
@@ -102,6 +103,60 @@ No seed/stem/state/ledger regions — host vaults are vaults, not boot
 devices. No privileged block of any kind: ring slots 0..255, then
 tract, uniform rules everywhere.
 ```
+
+---
+
+## Spine Entry Format
+
+Each spine entry is a complete commit object — parent pointer, content
+root, geometry, metadata, sealed:
+
+```
+RÅ<hp{entry_hash}>                  SELF hash: BLAKE3 of body, padding
+                                    included — sealed before trusted
+  [d("custodes.spine")]             dialect; a wire break publishes a
+                                    new schema name
+  [gen(u{generation})]              full EWE, arbitrary, no ceiling
+  [prev_hash(hp{hash})]             chain; genesis = hp([0u8;32])
+  [ring(u{r})]                      N = 1<<r        r=8 host & kernel STEM
+  [tract(u{t})]                     blocks = 1<<t   t=14 default (64MB)
+  [hamt_root(h{hash} u{lba})]       CONTENT hash: Merkle root of the
+                                    entire vault state + its location
+  [plow(u{lba})]                    tract write head
+  [eagle_time(e{t})]                caller clock
+
+~160 bytes of 4096. Kernel profile appends ledger_head / kernel_hash /
+kernel_sig to the same format — EWE named fields, readers skip unknown
+fields, one format both worlds.
+```
+
+**Exponent rule**: any quantity that is power-of-two BY LAW (ring size,
+tract capacity) is stored as its log2 in a tiny EWE uint — u3{8} not
+u4{256}, 2 bytes flat forever, and invalid geometries are
+UNREPRESENTABLE: there is no encoding for a non-power-of-two ring.
+Same trick EWE itself plays one level down (its size characters are
+log2 of bit-widths). Quantities arbitrary by nature (generation, lbas,
+plow, counts) stay full EWE, no ceiling. The tract being 2^t is law in
+its own right: the tract is a ring too, and the plow wraps by AND-mask
+exactly like slot placement in the spine.
+
+**Bootstrap, OS-free** (9 reads to full knowledge):
+```
+1. Read slot 0 → Valid? ring exponent r + dialect from it.   (1 read)
+   Corrupt? walk forward to first Valid. All Empty? pre-genesis →
+   profile defaults, format (anti-clobber rule applies).
+2. head_search over N = 1<<r                                  (8 reads)
+3. Head entry → tract t, plow, hamt_root
+4. Cross-checks: gen & (N-1) == slot; plow < 1<<t;
+   host-only: fs_len ≥ ((1<<r) + (1<<t)) × 4096 → else loud
+   truncation error. The fs is a witness, never the authority.
+```
+
+**Growth is a transaction**: fallocate to 2^(t+1), THEN commit a spine
+entry carrying tract(t+1). Power loss between the two → unclaimed
+zeroed space, committed geometry still old, nothing dangles. Geometry
+changes inherit the same killswitch semantics as every other write —
+which a write-once superblock could never offer.
 
 Differences from kernel profile, exhaustively:
 - Tract capacity from file size instead of partition offsets.
@@ -356,8 +411,9 @@ Three situations, one primitive:
 ```
 Catch-up      (gen_A ≠ gen_B):        verified_replicate(winner, loser)
 Fresh mirror  (file missing/corrupt): preallocate empty file, then same
-Grow tract    (the common resize):    fallocate more zeroed blocks —
-                                      no replication needed at all
+Grow tract    (the common resize):    fallocate to 2^(t+1), then commit
+                                      entry with tract(t+1) — no
+                                      replication (Spine Entry Format)
 Shrink tract  (rare):                 new smaller file,
                                       verified_replicate(old, new),
                                       atomic rename into place
