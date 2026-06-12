@@ -7,6 +7,8 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 blake3 = "1"
+# EWE + typed fields for spine entries / furrows / HAMT nodes. No text features — the engine uses d/u/h/e types only, never x.
+vsf = { version = "0.8", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"

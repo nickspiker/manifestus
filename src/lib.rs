@@ -17,6 +17,7 @@ pub mod error;
 pub mod host;
 pub mod mirror;
 pub mod record;
+pub mod ring;
 pub mod store;
 
 pub use block::{Block, BlockDev, BLOCK, ZERO_BLOCK};
@@ -24,6 +25,7 @@ pub use dual::DualStore;
 #[cfg(unix)]
 pub use host::FileDev;
 pub use mirror::Mirror;
+pub use ring::{any_sealed_block, block_is_sealed, classify, zero_ring, Classified, Ring, SpineEntry, FENCE_K, HOST_RING_LOG2};
 pub use error::{Error, Result};
 pub use record::{EntryKey, FLAG_EXPIRES, FLAG_PINNED, FLAG_TOMBSTONE};
 pub use store::{EntryMeta, Store};
