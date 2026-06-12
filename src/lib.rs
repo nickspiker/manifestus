@@ -13,6 +13,7 @@
 pub mod block;
 pub mod dual;
 pub mod error;
+pub mod hamt;
 #[cfg(unix)]
 pub mod host;
 pub mod mirror;
@@ -26,6 +27,7 @@ pub use dual::DualStore;
 #[cfg(unix)]
 pub use host::FileDev;
 pub use mirror::Mirror;
+pub use hamt::{lone_capacity, Delta, Hamt};
 pub use tract::{sealed_hp, Advance, Liveness, Reloc, Tract};
 pub use ring::{any_sealed_block, block_is_sealed, classify, zero_ring, Classified, Ring, SpineEntry, FENCE_K, HOST_RING_LOG2};
 pub use error::{Error, Result};
