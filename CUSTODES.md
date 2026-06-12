@@ -96,19 +96,30 @@ the magic). All blocks use the vsf-mini profile per RING.md/VAULT.md
 
 Genesis rule (Nick's ruling): the passless-derived filename IS the
 ownership proof — a 43-char blake3 name in our app dir is
-definitionally ours, so there is no foreign file to protect.
-Decided at MIRROR scope, after consulting both sides:
-  any Valid entry on either side  → real vault: open/replicate/recover,
-                                    NEVER format (a whole nother story)
-  zero Valid entries, both sides  → trash or fresh: zero the entire
-                                    ring region (Corrupt → Empty, so
-                                    future head searches never pay the
-                                    branch-on-corrupt cost for stale
-                                    wreckage), then genesis
-Recovery-ladder hook (later, same decision point): an all-trash ring
-over a surviving tract is recoverable via VAULT.md full recovery
-(linear tract scan, rebuild HAMT from hp-valid blocks); v0 logs and
-proceeds to genesis.
+definitionally ours, so there is no foreign file to protect. The
+trash-vs-real determination scans THE WHOLE FILE — every 4KB-aligned
+block, both mirrors — because a valid block is its own proof: an
+hp-sealed RÅ document arising in garbage is a 2^-256 event. No
+geometry knowledge needed to know whether anything real is present;
+geometry comes FROM whatever valid entries the scan finds (ring field
+of any spine entry; the largest power of two ≤ file blocks brackets
+the ring search if slot-0 bootstrap found nothing). Decided at MIRROR
+scope:
+  any valid block, either side,   → real vault: open/replicate/recover
+  anywhere in the file               (spine entries, HAMT nodes,
+                                     furrows all count), NEVER format
+  zero valid blocks, both files,  → trash or fresh: zero the ring
+  exhaustively                       region (Corrupt → Empty, so head
+                                     searches never pay branch-on-
+                                     corrupt tax for stale wreckage),
+                                     then genesis
+Cost: ~17k BLAKE3 reads for a 65MB vault, tens of ms, paid only on
+the path that ends in "this file contains nothing" — approximately
+once per vault per lifetime.
+Recovery-ladder hook (later, same decision point): valid tract blocks
+under a dead spine are recoverable via VAULT.md full recovery (linear
+tract scan, rebuild HAMT from hp-valid blocks); v0 logs what it found
+and refuses format whenever anything valid exists.
 
 No seed/stem/state/ledger regions — host vaults are vaults, not boot
 devices. No privileged block of any kind: ring slots 0..255, then
