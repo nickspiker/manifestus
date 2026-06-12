@@ -178,6 +178,21 @@ loss mid-spin keeps committed progress and needs no special recovery.
 Trigger evaluated after each commit, never on shutdown. The 25% floor
 bounds write amplification at ~3x worst case.
 
+**Rollback fence (k = 4)**: a relocated or dead block's old location
+may not be overwritten until the spine head is ≥ k generations past
+the commit that orphaned it. In the single-plow model the consumed
+region and the written region of a generation are the same blocks, so
+the rule reduces to plow positions alone: head(G) may not advance past
+head(G−k) + one full lap — a complete tract rotation requires ≥ k
+spine commits. Enforcement state is already durable: the last k spine
+entries record their plow positions and survive power loss by
+construction; crash mid-spin → reopen → fence rebuilt from the ring
+itself. Theorem: the last k generations are ALWAYS fully restorable —
+every block any of them references, old and new locations alike, is
+physically intact. Spin satisfies the fence naturally (one commit per
+relocation batch); steady-state writes only feel it on a pathologically
+full tract, where it forces interleaved commits — correct anyway.
+
 **Growth is a transaction**: fallocate any increment, THEN commit a
 spine entry carrying the new tract length. Power loss between the two
 → unclaimed zeroed space, committed geometry still old, nothing
