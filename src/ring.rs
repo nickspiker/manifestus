@@ -23,7 +23,7 @@ pub const SCHEMA: &str = "custodes.spine";
 pub const HOST_RING_LOG2: u8 = 8;
 
 /// Rollback fence depth: the last K generations are always fully restorable.
-pub const FENCE_K: u64 = 4;
+pub const FENCE_K: u64 = 1 << 2;
 
 /// One spine commit object. See CUSTODES.md "Spine Entry Format".
 #[derive(Debug, Clone, PartialEq)]
@@ -108,7 +108,7 @@ impl SpineEntry {
 
         // Seal check before believing a single field.
         if blake3::hash(&block[ptr..]).as_bytes() != stored.as_slice() {
-            return Err(Error::Hmac);
+            return Err(Error::Seal);
         }
 
         let VsfType::d(schema) = parse(block, &mut ptr).map_err(decode_err)? else {
@@ -128,7 +128,7 @@ impl SpineEntry {
         let mut live = None;
         let mut time = None;
 
-        // Named pairs until zero padding ('d' = 0x64; padding = 0x00). Unknown names are parsed-and-skipped — kernel-profile fields ride through.
+        // Named pairs until zero padding ('d' = 0x64; padding = 0x00). Unknown names are parsed-and-skipped — kernel-profile fields ride thru.
         while block.get(ptr) == Some(&b'd') {
             let VsfType::d(name) = parse(block, &mut ptr).map_err(decode_err)? else {
                 return Err(Error::Corrupt("expected field name".into()));
@@ -258,7 +258,7 @@ impl<A: BlockDev, B: BlockDev> Ring<A, B> {
     /// Bootstrap: discover the ring exponent from the file itself. Slot 0 holds generation 0 from the very first commit and is rewritten every lap, so it is Valid in any vault with history; walk a few slots forward past killswitch damage. Returns None on an apparently-empty/trash region — the caller escalates to the whole-file scan (genesis rule).
     pub fn bootstrap_n(mirror: &mut Mirror<A, B>) -> Result<Option<u8>> {
         let mut buf = ZERO_BLOCK;
-        let probe = 16u64.min(mirror.block_count());
+        let probe = (1u64 << 4).min(mirror.block_count());
         for slot in 0..probe {
             mirror.read(slot, &mut buf)?;
             if let Classified::Valid(e) = classify(&buf, slot, None) {
@@ -364,7 +364,7 @@ impl<A: BlockDev, B: BlockDev> Ring<A, B> {
         let mut lo_slot = lo;
         let mut hi = hi;
         while lo < hi {
-            let mid = (lo + hi + 1) / 2;
+            let mid = (lo + hi + 1) >> 1;
             match self.gen_at(mid)? {
                 Classified::Corrupt => {
                     // Ambiguous: no pruning decision possible — search both halves, take the higher generation.

@@ -547,8 +547,8 @@ impl Hamt {
                 Ok(Some(Child::Committed { hash, lba: r.to }))
             }
             Some(Child::Committed { hash, lba }) => {
-                if depth > target_depth.saturating_add(1) {
-                    return Ok(Some(Child::Committed { hash, lba })); // overshoot: not on this path
+                if target_depth != u8::MAX && depth > target_depth + 1 {
+                    return Ok(Some(Child::Committed { hash, lba })); // overshoot: not on this path — real depths are ≤ 51 so the +1 cannot overflow, and the MAX sentinel never overshoots
                 }
                 let Some(doc) = read_doc(mirror, tract, lba, &hash)? else {
                     return Ok(Some(Child::Committed { hash, lba }));
@@ -585,7 +585,7 @@ impl Hamt {
         _index: u64,
         r: &Reloc,
     ) -> Result<()> {
-        // The furrow's owner leaf lists its lbas; rebuild the leaf with the moved lba. Find the leaf, rewrite it as a fresh tract block, repoint the index at it. v0: the leaf rewrite rides the next flush via a dirty path with a REBUILT leaf — implemented as read-modify-write through put-like machinery.
+        // The furrow's owner leaf lists its lbas; rebuild the leaf with the moved lba. Find the leaf, rewrite it as a fresh tract block, repoint the index at it. v0: the leaf rewrite rides the next flush via a dirty path with a REBUILT leaf — implemented as read-modify-write thru put-like machinery.
         let Some((leaf_lba, leaf_hash)) = self.find_leaf(mirror, tract, key)? else {
             return Ok(()); // owner already gone (deleted) — orphan furrow, plow will reap
         };
@@ -642,12 +642,12 @@ fn body_start() -> usize {
 
 /// Max lone value: block minus envelope (schema, key field, value field header) with margin for EWE length growth.
 pub fn lone_capacity() -> usize {
-    BLOCK - body_start() - 128
+    BLOCK - body_start() - (1 << 7)
 }
 
 /// Max furrow payload per block.
 pub fn furrow_capacity() -> usize {
-    BLOCK - body_start() - 128
+    BLOCK - body_start() - (1 << 7)
 }
 
 fn encode_lone(key: &[u8; 32], value: &[u8]) -> Block {
@@ -729,7 +729,7 @@ fn read_doc<A: BlockDev, B: BlockDev>(
         return Err(Error::Corrupt(format!("unsealed block at tract lba {lba}")));
     };
     if &hash != expected {
-        return Err(Error::Hmac);
+        return Err(Error::Seal);
     }
     decode_doc(&buf).map(Some)
 }

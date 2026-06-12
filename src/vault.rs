@@ -58,7 +58,7 @@ impl Liveness for LiveSet {
 }
 
 /// Spin trigger: dead > 25% of the tract (CUSTODES.md). One window per commit keeps amplification incremental.
-const SPIN_WINDOW: u64 = 64;
+const SPIN_WINDOW: u64 = 1 << 6;
 
 pub struct Vault<A: BlockDev, B: BlockDev> {
     ring: Ring<A, B>,
@@ -249,8 +249,9 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
 
         // Spin trigger: dead > 25% of tract → one window per commit (incremental, bounded amplification).
         let used = self.tract.plow.min(self.tract.len);
-        let dead = used.saturating_sub(self.live.len() as u64);
-        if dead * 4 > self.tract.len {
+        // live ≤ used: every live-map key is a distinct tract position the plow has already written.
+        let dead = used - self.live.len() as u64;
+        if dead << 2 > self.tract.len {
             let spin = {
                 let Self { ring, tract, live, .. } = self;
                 tract.spin_window(ring.mirror(), live, SPIN_WINDOW)

@@ -260,7 +260,8 @@ fn ring_kill_child_worker() {
 
 #[test]
 fn ring_survives_kill_nine_and_resumes() {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
+    use vsf::types::eagle_time::eagle_time_oscillations;
     let exe = std::env::current_exe().unwrap();
     let dir = TempDir::new().unwrap();
     let base = dir.path().join("kill").to_str().unwrap().to_string();
@@ -276,8 +277,9 @@ fn ring_survives_kill_nine_and_resumes() {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        let jitter = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() as u64 % 120;
-        std::thread::sleep(Duration::from_millis(40 + jitter));
+        // Pseudo-random kill delay 32..160ms from the eagle clock's low oscillation bits — no rand dep, no UNIX epoch.
+        let jitter = eagle_time_oscillations() as u64 % (1 << 7);
+        std::thread::sleep(Duration::from_millis((1 << 5) + jitter));
         child.kill().unwrap();
         child.wait().unwrap();
 

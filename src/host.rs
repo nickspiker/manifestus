@@ -100,7 +100,7 @@ impl BlockDev for FileDev {
         self.bounds(lba)?;
         let off = lba * BLOCK as u64;
         if self.direct {
-            // O_DIRECT contract: aligned buffer, aligned offset, aligned length. Caller's buf may be unaligned — bounce through the aligned scratch.
+            // O_DIRECT contract: aligned buffer, aligned offset, aligned length. Caller's buf may be unaligned — bounce thru the aligned scratch.
             self.file.read_exact_at(&mut self.scratch.0, off)?;
             buf.copy_from_slice(&self.scratch.0);
         } else {
@@ -174,7 +174,7 @@ fn preallocate(f: &File, len: u64) -> Result<()> {
         if r == 0 {
             return Ok(());
         }
-        // Filesystem without fallocate support — fall through to sparse.
+        // Filesystem without fallocate support — fall thru to sparse.
     }
     f.set_len(len)?;
     Ok(())

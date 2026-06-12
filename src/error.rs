@@ -1,4 +1,4 @@
-//! Error type for custodes Layer 0.
+//! Error type for the custodes engine.
 
 use std::io;
 
@@ -6,10 +6,9 @@ use std::io;
 pub enum Error {
     Io(io::Error),
     BadMagic,
-    UnsupportedVersion(u32),
-    /// HMAC verification failed for an individual record.
-    Hmac,
-    /// Length redundancy check failed, body truncated, or other structural corruption. Triggers silent truncate at the offending offset during open.
+    /// Seal verification failed — the block's hp does not match BLAKE3 of its body.
+    Seal,
+    /// Structural corruption: misplaced entry, foreign schema, missing fields, broken chain, or geometry violations. Classification paths map this to Corrupt-the-state and trust no byte of the block.
     Corrupt(String),
     /// Read-back verification failed after write — the bytes on the device do not match what was written, even after retry.
     Verify(u64),
@@ -32,8 +31,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "I/O: {}", e),
             Error::BadMagic => write!(f, "not a custodes file (bad magic)"),
-            Error::UnsupportedVersion(v) => write!(f, "unsupported format version: {}", v),
-            Error::Hmac => write!(f, "HMAC verification failed"),
+            Error::Seal => write!(f, "seal verification failed"),
             Error::Corrupt(s) => write!(f, "corrupt: {}", s),
             Error::Verify(lba) => write!(f, "write verification failed at block {}", lba),
             Error::Bounds(lba) => write!(f, "block {} out of device bounds", lba),

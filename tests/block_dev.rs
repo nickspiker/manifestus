@@ -227,7 +227,8 @@ fn kill_child_worker() {
 
 #[test]
 fn kill_nine_leaves_only_valid_or_empty_blocks() {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
+    use vsf::types::eagle_time::eagle_time_oscillations;
     let exe = std::env::current_exe().unwrap();
     let dir = TempDir::new().unwrap();
 
@@ -243,13 +244,9 @@ fn kill_nine_leaves_only_valid_or_empty_blocks() {
             .spawn()
             .unwrap();
 
-        // Pseudo-random kill delay 30..160ms without a rand dep.
-        let jitter = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos() as u64
-            % 130;
-        std::thread::sleep(Duration::from_millis(30 + jitter));
+        // Pseudo-random kill delay 32..160ms from the eagle clock's low oscillation bits — no rand dep, no UNIX epoch.
+        let jitter = eagle_time_oscillations() as u64 % (1 << 7);
+        std::thread::sleep(Duration::from_millis((1 << 5) + jitter));
         child.kill().unwrap(); // SIGKILL — no cleanup, no flush, nothing
         child.wait().unwrap();
 

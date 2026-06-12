@@ -4,7 +4,7 @@
 
 use crate::error::Result;
 
-pub const BLOCK: usize = 4096;
+pub const BLOCK: usize = 1 << 12;
 
 /// One 4KB block. Stack-friendly fixed array; the engine never does partial-block I/O.
 pub type Block = [u8; BLOCK];

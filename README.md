@@ -43,9 +43,8 @@ The consumers here are programs holding secrets; kill the browsing and the entir
 
 ## Built for the killswitch (and the cosmic ray)
 
-ferros has a hardware killswitch: hold two buttons and power is physically cut in under 15 milliseconds, with no notice to software.
-That is the design brief for this engine.
-There is no clean shutdown, no unmount, no journal replay, no fsck, no recovery mode — because the recovery path *is* the open path, exercised on every start:
+ferros has a hardware killswitch: flip that switch and power is instantly cut to ALL circuits, with ZERO notice to software.
+There is no concept of shutdown, no such thing as unmount, there is no journal, no fsck, and no separate recovery because the recovery path *is* the open path, exercised on every start:
 
 - Power loss at any byte boundary is **normal operation**, not an exceptional event with its own code.
 - A spine entry is the transaction commit point; everything between commits is provisional, and orphans classify dead on the next plow pass.
@@ -68,7 +67,7 @@ The same seal check classifies spine entries, index nodes, leaves, and furrows; 
 - **The spine is a hash chain.** Every generation carries its parent's hash and the BLAKE3 Merkle root of the entire vault state. Verifying the head entry authenticates everything beneath it.
 - **A block cannot lie about its generation.** Generation g lives only at slot `g mod N`, so the expected residue is known before a read is trusted; a sealed-but-misplaced entry classifies Corrupt.
 - **The OS is a witness, never the authority.** There is no superblock to forge and no file metadata to trust: geometry (ring exponent, tract length, write head) rides inside every spine entry, and a truncated device is detected against the *committed* geometry, not the other way around.
-- **An unverified byte is not a written byte.** Every write is flushed, read back through the page-cache bypass (O_DIRECT on Linux/Android, F_NOCACHE on macOS), and byte-compared before it counts — verification that reaches media, not verification theater against RAM. The second mirror is not touched until the first verifies.
+- **An unverified byte is not a written byte.** Every write is flushed, read back thru the page-cache bypass (O_DIRECT on Linux/Android, F_NOCACHE on macOS), and byte-compared before it counts — verification that reaches media, not verification theater against RAM. The second mirror is not touched until the first verifies.
 - **A valid block is its own proof.** Trash-vs-real is decided by scanning the whole device for any sealed block (false-positive rate 2⁻²⁵⁶). A vault whose spine was destroyed but whose tract holds sealed data is detected and refused — the engine never formats over something real.
 - **Mirror resync is never a file copy.** `verified_replicate` picks the winner by highest valid generation, then converges the loser block-by-block: hash-compare-skip, write-verified, idempotent, I/O proportional to what actually diverged.
 
@@ -79,7 +78,7 @@ The seal is integrity, not confidentiality — encryption belongs to the layer a
 There is no wear-leveling subsystem and no garbage collector, in the same way there is no recovery mode: the jobs are done by the shape of the thing.
 
 - The spine rotates by `generation & (N−1)` — every slot written exactly once per N commits, uniformity as a mathematical property, no counter block to hot-spot, no mechanism by which wear *could* concentrate.
-- The tract has exactly one write mechanism: a single head advancing through it, visiting every block once per lap. Sequential, log-structured, exactly what flash wants (TRIM hooks fire on wrap in the kernel profile).
+- The tract has exactly one write mechanism: a single head advancing thru it, visiting every block once per lap. Sequential, log-structured, exactly what flash wants (TRIM hooks fire on wrap in the kernel profile).
 - Dead space is reclaimed by the head trampling it on arrival — GC is what advancing *is*. When dead space passes 25% of the tract, the plow takes a proactive lap in bounded windows (64 blocks per commit), so amplification is incremental and capped, never saved up, and nothing ever stops the world.
 - Compaction repairs its own index: relocated blocks self-address (leaves carry their key, furrows their owner, index nodes their depth and route), so a moved block read back at its new home names its own repair path. No reverse-pointer maps, nothing to lose in a crash.
 

@@ -1,7 +1,7 @@
 //! HAMT behavior: COW put/lookup/delete, lone + direct leaves, splits, flush + cold reopen, corruption, relocation repair.
 
 use custodes::block::Block;
-use custodes::{lone_capacity, BlockDev, Delta, FileDev, Hamt, Liveness, Mirror, Tract, ZERO_BLOCK};
+use custodes::{lone_capacity, Delta, FileDev, Hamt, Liveness, Mirror, Tract, ZERO_BLOCK};
 use std::collections::HashMap;
 use tempfile::TempDir;
 
