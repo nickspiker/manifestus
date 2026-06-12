@@ -28,3 +28,22 @@ pub trait BlockDev {
     /// Durability barrier — when this returns, prior writes survive power loss.
     fn flush(&mut self) -> Result<()>;
 }
+
+/// Forwarding impl so borrowed devices compose (verified_replicate wraps `&mut A` / `&mut B` in temporary solo Mirrors).
+impl<D: BlockDev + ?Sized> BlockDev for &mut D {
+    fn block_count(&self) -> u64 {
+        (**self).block_count()
+    }
+    fn read(&mut self, lba: u64, buf: &mut Block) -> Result<()> {
+        (**self).read(lba, buf)
+    }
+    fn write(&mut self, lba: u64, buf: &Block) -> Result<()> {
+        (**self).write(lba, buf)
+    }
+    fn discard(&mut self, lba: u64, count: u64) -> Result<()> {
+        (**self).discard(lba, count)
+    }
+    fn flush(&mut self) -> Result<()> {
+        (**self).flush()
+    }
+}

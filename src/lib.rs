@@ -1,14 +1,10 @@
-//! custodes Layer 0 (LEGACY — superseded by CUSTODES.md architecture) — append-only keyed store with self-validating records and crash-safe recovery.
+//! custodes — the ferros storage engine. Every block guards itself; the guards verify each other.
 //!
-//! This crate ships only the storage primitive ([`Store`]). Higher layers (multi-index manager, query engine, transactions) live in this same crate but are gated behind features and not implemented yet — they come online when a real DB consumer asks for them.
+//! A crash-proof keyed object store over mirrored 4KB block devices: spine ring (generation-numbered commit objects, binary-searched) + tract (plow-managed log ring) + COW HAMT (the index, living in the tract it indexes). Power loss at any byte boundary is normal operation; the committed generation defines exactly what exists.
 //!
-//! # Properties
+//! Layering: [`Vault`] composes [`ring::Ring`] + [`tract::Tract`] + [`hamt::Hamt`] over a [`Mirror`] of [`BlockDev`]s. Host backs devices with [`FileDev`] (O_DIRECT discipline); the ferros kernel backs them with UFS/SD HAL. Design contract: the ferros specs (RING.md / VAULT.md / HAMT.md) + CUSTODES.md.
 //!
-//! - **Append-only writes**: no in-place mutation, ever. Updates supersede; deletes tombstone.
-//! - **Per-record HMAC**: every record self-validates under the caller's `anchor_key`. Torn writes and tampering both surface as decode failures at the affected record.
-//! - **Silent recovery**: `open_or_create` scans front-to-back and truncates at the first invalid record. No `Recovered` variant exposed; callers see a consistent store. Atomicity all the way down.
-//! - **Sub-100 MB target**: the in-memory pointer table is rebuilt on every open by scanning the file. Fine for vault-scale data; if custodes ever grows past that scale we'll persist the index.
-//! - **No encryption in this layer**: bodies are opaque bytes. Encrypt at the caller level if you want it (e.g. photon-vault layers per-entry AEAD on top).
+//! The `record`/`store`/`dual` modules are the LEGACY Layer-0 engine (append-log + scan-rebuild) that photon currently rides; they are superseded by the architecture above and will be removed when photon's FlatStorage reskins onto [`Vault`].
 
 pub mod block;
 pub mod dual;
@@ -21,12 +17,14 @@ pub mod record;
 pub mod ring;
 pub mod store;
 pub mod tract;
+pub mod vault;
 
 pub use block::{Block, BlockDev, BLOCK, ZERO_BLOCK};
 pub use dual::DualStore;
 #[cfg(unix)]
 pub use host::FileDev;
 pub use mirror::Mirror;
+pub use vault::{verified_replicate, LiveSet, Replicated, Vault};
 pub use hamt::{lone_capacity, Delta, Hamt};
 pub use tract::{sealed_hp, Advance, Liveness, Reloc, Tract};
 pub use ring::{any_sealed_block, block_is_sealed, classify, zero_ring, Classified, Ring, SpineEntry, FENCE_K, HOST_RING_LOG2};

@@ -423,6 +423,55 @@ impl Hamt {
         Ok((hash, lba, relocs))
     }
 
+    /// Collect (lba, hash) of every live block reachable from the COMMITTED root: internal nodes, leaves, and furrows. The vault rebuilds its live set with this at open. Dirty state is not walked — call after from_root / flush.
+    pub fn walk_live<A: BlockDev, B: BlockDev>(
+        &mut self,
+        mirror: &mut Mirror<A, B>,
+        tract: &Tract,
+        out: &mut Vec<(u64, [u8; 32])>,
+    ) -> Result<()> {
+        let root = self.root.clone();
+        if let Some(Child::Committed { hash, lba }) = root {
+            self.walk_child(mirror, tract, lba, &hash, out)?;
+        }
+        Ok(())
+    }
+
+    fn walk_child<A: BlockDev, B: BlockDev>(
+        &mut self,
+        mirror: &mut Mirror<A, B>,
+        tract: &Tract,
+        lba: u64,
+        hash: &[u8; 32],
+        out: &mut Vec<(u64, [u8; 32])>,
+    ) -> Result<()> {
+        let Some(doc) = read_doc(mirror, tract, lba, hash)? else {
+            return Ok(()); // fast-deleted leaf: stale pointer, not live
+        };
+        out.push((lba, *hash));
+        match doc {
+            TractDoc::Node(node) => {
+                for c in node.children.iter().flatten() {
+                    if let Child::Committed { hash, lba } = c {
+                        let (h, l) = (*hash, *lba);
+                        self.walk_child(mirror, tract, l, &h, out)?;
+                    }
+                }
+            }
+            TractDoc::Direct { furrows, .. } => {
+                let mut buf = ZERO_BLOCK;
+                for f in furrows {
+                    tract.read(mirror, f, &mut buf)?;
+                    if let Some(fh) = sealed_hp(&buf) {
+                        out.push((f, fh));
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     // ======================================================================== relocation repair =====================================================
 
     /// Apply plow relocations to the index: each relocated block self-addresses (leaf → key, furrow → owner key + index, node → depth + route), so the repair is a directed descent, no reverse maps.

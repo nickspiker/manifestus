@@ -203,6 +203,15 @@ loss mid-spin keeps committed progress and needs no special recovery.
 Trigger evaluated after each commit, never on shutdown. The 25% floor
 bounds write amplification at ~3x worst case.
 
+**Heartbeat generations** (implementation discovery, ruled in): the
+fence can deadlock a tight tract — flushing the index needs tract
+writes, tract writes can be fenced, raising the fence needs new
+generations. Heartbeat entries break the cycle: a generation pointing
+at the CURRENT committed root (same hamt_root, current plow), written
+into the ring region — which the fence never covers. Old plow values
+slide out of the K-window, the fence rises, the flush retries. Commit
+attempts bound the loop at K+2 heartbeats.
+
 **Rollback fence (k = 4)**: a relocated or dead block's old location
 may not be overwritten until the spine head is ≥ k generations past
 the commit that orphaned it. In the single-plow model the consumed
