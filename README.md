@@ -106,9 +106,14 @@ Open source means no security-thru-obscurity — the attacker knows every deriva
 
 - **Leaked vault files (backup, cloud sync): safe.** The files hold ciphertext, and the key-derivation inputs live outside the vault directory — a copy of the files cannot derive its own key.
 - **Another local user: safe.** Vault files are created mode 0600 — the one defense crypto cannot provide, since machine identity is shared across UIDs.
-- **Other apps on a sandboxed OS (Android): strong.** App-private storage plus per-signing-key identity: a malicious app is signed by a different key, derives different secrets, and cannot reach the files anyway.
+- **Other apps on a sandboxed OS (Android): strong-ish.** App-private storage plus per-signing-key identity: a malicious app is signed by a different key, derives different secrets, and cannot reach the files anyway. The "ish": ANDROID_ID's keyspace is tiny, so the strength is the sandbox, not the entropy — the platform secret gates access, it does not survive an attacker who already holds the files *and* the device identity.
 - **A full-disk image with a known handle: broken — use FDE.** Machine identity travels with the image, so the derivation inputs do too. Full-disk encryption is the answer there, not this layer.
 - **Same-user malware on the desktop: not defended, and no file-based scheme can.** A process with your UID has your files, your machine identity, and your public handle — it can recompute every key you can. That is the Unix permission model, not an engine flaw; sandboxed packaging is the real fix on desktops.
+
+The endgame for that last hole is hardware: a write-once key in a physically isolated enclave (PIPE — the ferros hardware anchor) makes the derivation input something no process can read at any privilege.
+Until then the honest posture is the one every desktop user already lives, acknowledged or not: trust your software and your device.
+People install and run literally everything with sudo all day, and that trust — not the permission bits — is the actual security boundary.
+Photon, for the record, never asks for it: the whole stack runs unprivileged.
 
 ## Wear is arithmetic, GC is a side effect
 
