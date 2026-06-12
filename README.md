@@ -2,7 +2,7 @@
 
 **The guards.** Every block guards itself; the guards verify each other. *Quis custodiet ipsos custodes?* They do.
 
-The ferros storage engine: a crash-proof keyed object store over mirrored 4KB block devices. One engine, two worlds — host applications (Photon, Lumis) back it with files; the ferros kernel backs it with UFS/SD. Same blocks, same code, same theorems.
+The ferros storage engine: a crash-proof keyed object store over mirrored 4KB block devices. Built host-first — applications (Photon today, Lumis next) back it with files. The same engine is designed to back the ferros kernel with UFS/SD devices later; that integration has not happened yet, and until it does, "one engine, two worlds" is the destination, not the claim.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -53,7 +53,19 @@ let v = vault.get(&key)?;
 vault.delete(&key, now)?;
 ```
 
-Keys are 32-byte hashes (derive via [passless-key](../passless-key) or BLAKE3 of your logical key). Values up to ~3.9KB inline (lone leaves); larger values shard into furrows transparently.
+Keys are 32-byte hashes — deriving them is your job ([passless-key](../passless-key) or `blake3::derive_key` over your logical key). Values up to ~3.9KB inline (lone leaves); larger values shard into furrows transparently.
+
+## What this is not (yet)
+
+Honesty is the whole ethos here, so:
+
+- **0.0.0.** The API will move. The on-disk format is governed by per-entry schema ids and can evolve at generation boundaries, but don't mistake either for stable.
+- **Unix only.** `FileDev` is `cfg(unix)` (O_DIRECT/F_NOCACHE discipline). Windows needs a FILE_FLAG_NO_BUFFERING backend that doesn't exist yet. Bring your own `BlockDev` elsewhere.
+- **One process, one writer.** No file locking, no concurrent access — two Vaults on the same files is undefined behavior at the application layer. Photon serializes behind a mutex.
+- **Not an encryptor.** The vault stores what you hand it and seals it for INTEGRITY (BLAKE3), not confidentiality. Encrypt above (Photon wraps values in per-key ChaCha20-Poly1305 before they arrive).
+- **Not a database.** Point lookups by 32-byte key. No ranges, no iteration, no queries — deliberately (see HAMT.md, "the only question the vault asks").
+- **Recovery ladder is v0-shallow.** A vault whose spine is destroyed but whose tract holds sealed data is *detected* and refused (never formatted over) — but the full tract-scan rebuild is specified, not implemented.
+- **Kernel profile, no_std core, access()/capability layers**: ferros integration phase, not present.
 
 ## Specs
 
@@ -61,7 +73,7 @@ The design contract lives in the ferros specification set — `RING.md`, `VAULT.
 
 ## Status
 
-Engine complete and kill-tested on the host profile: 77 tests including three kill -9 harnesses (block, ring, vault layers). Photon's `FlatStorage` is the first consumer. Kernel profile (UFS/SD HAL backend, no_std core) is the ferros integration phase.
+Engine complete and kill-tested on the host profile: 51 tests including three kill -9 harnesses (block, ring, and vault layers — the vault one asserts the exact committed prefix survives). Photon's `FlatStorage` rides it as the first consumer; battle-soak in real use precedes any crates.io publish.
 
 ## License
 
