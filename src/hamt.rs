@@ -2,7 +2,7 @@
 //!
 //! 32-way branching, 5 bits of the key per level. Every edit copies the touched path (2-4 nodes) and produces a new root; old roots remain intact and readable — the HAMT root in a spine entry IS the version identifier.
 //!
-//! Engine deviation from HAMT.md's leaf header (flagged in CUSTODES.md): every block is sealed by hp = BLAKE3(body) — the crate's ONE verification rule (plow scan, whole-file scan, ring entries, here). The provenance key lives as a FIELD inside the leaf rather than as the header hash, so lookup compares keys explicitly and the seal stays uniform.
+//! Engine deviation from HAMT.md's leaf header (this doc is the flag, per the README's Specs section): every block is sealed by hp = BLAKE3(body) — the crate's ONE verification rule (plow scan, whole-file scan, ring entries, here). The provenance key lives as a FIELD inside the leaf rather than as the header hash, so lookup compares keys explicitly and the seal stays uniform.
 //!
 //! Self-addressing blocks: internal nodes carry (depth, route — any key beneath them), leaves carry their key, furrows their owner key + index. A relocated block read back from its new position names its own repair path — no reverse-pointer maps, nothing to lose in a crash.
 

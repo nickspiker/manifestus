@@ -1,4 +1,4 @@
-//! The ring — generation-numbered commit objects, binary-searched. RING.md / VAULT_ROOT.md mechanics; CUSTODES.md host resolutions.
+//! The ring — generation-numbered commit objects, binary-searched. RING.md / VAULT_ROOT.md mechanics; host-profile resolutions in the README.
 //!
 //! Each entry is a complete commit object: parent pointer (prev_hash), content root (hamt_root), geometry (ring/tract), write head (plow), health (live), sealed by hp. Generation g lives at slot `g & (N-1)`. Empty is a verification state, not a generation number — None < Some(0), and generation 0 is legal (first commit, slot 0).
 //!
@@ -25,7 +25,7 @@ pub const HOST_RING_LOG2: u8 = 8;
 /// Rollback fence depth: the last K generations are always fully restorable.
 pub const FENCE_K: u64 = 1 << 2;
 
-/// One spine commit object. See CUSTODES.md "Spine Entry Format".
+/// One spine commit object. See README "The commit object".
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpineEntry {
     pub gen: u64,

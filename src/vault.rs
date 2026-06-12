@@ -1,8 +1,8 @@
-//! The vault — spine + tract + HAMT composed into a crash-proof keyed object store. VAULT.md write path, CUSTODES.md host resolutions.
+//! The vault — spine + tract + HAMT composed into a crash-proof keyed object store. VAULT.md write path; host-profile resolutions in the README.
 //!
 //! Commit-per-write by default: `put`/`delete` return durable (a spine entry references the new state on at least one verified mirror). Everything between spine commits is provisional — orphans trample on the next plow pass.
 //!
-//! Open ladder (CUSTODES.md genesis rule):
+//! Open ladder (the genesis rule — README "Security posture"):
 //! 1. Bootstrap: ring exponent from slot 0 (walks past killswitch damage).
 //! 2. Found → head search → geometry/index/live-set from the committed head.
 //! 3. Nothing → WHOLE-FILE scan, both mirrors. Any sealed block anywhere = real vault → refuse to format (recovery ladder, v0 refuses loudly). Zero sealed blocks = trash or fresh → zero the ring, genesis.
@@ -16,6 +16,8 @@ use crate::tract::{Liveness, Reloc, Tract};
 use std::collections::HashMap;
 
 /// The vault's knowledge of what is referenced: tract lba → sealing hash. Rebuilt from the committed HAMT at open; maintained by deltas and relocations afterward. This IS the plow's liveness oracle.
+///
+/// HashMap PROOF (AGENT.md consent: Nick, 2026-06-12): `is_live` is called once per scanned position on every plow advance, and the map holds one entry per live tract block. A linear scan would make one advance O(scanned × live) — a spin lap over a full 4096-block tract with thousands live is millions of compares, every commit, forever. The keys are u64 lbas with no exploitable order at query time (the plow asks about positions, the map is keyed by them), so O(1) point lookup is exactly the structure the access pattern is.
 #[derive(Default)]
 pub struct LiveSet {
     map: HashMap<u64, [u8; 32]>,
@@ -57,7 +59,7 @@ impl Liveness for LiveSet {
     }
 }
 
-/// Spin trigger: dead > 25% of the tract (CUSTODES.md). One window per commit keeps amplification incremental.
+/// Spin trigger: dead > 25% of the tract. One window per commit keeps amplification incremental.
 const SPIN_WINDOW: u64 = 1 << 6;
 
 pub struct Vault<A: BlockDev, B: BlockDev> {
@@ -332,7 +334,7 @@ pub struct Replicated {
     pub tract_copied: u64,
 }
 
-/// CUSTODES.md mirror resync — NEVER a file copy. Block-level, hash-compare-skip, write-verified, idempotent; I/O proportional to live + diverged data. Decides the winner by the highest valid generation found in either spine, then converges the loser: spine slots first, then the winner's committed live set.
+/// Mirror resync — NEVER a file copy. Block-level, hash-compare-skip, write-verified, idempotent; I/O proportional to live + diverged data. Decides the winner by the highest valid generation found in either spine, then converges the loser: spine slots first, then the winner's committed live set.
 pub fn verified_replicate<A: BlockDev, B: BlockDev>(
     a: &mut A,
     b: &mut B,

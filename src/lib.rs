@@ -2,7 +2,7 @@
 //!
 //! A crash-proof keyed object store over mirrored 4KB block devices: spine ring (generation-numbered commit objects, binary-searched) + tract (plow-managed log ring) + COW HAMT (the index, living in the tract it indexes). Power loss at any byte boundary is normal operation; the committed generation defines exactly what exists.
 //!
-//! Layering: [`Vault`] composes [`ring::Ring`] + [`tract::Tract`] + [`hamt::Hamt`] over a [`Mirror`] of [`BlockDev`]s. Host backs devices with [`FileDev`] (O_DIRECT discipline); the ferros kernel backs them with UFS/SD HAL. Design contract: the ferros specs (RING.md / VAULT.md / HAMT.md) + CUSTODES.md.
+//! Layering: [`Vault`] composes [`ring::Ring`] + [`tract::Tract`] + [`hamt::Hamt`] over a [`Mirror`] of [`BlockDev`]s. Host backs devices with [`FileDev`] (O_DIRECT discipline); the ferros kernel backs them with UFS/SD HAL. Design contract: the ferros specs (RING.md / VAULT.md / HAMT.md) + the host-profile resolutions in the README.
 //!
 pub mod block;
 pub mod error;

@@ -50,7 +50,8 @@ There is no concept of shutdown, no such thing as unmount, there is no journal, 
 - A spine entry is the transaction commit point; everything between commits is provisional, and orphans classify dead on the next plow pass.
 - The committed generation defines *exactly* what exists: kill -9 mid-write, reopen, and puts `0..G` are intact while put `G` is fully absent — never partial. This is a test, not a slogan.
 - The rollback fence keeps the last K=4 generations fully restorable: no block any of them references — old location or new — can be physically overwritten until the orphaning commit is K generations deep. Relocation copies land *before* the commit that references them; the originals stay sealed in place behind the fence.
-- A torn or scribbled block reads as Corrupt, and the head search bisects around it, branching both halves — an ambiguous read prunes nothing.
+- The fence cannot deadlock a tight tract, even though flushing the index needs tract writes, tract writes can be fenced, and raising the fence needs new generations. Heartbeat generations break the cycle: a commit pointing at the current root, written into the ring region the fence never covers, sliding old plow positions out of the K-window.
+- A torn or scribbled block reads as Corrupt, and the head search bisects around it, branching both halves — an ambiguous read prunes nothing. Rank a corrupt slot as "oldest" instead and a single bad block deflects a naive bisect to a stale generation; the counter-example is a pinned test.
 
 A 15ms power cut, a cosmic-ray bit flip, and a tampered byte all produce the identical symptom — a block whose seal fails — and receive the identical treatment: classify Corrupt, route around it, read the mirror's copy, heal on resync.
 The engine never needs to know which one happened, so there is one defense instead of three.
@@ -73,13 +74,49 @@ The same seal check classifies spine entries, index nodes, leaves, and furrows; 
 
 The seal is integrity, not confidentiality — encryption belongs to the layer above (Photon wraps values before they arrive).
 
+## The commit object
+
+A generation is one 4KB spine entry — a complete commit object, sealed like every other block:
+
+```
+gen      full-EWE generation counter — no ceiling
+prev     hp of the parent entry's body — the hash chain
+ring     ring exponent r (N = 1 << r)
+tract    tract length in blocks — arbitrary, full EWE
+hamt     BLAKE3 Merkle root of the entire vault state
+hamtat   tract-relative lba of that root
+plow     write head, as the monotone total of blocks plowed since genesis
+live     live tract block count — feeds the spin trigger
+time     caller clock (eagle oscillations); the engine never interprets it
+```
+
+About 160 bytes of the 4096 are used; the rest is zero padding, and the seal covers the padding — a tampered tail reads Corrupt.
+
+- **The exponent rule.** Quantities that are power-of-two by law are stored as their log2, so an invalid ring size is *unrepresentable*, not merely rejected. The tract length is deliberately full-EWE arbitrary — the kernel tract is "whatever remains of the device," which is never a power of two.
+- **The plow is a monotone total.** Wrapped positions are lap-ambiguous; totals are not. Wrapped position and lap count are derived (`plow % len`, `plow / len`), and the rollback fence becomes a pure integer compare.
+- **Tract-relative addressing.** Every lba in entries and index nodes is 0-based within the tract: a pointer into the ring region is unrepresentable, and the same bytes are valid wherever the tract physically sits — host file today, raw partition on ferros.
+- **No genesis entry, no privileged slot.** An all-Empty ring *is* the pre-genesis state; generation 0 lands at slot 0 and the first lap fills the ring in order. Empty is a verification state, not a number — None sorts below Some(0), and every value on the number line is legal.
+- **Unknown fields are parsed and skipped.** The kernel profile appends its own fields (ledger head, kernel hash, signature) to the same wire format and host readers ride thru them. One format, both worlds.
+
+## Threat model, stated plainly
+
+custodes stores only ciphertext and hashes — it never sees plaintext.
+Encryption is the layer above; the engine guarantees structure: never a block without a seal, never an unverified byte.
+Open source means no security-thru-obscurity — the attacker knows every derivation step, so security rests entirely on which *inputs* are secret.
+
+- **Leaked vault files (backup, cloud sync): safe.** The files hold ciphertext, and the key-derivation inputs live outside the vault directory — a copy of the files cannot derive its own key.
+- **Another local user: safe.** Vault files are created mode 0600 — the one defense crypto cannot provide, since machine identity is shared across UIDs.
+- **Other apps on a sandboxed OS (Android): strong.** App-private storage plus per-signing-key identity: a malicious app is signed by a different key, derives different secrets, and cannot reach the files anyway.
+- **A full-disk image with a known handle: broken — use FDE.** Machine identity travels with the image, so the derivation inputs do too. Full-disk encryption is the answer there, not this layer.
+- **Same-user malware on the desktop: not defended, and no file-based scheme can.** A process with your UID has your files, your machine identity, and your public handle — it can recompute every key you can. That is the Unix permission model, not an engine flaw; sandboxed packaging is the real fix on desktops.
+
 ## Wear is arithmetic, GC is a side effect
 
 There is no wear-leveling subsystem and no garbage collector, in the same way there is no recovery mode: the jobs are done by the shape of the thing.
 
 - The spine rotates by `generation & (N−1)` — every slot written exactly once per N commits, uniformity as a mathematical property, no counter block to hot-spot, no mechanism by which wear *could* concentrate.
 - The tract has exactly one write mechanism: a single head advancing thru it, visiting every block once per lap. Sequential, log-structured, exactly what flash wants (TRIM hooks fire on wrap in the kernel profile).
-- Dead space is reclaimed by the head trampling it on arrival — GC is what advancing *is*. When dead space passes 25% of the tract, the plow takes a proactive lap in bounded windows (64 blocks per commit), so amplification is incremental and capped, never saved up, and nothing ever stops the world.
+- Dead space is reclaimed by the head trampling it on arrival — GC is what advancing *is*. When dead space passes 25% of the tract, the plow takes a proactive lap in bounded windows (64 blocks per commit), so amplification is incremental and capped, never saved up, and nothing ever stops the world. The 25% floor bounds write amplification near 3× in the worst case.
 - Compaction repairs its own index: relocated blocks self-address (leaves carry their key, furrows their owner, index nodes their depth and route), so a moved block read back at its new home names its own repair path. No reverse-pointer maps, nothing to lose in a crash.
 
 ## Unlimited
@@ -87,6 +124,7 @@ There is no wear-leveling subsystem and no garbage collector, in the same way th
 Every quantity on disk is EWE-encoded (vsf's exponential width encoding): integers that grow with reality and never hit a ceiling.
 
 - The generation counter never wraps, never saturates, never needs a migration. Generation 10¹⁸ encodes in a few more bytes than generation 10.
+- Full generations are also what make two mirrors comparable after unbounded divergence: a restored backup or a stale SD card is internally perfect on both sides, and only an unbounded counter can say which one is newer.
 - Tract length is arbitrary — grow the device, fallocate, commit the new geometry in the next spine entry; growth is a transaction with the same killswitch semantics as every other write.
 - The plow position is a monotone total that counts forever; its wrapped position and lap count are derived, not stored.
 - No field anywhere in the format has a "we'll widen it later." There is no year-ten 2³² surprise because there is no 2³² anything.
@@ -155,7 +193,7 @@ Know what you're holding:
 
 ## Specs
 
-The design contract is the ferros specification set — `RING.md`, `VAULT.md`, `HAMT.md`, `VAULT_ROOT.md` — with host-profile resolutions recorded alongside the engine.
+The design contract is the ferros specification set — `RING.md`, `VAULT.md`, `HAMT.md`, `VAULT_ROOT.md` — with the host-profile resolutions recorded in this README.
 Deviations from spec (uniform body-hash sealing, the monotone plow, heartbeat generations) are flagged in the module docs where they occur.
 
 ## Status

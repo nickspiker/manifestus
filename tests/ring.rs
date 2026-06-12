@@ -112,7 +112,7 @@ fn head_survives_reopen_across_laps() {
 
 #[test]
 fn deflection_counter_example() {
-    // CUSTODES.md head-search section, verbatim: N=8, gens 8..14 + old 7, slot 4 (gen 12) corrupted. Naive corrupt-as-oldest bisect prunes the true head away and returns gen 11; branch-on-corrupt must find gen 14 at slot 6.
+    // The deflection counter-example (README "Built for the killswitch"): N=8, gens 8..14 + old 7, slot 4 (gen 12) corrupted. Naive corrupt-as-oldest bisect prunes the true head away and returns gen 11; branch-on-corrupt must find gen 14 at slot 6.
     let dir = TempDir::new().unwrap();
     let mut ring = Ring::open(mk_mirror(&dir, "defl", 8), 3).unwrap();
     build(&mut ring, 1, 3);

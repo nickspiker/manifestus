@@ -29,11 +29,15 @@ pub struct FileDev {
 
 impl FileDev {
     /// Create the device file at `blocks` 4KB blocks (zeroed), or ADOPT an existing one (growing it to at least `blocks` if short, never truncating). The path is passless-derived — a 43-char blake3 name in our app dir is definitionally ours — so there is no foreign file to protect at this layer. Data-aware protection lives at the ring level: genesis only over zero-Valid rings, decided at mirror scope.
+    ///
+    /// Files are created mode 0600: the one defense against other local users, since machine identity is shared across UIDs and crypto cannot help there (README threat model).
     pub fn create(path: &Path, blocks: u64) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
         let f = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
+            .mode(0o600)
             .open(path)?;
         let len = f.metadata()?.len();
         let want = blocks * BLOCK as u64;
