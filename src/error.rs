@@ -15,6 +15,10 @@ pub enum Error {
     Verify(u64),
     /// Block address beyond device bounds.
     Bounds(u64),
+    /// Write cursor reached the rollback fence — the caller must commit generations before the plow may advance further.
+    Fenced(u64),
+    /// A full lap was scanned without finding enough dead space: the tract is full (grow or refuse).
+    TractFull,
 }
 
 impl From<io::Error> for Error {
@@ -33,6 +37,8 @@ impl std::fmt::Display for Error {
             Error::Corrupt(s) => write!(f, "corrupt: {}", s),
             Error::Verify(lba) => write!(f, "write verification failed at block {}", lba),
             Error::Bounds(lba) => write!(f, "block {} out of device bounds", lba),
+            Error::Fenced(w) => write!(f, "rollback fence reached at plow {}", w),
+            Error::TractFull => write!(f, "tract full — no dead space in a full lap"),
         }
     }
 }

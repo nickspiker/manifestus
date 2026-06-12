@@ -147,9 +147,13 @@ RÅ<hp{entry_hash}>                  SELF hash: BLAKE3 of body, padding
   [hamt_root(h{hash} u{lba})]       CONTENT hash: Merkle root of the
                                     entire vault state + its location.
                                     lba is TRACT-RELATIVE
-  [plow(u{lba})]                    tract write head, TRACT-RELATIVE;
-                                    wraps at tract length (one compare
-                                    per rotation — masks not needed here)
+  [plow(u{total})]                  tract write head as the MONOTONE
+                                    total of blocks plowed since genesis
+                                    (EWE, no ceiling). Wrapped position =
+                                    plow mod tract; lap = plow / tract.
+                                    Monotone makes the rollback fence an
+                                    integer compare — wrapped positions
+                                    are lap-ambiguous
   [live(u{blocks})]                 live tract blocks — every COW edit
                                     knows its delta, so the counter is
                                     free; feeds the spin trigger
