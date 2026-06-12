@@ -64,11 +64,23 @@ fn filedev_persists_across_open() {
 }
 
 #[test]
-fn filedev_create_refuses_existing() {
+fn filedev_create_adopts_existing() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("e.bin");
-    FileDev::create(&path, 4).unwrap();
-    assert!(FileDev::create(&path, 4).is_err(), "create over existing must refuse");
+    {
+        let mut dev = FileDev::create(&path, 4).unwrap();
+        dev.write(2, &pattern(2, 0x99)).unwrap();
+        dev.flush().unwrap();
+    }
+    // Re-create adopts: existing content intact, never truncated; short files grow.
+    let mut dev = FileDev::create(&path, 8).unwrap();
+    assert_eq!(dev.block_count(), 8, "adopted file grew to requested size");
+    let mut out = ZERO_BLOCK;
+    dev.read(2, &mut out).unwrap();
+    assert_eq!(out, pattern(2, 0x99), "adoption must not destroy existing blocks");
+    // Adopting with a smaller request never shrinks.
+    let dev = FileDev::create(&path, 4).unwrap();
+    assert_eq!(dev.block_count(), 8);
 }
 
 #[test]

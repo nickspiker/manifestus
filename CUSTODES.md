@@ -94,11 +94,21 @@ magic. One identity system, one liveness scan, one deletion rule (zero
 the magic). All blocks use the vsf-mini profile per RING.md/VAULT.md
 (RÅ<hp ...> + EWE fields, no z/y/b/l).
 
-Anti-clobber rule (the protection the superblock implicitly provided,
-now explicit): genesis/auto-format is legal ONLY when the ring region
-is all-Empty and the file size is sane. A ring full of Corrupt blocks
-means "not ours, or wrecked" → refuse loudly, never format over it.
-The Corrupt ≠ Empty distinction doing one more job.
+Genesis rule (Nick's ruling): the passless-derived filename IS the
+ownership proof — a 43-char blake3 name in our app dir is
+definitionally ours, so there is no foreign file to protect.
+Decided at MIRROR scope, after consulting both sides:
+  any Valid entry on either side  → real vault: open/replicate/recover,
+                                    NEVER format (a whole nother story)
+  zero Valid entries, both sides  → trash or fresh: zero the entire
+                                    ring region (Corrupt → Empty, so
+                                    future head searches never pay the
+                                    branch-on-corrupt cost for stale
+                                    wreckage), then genesis
+Recovery-ladder hook (later, same decision point): an all-trash ring
+over a surviving tract is recoverable via VAULT.md full recovery
+(linear tract scan, rebuild HAMT from hp-valid blocks); v0 logs and
+proceeds to genesis.
 
 No seed/stem/state/ledger regions — host vaults are vaults, not boot
 devices. No privileged block of any kind: ring slots 0..255, then

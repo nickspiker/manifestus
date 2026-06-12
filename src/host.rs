@@ -28,14 +28,18 @@ pub struct FileDev {
 }
 
 impl FileDev {
-    /// Create a new device file, preallocated to `blocks` 4KB blocks (zeroed). Refuses to overwrite an existing file — creation is `create_new`; clobber protection starts at the lowest layer.
+    /// Create the device file at `blocks` 4KB blocks (zeroed), or ADOPT an existing one (growing it to at least `blocks` if short, never truncating). The path is passless-derived — a 43-char blake3 name in our app dir is definitionally ours — so there is no foreign file to protect at this layer. Data-aware protection lives at the ring level: genesis only over zero-Valid rings, decided at mirror scope.
     pub fn create(path: &Path, blocks: u64) -> Result<Self> {
         let f = OpenOptions::new()
             .read(true)
             .write(true)
-            .create_new(true)
+            .create(true)
             .open(path)?;
-        preallocate(&f, blocks * BLOCK as u64)?;
+        let len = f.metadata()?.len();
+        let want = blocks * BLOCK as u64;
+        if len < want {
+            preallocate(&f, want)?;
+        }
         f.sync_all()?;
         drop(f);
         Self::open(path)
