@@ -10,12 +10,20 @@
 //! - **Sub-100 MB target**: the in-memory pointer table is rebuilt on every open by scanning the file. Fine for vault-scale data; if custodes ever grows past that scale we'll persist the index.
 //! - **No encryption in this layer**: bodies are opaque bytes. Encrypt at the caller level if you want it (e.g. photon-vault layers per-entry AEAD on top).
 
+pub mod block;
 pub mod dual;
 pub mod error;
+#[cfg(unix)]
+pub mod host;
+pub mod mirror;
 pub mod record;
 pub mod store;
 
+pub use block::{Block, BlockDev, BLOCK, ZERO_BLOCK};
 pub use dual::DualStore;
+#[cfg(unix)]
+pub use host::FileDev;
+pub use mirror::Mirror;
 pub use error::{Error, Result};
 pub use record::{EntryKey, FLAG_EXPIRES, FLAG_PINNED, FLAG_TOMBSTONE};
 pub use store::{EntryMeta, Store};

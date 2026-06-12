@@ -11,6 +11,10 @@ pub enum Error {
     Hmac,
     /// Length redundancy check failed, body truncated, or other structural corruption. Triggers silent truncate at the offending offset during open.
     Corrupt(String),
+    /// Read-back verification failed after write — the bytes on the device do not match what was written, even after retry.
+    Verify(u64),
+    /// Block address beyond device bounds.
+    Bounds(u64),
 }
 
 impl From<io::Error> for Error {
@@ -27,6 +31,8 @@ impl std::fmt::Display for Error {
             Error::UnsupportedVersion(v) => write!(f, "unsupported format version: {}", v),
             Error::Hmac => write!(f, "HMAC verification failed"),
             Error::Corrupt(s) => write!(f, "corrupt: {}", s),
+            Error::Verify(lba) => write!(f, "write verification failed at block {}", lba),
+            Error::Bounds(lba) => write!(f, "block {} out of device bounds", lba),
         }
     }
 }
