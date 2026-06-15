@@ -1,9 +1,11 @@
 [package]
-name = "custodes"
+name = "manifestus"
 version = "0.0.0"
 edition = "2021"
 description = "ferros storage engine: mirrored 4KB block devices, generation ring, plow-managed tract, COW HAMT. Every block guards itself; the guards verify each other."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/nickspiker/manifestus"
+readme = "README.md"
 
 [dependencies]
 blake3 = "1"

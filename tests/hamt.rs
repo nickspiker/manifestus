@@ -1,7 +1,7 @@
 //! HAMT behavior: COW put/lookup/delete, lone + direct leaves, splits, flush + cold reopen, corruption, relocation repair.
 
-use custodes::block::Block;
-use custodes::{lone_capacity, Delta, FileDev, Hamt, Liveness, Mirror, Tract, ZERO_BLOCK};
+use manifestus::block::Block;
+use manifestus::{lone_capacity, Delta, FileDev, Hamt, Liveness, Mirror, Tract, ZERO_BLOCK};
 use std::collections::HashMap;
 use tempfile::TempDir;
 
@@ -48,11 +48,11 @@ fn lone_put_lookup_roundtrip() {
     let mut live = LiveMap::default();
     let mut h = Hamt::empty();
 
-    h.put(&mut m, &mut t, &live, &key(1), b"hello custodes").unwrap();
+    h.put(&mut m, &mut t, &live, &key(1), b"hello manifestus").unwrap();
     live.apply(h.take_delta());
     assert_eq!(
         h.lookup(&mut m, &t, &key(1)).unwrap(),
-        Some(b"hello custodes".to_vec())
+        Some(b"hello manifestus".to_vec())
     );
     assert_eq!(h.lookup(&mut m, &t, &key(2)).unwrap(), None, "absent key");
 }

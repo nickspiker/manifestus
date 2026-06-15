@@ -17,7 +17,7 @@ use vsf::types::{EtType, VsfType};
 pub const MAGIC: [u8; 4] = [0x52, 0xC3, 0x85, 0x3C];
 
 /// Spine schema identifier. A wire break publishes a new name — per-entry dialect, no superblock.
-pub const SCHEMA: &str = "custodes.spine";
+pub const SCHEMA: &str = "manifestus.spine";
 
 /// Host + kernel-STEM ring exponent: N = 256.
 pub const HOST_RING_LOG2: u8 = 8;

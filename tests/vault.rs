@@ -1,6 +1,6 @@
 //! The composition: genesis ladder, KV durability, cold resume, replication, spin, and the final-form kill -9 test — murder mid-commit, reopen, assert the committed prefix is exactly intact.
 
-use custodes::{verified_replicate, BlockDev, FileDev, Mirror, Vault, ZERO_BLOCK, HOST_RING_LOG2};
+use manifestus::{verified_replicate, BlockDev, FileDev, Mirror, Vault, ZERO_BLOCK, HOST_RING_LOG2};
 use tempfile::TempDir;
 
 const RING: u64 = 1 << HOST_RING_LOG2;
@@ -84,7 +84,7 @@ fn open_ladder_genesis_over_trash_refuses_real() {
         let mut found = None;
         for lba in RING..donor.block_count() {
             donor.read(lba, &mut buf).unwrap();
-            if custodes::sealed_hp(&buf).is_some() {
+            if manifestus::sealed_hp(&buf).is_some() {
                 found = Some(buf);
                 break;
             }

@@ -1,6 +1,8 @@
-# custodes
+# manifestus
 
-**The guards.** Every block guards itself; the guards verify each other. *Quis custodiet ipsos custodes?* **Each other.**
+**Struck by the hand.** An unverified byte is not a written byte. Nothing exists until contact with the medium is confirmed.
+
+The vault answers one question per key. Hold it, the object answers. Don't hold it, the object doesn't exist — not "permission denied," which would at least confirm something's there. Silence. The 2²⁵⁶ keyspace makes guessing equivalent to not trying. Internally it's a 32-way hash-mapped trie (HAMT, copy-on-write) built from VSF-sealed blocks on a log-structured ring, with the index living in the tract it indexes. Three operations: `put`, `get`, `delete`.
 
 The ferros storage engine: a crash-proof keyed object store over mirrored 4KB block devices.
 Built host-first — applications back it with plain files (Photon rides it today), and the same engine code is designed to sit directly on UFS/SD HAL devices inside the ferros kernel.
@@ -50,7 +52,7 @@ There is no concept of shutdown, no such thing as unmount, there is no journal, 
 - A spine entry is the transaction commit point; everything between commits is provisional, and orphans classify dead on the next plow pass.
 - The committed generation defines *exactly* what exists: kill -9 mid-write, reopen, and puts `0..G` are intact while put `G` is fully absent — never partial. This is a test, not a slogan.
 - The rollback fence keeps the last K=4 generations fully restorable: no block any of them references — old location or new — can be physically overwritten until the orphaning commit is K generations deep. Relocation copies land *before* the commit that references them; the originals stay sealed in place behind the fence.
-- The fence cannot deadlock a tight tract, even though flushing the index needs tract writes, tract writes can be fenced, and raising the fence needs new generations. Heartbeat generations break the cycle: a commit pointing at the current root, written into the ring region the fence never covers, sliding old plow positions out of the K-window.
+- The fence cannot deadlock a tight tract, even tho flushing the index needs tract writes, tract writes can be fenced, and raising the fence needs new generations. Heartbeat generations break the cycle: a commit pointing at the current root, written into the ring region the fence never covers, sliding old plow positions out of the K-window.
 - A torn or scribbled block reads as Corrupt, and the head search bisects around it, branching both halves — an ambiguous read prunes nothing. Rank a corrupt slot as "oldest" instead and a single bad block deflects a naive bisect to a stale generation; the counter-example is a pinned test.
 
 A 15ms power cut, a cosmic-ray bit flip, and a tampered byte all produce the identical symptom — a block whose seal fails — and receive the identical treatment: classify Corrupt, route around it, read the mirror's copy, heal on resync.
@@ -100,7 +102,7 @@ About 160 bytes of the 4096 are used; the rest is zero padding, and the seal cov
 
 ## Threat model, stated plainly
 
-custodes stores only ciphertext and hashes — it never sees plaintext.
+manifestus stores only ciphertext and hashes — it never sees plaintext.
 Encryption is the layer above; the engine guarantees structure: never a block without a seal, never an unverified byte.
 Open source means no security-thru-obscurity — the attacker knows every derivation step, so security rests entirely on which *inputs* are secret.
 
@@ -163,13 +165,14 @@ The design is what was removed:
 - **No wear-leveling subsystem.** Rotation is arithmetic.
 - **No garbage collector.** Advancing is collecting.
 - **No recovery mode.** Opening is recovering.
+- **No ownership.** The vault has no provenance metadata. Blocks belonging to an uninstalled app are indistinguishable from live blocks — the plow will not reclaim them. The layer above must maintain a bundle: a VSF object keyed to the app's ihi, recording every key written, consumed as the uninstall manifest.
 
 Two runtime dependencies (blake3 and vsf), ~2,400 lines of engine, and every structural decision falls out of one rule: a block is sealed, empty, or corrupt, and nothing else is believed.
 
 ## Quick start
 
 ```rust
-use custodes::{FileDev, Mirror, Vault, HOST_RING_LOG2};
+use manifestus::{FileDev, Mirror, Vault, HOST_RING_LOG2};
 
 let a = FileDev::create(path_a, 256 + 16384)?;   // 256-slot ring + 64MB tract
 let b = FileDev::create(path_b, 256 + 16384)?;
@@ -195,6 +198,7 @@ Know what you're holding:
 - **Single values cap at ~4MB** until chained leaves land (specified, not built).
 - **Recovery ladder is v0-shallow.** A spine-destroyed vault with sealed tract data is detected and protected, but the full tract-scan rebuild is specified, not yet implemented.
 - **Kernel profile is the destination, not the claim.** no_std core and HAL backends land with the ferros integration phase.
+- **Bundle maintenance is required for clean uninstall.** manifestus cannot enumerate blocks by provenance. Without a bundle, uninstalled app data persists in the HAMT until explicitly deleted. This is a ferros integration concern, not an engine concern — but ignoring it leaks storage permanently.
 
 ## Specs
 
@@ -203,7 +207,7 @@ Deviations from spec (uniform body-hash sealing, the monotone plow, heartbeat ge
 
 ## Status
 
-Engine complete and kill-tested on the host profile: 51 tests across five suites, including the three kill -9 harnesses.
+Engine complete and kill-tested on the host profile: 51 tests across five suites, including three kill -9 harnesses.
 Photon's `FlatStorage` rides it as the first consumer; battle-soak in real use precedes any crates.io publish.
 
 ## License

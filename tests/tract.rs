@@ -1,10 +1,10 @@
 //! Plow behavior: placement, hole reuse, compaction with relocation, fence, full, zero-delete, killswitch stale-copy property.
 
-use custodes::ring::MAGIC;
-use custodes::{
+use manifestus::ring::MAGIC;
+use manifestus::{
     sealed_hp, BlockDev, FileDev, Liveness, Mirror, Tract, ZERO_BLOCK,
 };
-use custodes::block::Block;
+use manifestus::block::Block;
 use std::collections::HashMap;
 use tempfile::TempDir;
 
@@ -162,7 +162,7 @@ fn fence_blocks_writes() {
     let out = t.advance(&mut m, &oracle, &[seal(1), seal(2)], 0).unwrap();
     assert_eq!(out.placed, vec![0, 1]);
     let err = t.advance(&mut m, &oracle, &[seal(3)], 0);
-    assert!(matches!(err, Err(custodes::Error::Fenced(2))));
+    assert!(matches!(err, Err(manifestus::Error::Fenced(2))));
 }
 
 #[test]
@@ -178,7 +178,7 @@ fn full_tract_errors() {
     }
     assert!(matches!(
         t.advance(&mut m, &oracle, &[seal(9)], 0),
-        Err(custodes::Error::TractFull)
+        Err(manifestus::Error::TractFull)
     ));
 }
 

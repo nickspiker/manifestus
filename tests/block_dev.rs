@@ -1,6 +1,6 @@
 //! FileDev + Mirror behavior, including the kill -9 harness.
 
-use custodes::{Block, BlockDev, FileDev, Mirror, BLOCK, ZERO_BLOCK};
+use manifestus::{Block, BlockDev, FileDev, Mirror, BLOCK, ZERO_BLOCK};
 use tempfile::TempDir;
 
 fn pattern(lba: u64, seed: u8) -> Block {
@@ -139,17 +139,17 @@ impl BlockDev for Flaky {
     fn block_count(&self) -> u64 {
         self.inner.block_count()
     }
-    fn read(&mut self, lba: u64, buf: &mut Block) -> custodes::Result<()> {
+    fn read(&mut self, lba: u64, buf: &mut Block) -> manifestus::Result<()> {
         self.inner.read(lba, buf)
     }
-    fn write(&mut self, lba: u64, buf: &Block) -> custodes::Result<()> {
+    fn write(&mut self, lba: u64, buf: &Block) -> manifestus::Result<()> {
         if self.writes_left == 0 {
-            return Err(custodes::Error::Verify(lba));
+            return Err(manifestus::Error::Verify(lba));
         }
         self.writes_left -= 1;
         self.inner.write(lba, buf)
     }
-    fn flush(&mut self) -> custodes::Result<()> {
+    fn flush(&mut self) -> manifestus::Result<()> {
         self.inner.flush()
     }
 }

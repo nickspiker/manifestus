@@ -1,4 +1,4 @@
-//! Error type for the custodes engine.
+//! Error type for the manifestus engine.
 
 use std::io;
 
@@ -30,7 +30,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Io(e) => write!(f, "I/O: {}", e),
-            Error::BadMagic => write!(f, "not a custodes file (bad magic)"),
+            Error::BadMagic => write!(f, "not a manifestus file (bad magic)"),
             Error::Seal => write!(f, "seal verification failed"),
             Error::Corrupt(s) => write!(f, "corrupt: {}", s),
             Error::Verify(lba) => write!(f, "write verification failed at block {}", lba),

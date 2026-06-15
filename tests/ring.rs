@@ -1,6 +1,6 @@
 //! Spine ring behavior: codec, classification, head search (incl. the CUSTODES.md deflection counter-example), chain enforcement, genesis rule helpers, kill -9 survival.
 
-use custodes::{
+use manifestus::{
     any_sealed_block, classify, zero_ring, BlockDev, Classified, FileDev, Mirror, Ring,
     SpineEntry, ZERO_BLOCK,
 };

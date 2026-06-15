@@ -55,7 +55,7 @@ impl FileDev {
         let len = file.metadata()?.len();
         if len % BLOCK as u64 != 0 {
             return Err(Error::Corrupt(format!(
-                "file length {} is not 4KB-aligned — not a custodes device",
+                "file length {} is not 4KB-aligned — not a manifestus device",
                 len
             )));
         }

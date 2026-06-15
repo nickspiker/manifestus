@@ -14,10 +14,10 @@ use crate::tract::{sealed_hp, Liveness, Reloc, Tract};
 use vsf::decoding::parse::parse;
 use vsf::types::VsfType;
 
-pub const SCHEMA_NODE: &str = "custodes.hamt";
-pub const SCHEMA_LONE: &str = "custodes.lone";
-pub const SCHEMA_DIRECT: &str = "custodes.direct";
-pub const SCHEMA_FURROW: &str = "custodes.furrow";
+pub const SCHEMA_NODE: &str = "manifestus.hamt";
+pub const SCHEMA_LONE: &str = "manifestus.lone";
+pub const SCHEMA_DIRECT: &str = "manifestus.direct";
+pub const SCHEMA_FURROW: &str = "manifestus.furrow";
 
 /// 5-bit chunk of the key at `depth`. 256 bits / 5 = 51 full levels — two distinct keys always diverge within 52.
 fn chunk(key: &[u8; 32], depth: u8) -> u8 {
