@@ -170,14 +170,21 @@ impl Tract {
             write += 1;
         }
 
-        // Place the payload into the remaining slack.
+        // Place the payload into the remaining slack — batched so both rings write concurrently. (Relocations above stay sequential: they're read-then-write interleaved.) Resolve each block's fenced lba up front, then one concurrent verified write.
+        let mut batch: Vec<(u64, &Block)> = Vec::with_capacity(payload.len());
         for block in payload {
             skip_reserved!();
             debug_assert!(write < scan);
-            self.fenced_write(mirror, write, block)?;
+            if let Some(limit) = self.fence_limit {
+                if write >= limit {
+                    return Err(Error::Fenced(write));
+                }
+            }
+            batch.push((self.base + (write % len), block));
             out.placed.push(write % len);
             write += 1;
         }
+        mirror.write_verified_batch(&batch)?;
         skip_reserved!();
 
         // The new plow is the write cursor: everything in [write, scan) was classified dead and remains free-ahead; the next pass re-derives it with cheap reads. Persisting only the write cursor keeps crash recovery trivial.

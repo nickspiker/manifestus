@@ -11,8 +11,8 @@ pub type Block = [u8; BLOCK];
 
 pub const ZERO_BLOCK: Block = [0u8; BLOCK];
 
-/// The engine's entire I/O surface. Host backs this with files (see [`crate::host::FileDev`]); the ferros kernel backs it with UFS/SD HAL devices. Same engine code above, zero changes.
-pub trait BlockDev {
+/// The engine's entire I/O surface. Host backs this with files (see [`crate::host::FileDev`]); the ferros kernel backs it with UFS/SD HAL devices. Same engine code above, zero changes. `Send` so the two mirror rings can be written concurrently from separate threads (the hybrid write path treats each ring as its own disk).
+pub trait BlockDev: Send {
     /// Device capacity in blocks. Engine-visible geometry comes from spine entries, never from here — this exists for bounds checks and the fs-as-witness cross-check.
     fn block_count(&self) -> u64;
 
