@@ -1,3 +1,5 @@
+![manifestus](manifestus.webp)
+
 # manifestus
 
 **Struck by the hand.** An unverified byte is not a written byte. Nothing exists until contact with the medium is confirmed.
@@ -209,6 +211,12 @@ Deviations from spec (uniform body-hash sealing, the monotone plow, heartbeat ge
 
 Engine complete and kill-tested on the host profile: 51 tests across five suites, including three kill -9 harnesses.
 Photon's `FlatStorage` rides it as the first consumer; battle-soak in real use precedes any crates.io publish.
+
+## Terminology
+
+manifestus stores bytes and asks no names, but the layer above keys its bundle on the app's ***ihi*** — the provable identity (handle-layer: `handle_proof`) under which an app's written keys are recorded for the uninstall manifest (see "No ownership", above). The shared identity vocabulary (*ihi*, *ira*, *wairua*, *whakaira*, the chip states) is defined in the cross-stack glossary: `GLOSSARY.md` in the ferros repo.
+
+---
 
 ## License
 

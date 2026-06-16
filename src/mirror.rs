@@ -7,9 +7,23 @@
 //! - Secondary fails → dropped for the session, `degraded` flips, the op succeeds — the primary has it.
 //!
 //! The comparison is byte equality against the just-written buffer — strictly stronger than the kernel's BLAKE3-against-expected-hash check (we hold both byte strings; the kernel holds only the hash).
+//!
+//! Hybrid write path: the bulk *data* blocks of a commit go through [`Mirror::write_verified_batch`], which writes both rings concurrently (each ring is its own disk — the ferros two-device case, in software for now) and verifies both, reconciled with the same primary-authoritative rule. The single-block [`Mirror::write_verified`] stays sequential and is what the authoritative spine commit uses, so "one device defines the committed generation" is unchanged.
 
 use crate::block::{Block, BlockDev, ZERO_BLOCK};
 use crate::error::{Error, Result};
+
+/// Below this many blocks a batch writes sequentially — spawning threads to mirror a handful of 4KB blocks costs more than it saves. Bulk writes (furrow shards, large flushes) clear it easily; a prototype knob to tune against benchmarks.
+const PAR_BATCH_THRESHOLD: usize = 4;
+
+/// Write + verify every block of a batch on one device, with a device-local scratch (so concurrent device threads never share the read-back buffer).
+fn write_each<D: BlockDev>(dev: &mut D, blocks: &[(u64, &Block)]) -> Result<()> {
+    let mut scratch = ZERO_BLOCK;
+    for &(lba, buf) in blocks {
+        write_one(dev, lba, buf, &mut scratch)?;
+    }
+    Ok(())
+}
 
 pub struct Mirror<A: BlockDev, B: BlockDev> {
     a: Option<A>,
@@ -59,6 +73,31 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
             (None, Some(b)) => write_one(b, lba, buf, &mut self.scratch),
             (None, None) => Err(Error::Corrupt("mirror has no devices".into())),
         }
+    }
+
+    /// Concurrent bulk write: fan the whole batch out to both rings on separate threads (each writes + read-back-verifies its own device with a private scratch), then reconcile. The primary stays authoritative — its failure fails the op; a secondary failure drops the ring and flips `degraded`. This is the hybrid for the data-block phase of a commit; the authoritative spine commit still uses the sequential [`write_verified`]. A single device, or a batch below [`PAR_BATCH_THRESHOLD`], falls back to sequential. Per-block discipline is unchanged: write → flush → read back → compare → retry once.
+    pub fn write_verified_batch(&mut self, blocks: &[(u64, &Block)]) -> Result<()> {
+        let both = self.a.is_some() && self.b.is_some();
+        if !both || blocks.len() < PAR_BATCH_THRESHOLD {
+            for &(lba, buf) in blocks {
+                self.write_verified(lba, buf)?;
+            }
+            return Ok(());
+        }
+        let a = self.a.as_mut().unwrap();
+        let b = self.b.as_mut().unwrap();
+        let (a_res, b_ok) = std::thread::scope(|s| {
+            let bh = s.spawn(move || write_each(b, blocks));
+            let a_res = write_each(a, blocks);
+            (a_res, matches!(bh.join(), Ok(Ok(()))))
+        });
+        // Primary authoritative: the secondary's writes landed in uncommitted COW slack, so dropping the ring on failure loses nothing committed.
+        a_res?;
+        if !b_ok {
+            self.b = None;
+            self.degraded = true;
+        }
+        Ok(())
     }
 
     /// Read from the first healthy device. Content validation (hp / Empty / Corrupt classification) is the layer above — the mirror only routes.
