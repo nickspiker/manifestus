@@ -7,7 +7,7 @@
 pub mod block;
 pub mod error;
 pub mod hamt;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod host;
 pub mod mirror;
 pub mod ring;
@@ -15,7 +15,7 @@ pub mod tract;
 pub mod vault;
 
 pub use block::{Block, BlockDev, BLOCK, ZERO_BLOCK};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use host::FileDev;
 pub use mirror::Mirror;
 pub use vault::{verified_replicate, LiveSet, Replicated, Vault};
