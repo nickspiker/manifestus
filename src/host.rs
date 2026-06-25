@@ -11,7 +11,8 @@
 //! Torn writes: 4KB atomicity is never assumed. A torn block reads as Corrupt at the validation layer (BLAKE3 fails) and the killswitch theorems handle it.
 
 use std::fs::{File, OpenOptions};
-#[cfg(unix)]
+// `as_raw_fd` is only reached by the raw libc calls: macOS F_FULLFSYNC / F_NOCACHE and linux/android fallocate. Other unix-ish targets (Redox) take none of those paths, so gate the import to exactly where it's used or it warns there.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
