@@ -12,6 +12,11 @@ blake3 = "1"
 # EWE + typed fields for spine entries / furrows / HAMT nodes. No text features — the engine uses d/u/h/e types only, never x.
 vsf = { version = "0.8", default-features = false, features = ["std"] }
 
+# Structural vault inspector (vsfinfo-style). Host-only — it backs the device with FileDev.
+[[bin]]
+name = "vaultinfo"
+path = "src/bin/vaultinfo.rs"
+
 [dev-dependencies]
 tempfile = "3"
 
