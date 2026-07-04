@@ -23,11 +23,14 @@ This engine has no someone-else's-layer to defer to, so it does all three jobs w
 │                tract it indexes and is plowed like          │
 │                everything else                              │
 ├─────────────────────────────────────────────────────────────┤
-│  Tract         plow-managed log ring: compaction, spin GC,  │
+│  Tract         two-cursor log ring: blind appends at the    │
+│                plow, windowed cleaning at the reap,         │
 │                rollback fence, zero-delete                  │
 ├─────────────────────────────────────────────────────────────┤
 │  Ring (spine)  generation-numbered commit objects,          │
-│                hash-chained, binary-searched head           │
+│                hash-chained, binary-searched head;          │
+│                optionally MIGRATING thru a residence band   │
+│                behind a 4-slot root ring (raw-flash wear)   │
 ├─────────────────────────────────────────────────────────────┤
 │  Mirror        write → verify → THEN the second device      │
 │  BlockDev      4KB blocks; FileDev (host) / HAL (kernel)    │
@@ -53,8 +56,8 @@ There is no concept of shutdown, no such thing as unmount, there is no journal, 
 - Power loss at any byte boundary is **normal operation**, not an exceptional event with its own code.
 - A spine entry is the transaction commit point; everything between commits is provisional, and orphans classify dead on the next plow pass.
 - The committed generation defines *exactly* what exists: kill -9 mid-write, reopen, and puts `0..G` are intact while put `G` is fully absent — never partial. This is a test, not a slogan.
-- The rollback fence keeps the last K=4 generations fully restorable: no block any of them references — old location or new — can be physically overwritten until the orphaning commit is K generations deep. Relocation copies land *before* the commit that references them; the originals stay sealed in place behind the fence.
-- The fence cannot deadlock a tight tract, even tho flushing the index needs tract writes, tract writes can be fenced, and raising the fence needs new generations. Heartbeat generations break the cycle: a commit pointing at the current root, written into the ring region the fence never covers, sliding old plow positions out of the K-window.
+- The rollback fence keeps the last K=4 generations fully restorable with one integer compare: appends stay below min(reap_i + len_i) over the window — inside space that was already clean (live-free) at every windowed generation, which therefore contains nothing any of them references. Reap copies land *before* the commit that retires their window; the originals stay sealed in place until that commit is K generations deep.
+- The fence cannot deadlock a tight tract, even tho flushing the index needs tract appends, appends can be fenced, and raising the fence needs new generations. Heartbeat generations break the cycle: a commit re-asserting the head verbatim (root, reap, geometry — never in-flight cursors, which would raise the fence past what the committed root survives), written into the ring region the fence never covers, sliding old entries out of the K-window.
 - A torn or scribbled block reads as Corrupt, and the head search bisects around it, branching both halves — an ambiguous read prunes nothing. Rank a corrupt slot as "oldest" instead and a single bad block deflects a naive bisect to a stale generation; the counter-example is a pinned test.
 
 A 15ms power cut, a cosmic-ray bit flip, and a tampered byte all produce the identical symptom — a block whose seal fails — and receive the identical treatment: classify Corrupt, route around it, read the mirror's copy, heal on resync.
@@ -89,15 +92,16 @@ ring     ring exponent r (N = 1 << r)
 tract    tract length in blocks — arbitrary, full EWE
 hamt     BLAKE3 Merkle root of the entire vault state
 hamtat   tract-relative lba of that root
-plow     write head, as the monotone total of blocks plowed since genesis
-live     live tract block count — feeds the spin trigger
+plow     append head, as a monotone total of blocks since genesis
+reap     cleaning head, same monotone domain — the fence input
+live     live tract block count — feeds the reap trigger
 time     caller clock (eagle oscillations); the engine never interprets it
 ```
 
 About 160 bytes of the 4096 are used; the rest is zero padding, and the seal covers the padding — a tampered tail reads Corrupt.
 
 - **The exponent rule.** Quantities that are power-of-two by law are stored as their log2, so an invalid ring size is *unrepresentable*, not merely rejected. The tract length is deliberately full-EWE arbitrary — the kernel tract is "whatever remains of the device," which is never a power of two.
-- **The plow is a monotone total.** Wrapped positions are lap-ambiguous; totals are not. Wrapped position and lap count are derived (`plow % len`, `plow / len`), and the rollback fence becomes a pure integer compare.
+- **Both cursors are monotone totals.** Wrapped positions are lap-ambiguous; totals are not. Positions and lap counts are derived (`cursor % len`, `cursor / len`), and the rollback fence becomes a pure integer compare. A legacy entry without a reap field contributes zero append budget and ages out over K generations — old vaults migrate themselves thru ordinary cleaning, no format break.
 - **Tract-relative addressing.** Every lba in entries and index nodes is 0-based within the tract: a pointer into the ring region is unrepresentable, and the same bytes are valid wherever the tract physically sits — host file today, raw partition on ferros.
 - **No genesis entry, no privileged slot.** An all-Empty ring *is* the pre-genesis state; generation 0 lands at slot 0 and the first lap fills the ring in order. Empty is a verification state, not a number — None sorts below Some(0), and every value on the number line is legal.
 - **Unknown fields are parsed and skipped.** The kernel profile appends its own fields (ledger head, kernel hash, signature) to the same wire format and host readers ride thru them. One format, both worlds.
@@ -123,10 +127,11 @@ Photon, for the record, never asks for it: the whole stack runs unprivileged.
 
 There is no wear-leveling subsystem and no garbage collector, in the same way there is no recovery mode: the jobs are done by the shape of the thing.
 
-- The spine rotates by `generation & (N−1)` — every slot written exactly once per N commits, uniformity as a mathematical property, no counter block to hot-spot, no mechanism by which wear *could* concentrate.
-- The tract has exactly one write mechanism: a single head advancing thru it, visiting every block once per lap. Sequential, log-structured, exactly what flash wants (TRIM hooks fire on wrap in the kernel profile).
-- Dead space is reclaimed by the head trampling it on arrival — GC is what advancing *is*. When dead space passes 25% of the tract, the plow takes a proactive lap in bounded windows (64 blocks per commit), so amplification is incremental and capped, never saved up, and nothing ever stops the world. The 25% floor bounds write amplification near 3× in the worst case.
-- Compaction repairs its own index: relocated blocks self-address (leaves carry their key, furrows their owner, index nodes their depth and route), so a moved block read back at its new home names its own repair path. No reverse-pointer maps, nothing to lose in a crash.
+- The spine rotates by `generation & (N−1)` — every slot written exactly once per N commits, uniformity as a mathematical property, no counter block to hot-spot, no mechanism by which wear *could* concentrate. On raw (FTL-less) flash even the spine's REGION moves: a 4-slot root ring records its residence, the spine hops after a fixed number of rotations, and each indirection level multiplies endurance by slots × P/E (RING.md "Migrating Rings"). Existing fixed-ring vaults are the degenerate case and stay valid.
+- The tract has exactly one write mechanism: blind appends at the plow into clean space (live-free by invariant) — no read-before, no classification, no relocation on the write path, and every multi-block value lands as one contiguous run. Sequential, log-structured, exactly what flash wants (TRIM hooks fire on wrap in the kernel profile).
+- Dead space is reclaimed by the REAP: a second cursor trailing the plow by at most a lap, retiring occupied space in bounded windows. Survivors re-append at the plow (source and target can never overlap — the target is clean, so redundancy never blinks), garbage is left behind, and the retiring commit advances the reap. Windows run under space pressure and proactively past 25% dead — incremental and capped, never saved up, nothing ever stops the world.
+- The reap repairs its own index in the same pass: survivors self-address (leaves carry their key, furrows their owner and index, index nodes their depth and route), so each names its repair path — extent lists rebuilt, nodes and leaves re-anchored thru the COW machinery. No reverse-pointer maps, nothing to lose in a crash.
+- Wear leveling still falls out free, now with teeth: the reap forcibly migrates even never-rewritten cold data once per lap, so no position can sit out the rotation.
 
 ## Unlimited
 
@@ -138,20 +143,19 @@ Every quantity on disk is EWE-encoded (vsf's exponential width encoding): intege
 - The plow position is a monotone total that counts forever; its wrapped position and lap count are derived, not stored.
 - No field anywhere in the format has a "we'll widen it later." There is no year-ten 2³² surprise because there is no 2³² anything.
 
-One v0 implementation asterisk: a single *value* currently tops out near 4MB (one direct leaf indexes ~1000 furrows).
-The chained-leaf format that removes the cap is specified in HAMT.md and not yet built — the format is unlimited; the implementation has one TODO.
+Values are unlimited too: an extent leaf records (start, count) runs, not per-block pointers, so one 4KB leaf declares a value of any size — fresh writes are one run (two at a ring wrap), and only reap-window boundaries add fragments, which consecutive windows re-coalesce.
 
 ## The write path
 
 `put` returns durable, every time, and the price is a handful of sequential 4KB writes:
 
-1. The value lands first — one sealed leaf block for values up to ~3.9KB, or furrow blocks plus a leaf above that.
+1. The value lands first — one sealed leaf block for values up to ~3.9KB, or one contiguous run of furrow blocks plus an extent leaf above that.
 2. The copy-on-write index path follows — typically 2–4 nodes for the touched path; untouched subtrees are shared, not copied.
 3. One spine entry commits the generation.
 
 Data is written **once**.
 There is no journal, so there is no double-write tax and no replay on open.
-Delete is O(1): zero the block — flash erases to zero, so zero *is* the deleted state; the index pointer goes stale and the plow reaps the slot.
+Delete is O(1) plus furrow count: zero the blocks — flash erases to zero, so zero *is* the deleted state; the index pointer goes stale and the reap retires the slots.
 Open finds the head in ~9 reads regardless of vault size: one bootstrap read plus a binary search over the 256-slot ring, with no dependence on the OS for so much as the file length.
 
 ## What isn't here
@@ -161,7 +165,7 @@ The design is what was removed:
 - **No permissions.** The key is the capability; absence is the denial.
 - **No superblock.** Geometry rides in every commit object.
 - **No journal.** Data is written once, where it lives.
-- **No allocator, no free list.** The plow reclaims dead space by trampling it.
+- **No allocator, no free list.** Appends land at the plow; the reap retires dead space behind it.
 - **No tombstones.** Zero is the deleted state.
 - **No reverse maps.** Blocks self-address.
 - **No wear-leveling subsystem.** Rotation is arithmetic.
@@ -197,19 +201,20 @@ Know what you're holding:
 - **Unix only, for now.** `FileDev` is `cfg(unix)`; Windows needs a FILE_FLAG_NO_BUFFERING backend that doesn't exist yet. The engine itself only needs a `BlockDev` — bring your own anywhere else.
 - **One process, one writer.** No file locking, no concurrent access; the application layer serializes (Photon uses a mutex).
 - **Point lookups only.** No ranges, no iteration, no queries — deliberately. The vault answers one question: what bytes live under this key.
-- **Single values cap at ~4MB** until chained leaves land (specified, not built).
 - **Recovery ladder is v0-shallow.** A spine-destroyed vault with sealed tract data is detected and protected, but the full tract-scan rebuild is specified, not yet implemented.
 - **Kernel profile is the destination, not the claim.** no_std core and HAL backends land with the ferros integration phase.
+- **Petabyte tracts are a format reality, not yet an implementation one.** The on-disk format has no size ceiling anywhere (EWE integers, constant-fragment extent leaves, size-independent spine), but the host implementation keeps a RAM live-map (one entry per live block) and rebuilds it with a full index walk at open. Both are caches — blocks self-address, so liveness is answerable from the index itself — and both retire with the kernel-profile port. Tracked in `src/vault.rs` (`TODO(scale)`).
+- **Migrating-ring endgame is spec'd, not built.** v1 uses a dedicated residence band; the tract-pooled variant (residences carved from clean tract space — one wear pool, the whole device) is deliberately deferred to the raw-NAND target. See RING.md "Migrating Rings".
 - **Bundle maintenance is required for clean uninstall.** manifestus cannot enumerate blocks by provenance. Without a bundle, uninstalled app data persists in the HAMT until explicitly deleted. This is a ferros integration concern, not an engine concern — but ignoring it leaks storage permanently.
 
 ## Specs
 
 The design contract is the ferros specification set — `RING.md`, `VAULT.md`, `HAMT.md`, `VAULT_ROOT.md` — with the host-profile resolutions recorded in this README.
-Deviations from spec (uniform body-hash sealing, the monotone plow, heartbeat generations) are flagged in the module docs where they occur.
+Deviations from spec (uniform body-hash sealing, monotone cursors, heartbeat generations, extent leaves in place of HAMT.md's chained mode) are flagged in the module docs where they occur.
 
 ## Status
 
-Engine complete and kill-tested on the host profile: 51 tests across five suites, including three kill -9 harnesses.
+Engine complete and kill-tested on the host profile: 62 tests across nine suites, including four kill -9 harnesses (block, ring, vault, and mid-migration), a multi-lap large-value migration test, and a legacy-format self-migration test.
 Photon's `FlatStorage` rides it as the first consumer; battle-soak in real use precedes any crates.io publish.
 
 ## Terminology

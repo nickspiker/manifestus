@@ -21,6 +21,7 @@ fn entry(gen: u64, prev: [u8; 32], r: u8) -> SpineEntry {
         hamt_hash: [gen as u8; 32],
         hamt_lba: gen,
         plow: gen * 3,
+        reap: Some(gen * 2),
         live: gen,
         eagle_time: 1_000_000 + gen as i64,
     }

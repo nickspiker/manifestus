@@ -38,8 +38,10 @@ pub struct SpineEntry {
     /// Merkle root of the entire vault state (BLAKE3) + its tract-relative lba.
     pub hamt_hash: [u8; 32],
     pub hamt_lba: u64,
-    /// Tract write head, tract-relative.
+    /// Tract append head — monotone total since genesis.
     pub plow: u64,
+    /// Tract cleaning head — monotone total since genesis. None on pre-reap entries (legacy format), which contribute the maximally restrictive fence budget.
+    pub reap: Option<u64>,
     /// Live tract blocks — feeds the spin trigger.
     pub live: u64,
     /// Caller-clock timestamp (eagle oscillations); the engine never interprets it.
@@ -78,6 +80,14 @@ impl SpineEntry {
             ("live", VsfType::u(self.live as usize, false)),
             ("time", VsfType::e(EtType::e6(self.eagle_time))),
         ];
+        let pairs: Vec<(&str, VsfType)> = match self.reap {
+            Some(r) => {
+                let mut p = pairs;
+                p.push(("reap", VsfType::u(r as usize, false)));
+                p
+            }
+            None => pairs,
+        };
         for (name, value) in pairs {
             put(VsfType::d(name.to_string()).flatten(), &mut cursor);
             put(value.flatten(), &mut cursor);
@@ -127,6 +137,7 @@ impl SpineEntry {
         let mut plow = None;
         let mut live = None;
         let mut time = None;
+        let mut reap = None;
 
         // Named pairs until zero padding ('d' = 0x64; padding = 0x00). Unknown names are parsed-and-skipped — kernel-profile fields ride thru.
         while block.get(ptr) == Some(&b'd') {
@@ -142,6 +153,7 @@ impl SpineEntry {
                 ("hamt", VsfType::hp(h)) => hamt = Some(to32(&h)?),
                 ("hamtat", v) if as_u64(&v).is_some() => hamtat = as_u64(&v),
                 ("plow", v) if as_u64(&v).is_some() => plow = as_u64(&v),
+                ("reap", v) if as_u64(&v).is_some() => reap = as_u64(&v),
                 ("live", v) if as_u64(&v).is_some() => live = as_u64(&v),
                 ("time", VsfType::e(EtType::e6(t))) => time = Some(t),
                 _ => {} // forward-compat: unknown field or unexpected type — skip
@@ -156,6 +168,7 @@ impl SpineEntry {
             hamt_hash: hamt.ok_or_else(|| Error::Corrupt("missing hamt".into()))?,
             hamt_lba: hamtat.ok_or_else(|| Error::Corrupt("missing hamtat".into()))?,
             plow: plow.ok_or_else(|| Error::Corrupt("missing plow".into()))?,
+            reap,
             live: live.ok_or_else(|| Error::Corrupt("missing live".into()))?,
             eagle_time: time.ok_or_else(|| Error::Corrupt("missing time".into()))?,
         };
@@ -163,6 +176,14 @@ impl SpineEntry {
             return Err(Error::Corrupt(format!("insane ring exponent {}", entry.ring_log2)));
         }
         Ok(entry)
+    }
+
+    /// This generation's contribution to the rollback fence: appends must stay below reap + len (space that was clean when this generation committed contains nothing it references). A legacy entry without a reap contributes its plow — zero append budget — and K subsequent generations age it out.
+    pub fn fence_budget(&self) -> u64 {
+        match self.reap {
+            Some(r) => r + self.tract_blocks,
+            None => self.plow,
+        }
     }
 
     /// hp of this entry's encoded body — what the NEXT entry's prev_hash must be.
@@ -230,10 +251,11 @@ pub fn classify(block: &Block, slot: u64, ring_log2: Option<u8>) -> Classified {
     }
 }
 
-/// A spine ring over a mirrored block device. The ring occupies blocks [0, N); the tract begins at N (callers add the base).
+/// A spine ring over a mirrored block device, occupying blocks [base, base + N). The legacy/host profile has base = 0; the migrating profile (RING.md "Migrating Rings") re-bases the ring as residences retire.
 pub struct Ring<A: BlockDev, B: BlockDev> {
     mirror: Mirror<A, B>,
     ring_log2: u8,
+    base: u64,
     /// Cached head after open/append: (slot, entry).
     head: Option<(u64, SpineEntry)>,
 }
@@ -255,6 +277,10 @@ impl<A: BlockDev, B: BlockDev> Ring<A, B> {
         &mut self.mirror
     }
 
+    pub fn into_mirror(self) -> Mirror<A, B> {
+        self.mirror
+    }
+
     /// Bootstrap: discover the ring exponent from the file itself. Slot 0 holds generation 0 from the very first commit and is rewritten every lap, so it is Valid in any vault with history; walk a few slots forward past killswitch damage. Returns None on an apparently-empty/trash region — the caller escalates to the whole-file scan (genesis rule).
     pub fn bootstrap_n(mirror: &mut Mirror<A, B>) -> Result<Option<u8>> {
         let mut buf = ZERO_BLOCK;
@@ -268,11 +294,17 @@ impl<A: BlockDev, B: BlockDev> Ring<A, B> {
         Ok(None)
     }
 
-    /// Open a ring with a known exponent (from bootstrap or profile default) and find its head.
+    /// Open a ring at block 0 (legacy/host profile).
     pub fn open(mirror: Mirror<A, B>, ring_log2: u8) -> Result<Self> {
+        Self::open_at(mirror, ring_log2, 0)
+    }
+
+    /// Open a ring at an arbitrary base (migrating profile) and find its head.
+    pub fn open_at(mirror: Mirror<A, B>, ring_log2: u8, base: u64) -> Result<Self> {
         let mut ring = Self {
             mirror,
             ring_log2,
+            base,
             head: None,
         };
         ring.head = ring.head_search()?;
@@ -308,13 +340,36 @@ impl<A: BlockDev, B: BlockDev> Ring<A, B> {
 
         let slot = entry.gen & (self.n() - 1);
         let block = entry.encode();
-        self.mirror.write_verified(slot, &block)?;
+        self.mirror.write_verified(self.base + slot, &block)?;
         self.head = Some((slot, entry.clone()));
         Ok(())
     }
 
+    /// Move the ring to a fresh residence (migrating profile). The caller has zeroed the region and recorded the move in the root ring; the cached head (an entry, not an address) rides across unchanged — the next append lands at the new base.
+    pub fn set_base(&mut self, base: u64) {
+        self.base = base;
+    }
+
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
     /// Plow positions of the last `k` generations (newest first) — the rollback fence input. Fewer than k exist near genesis; returns what's there.
     pub fn recent_plows(&mut self, k: u64) -> Result<Vec<u64>> {
+        Ok(self.recent_entries(k)?.into_iter().map(|e| e.map(|e| e.plow).unwrap_or(0)).collect())
+    }
+
+    /// Fence budgets (reap_i + tract_blocks_i) of the last `k` generations, newest first. Each generation permits appends only into space that was already clean when it committed — see SpineEntry::fence_budget. A corrupt/lapped slot inside the window contributes 0 (maximally restrictive; heartbeat generations slide it out).
+    pub fn recent_fences(&mut self, k: u64) -> Result<Vec<u64>> {
+        Ok(self
+            .recent_entries(k)?
+            .into_iter()
+            .map(|e| e.map(|e| e.fence_budget()).unwrap_or(0))
+            .collect())
+    }
+
+    /// The last `k` generations' entries, newest first; None for a corrupt/lapped slot inside the window.
+    fn recent_entries(&mut self, k: u64) -> Result<Vec<Option<SpineEntry>>> {
         let Some((_, head)) = &self.head else {
             return Ok(Vec::new());
         };
@@ -326,11 +381,10 @@ impl<A: BlockDev, B: BlockDev> Ring<A, B> {
         for back in 0..count {
             let gen = head_gen - back;
             let slot = gen & (n - 1);
-            self.mirror.read(slot, &mut buf)?;
+            self.mirror.read(self.base + slot, &mut buf)?;
             match classify(&buf, slot, Some(self.ring_log2)) {
-                Classified::Valid(e) if e.gen == gen => out.push(e.plow),
-                // A corrupt/lapped slot inside the fence window: be conservative — report plow 0 (maximally restrictive fence).
-                _ => out.push(0),
+                Classified::Valid(e) if e.gen == gen => out.push(Some(e)),
+                _ => out.push(None),
             }
         }
         Ok(out)
@@ -344,7 +398,7 @@ impl<A: BlockDev, B: BlockDev> Ring<A, B> {
 
     fn gen_at(&mut self, slot: u64) -> Result<Classified> {
         let mut buf = ZERO_BLOCK;
-        self.mirror.read(slot, &mut buf)?;
+        self.mirror.read(self.base + slot, &mut buf)?;
         Ok(classify(&buf, slot, Some(self.ring_log2)))
     }
 
@@ -442,8 +496,179 @@ pub fn any_sealed_block<D: BlockDev>(dev: &mut D) -> Result<bool> {
 
 /// Zero the ring region (Corrupt → Empty) so post-genesis head searches never pay branch-on-corrupt tax for stale wreckage. Used only after the whole-file scan proved emptiness.
 pub fn zero_ring<A: BlockDev, B: BlockDev>(mirror: &mut Mirror<A, B>, ring_log2: u8) -> Result<()> {
+    zero_ring_at(mirror, ring_log2, 0)
+}
+
+/// Zero a ring region at an arbitrary base — genesis, and residence preparation before a migration.
+pub fn zero_ring_at<A: BlockDev, B: BlockDev>(
+    mirror: &mut Mirror<A, B>,
+    ring_log2: u8,
+    base: u64,
+) -> Result<()> {
     for slot in 0..(1u64 << ring_log2) {
-        mirror.write_verified(slot, &ZERO_BLOCK)?;
+        mirror.write_verified(base + slot, &ZERO_BLOCK)?;
     }
     Ok(())
+}
+
+// ============================================================================ root ring (migrating profile) ==========================================
+
+/// Root ring size: 4 slots at block 0. Written once per spine MIGRATION — the level-0 node of the wear tree (RING.md "Migrating Rings").
+pub const ROOT_SLOTS: u64 = 4;
+
+/// Root schema identifier.
+pub const SCHEMA_ROOT: &str = "manifestus.root";
+
+/// One root entry: where the spine ring lives now (and lived before), plus the residency bookkeeping that decides when it moves again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RootEntry {
+    pub gen: u64,
+    /// hp of the previous root entry's body; first migration chain start = [0u8; 32].
+    pub prev_hash: [u8; 32],
+    /// Spine ring exponent (N = 1 << r) — identical at every residence.
+    pub ring_log2: u8,
+    /// CURRENT spine residence base (absolute block).
+    pub at: u64,
+    /// PREVIOUS spine residence base — the A/B fallback at boot.
+    pub was: u64,
+    /// Spine generation at arrival: rotations here = (spine_gen - since) >> ring_log2.
+    pub since: u64,
+    /// Residence count in the band (band = [ROOT_SLOTS, ROOT_SLOTS + residences << ring_log2)).
+    pub residences: u64,
+    /// Rotations per residence before migrating.
+    pub residency: u64,
+    pub eagle_time: i64,
+}
+
+impl RootEntry {
+    pub fn encode(&self) -> Block {
+        let mut buf = ZERO_BLOCK;
+        buf[..4].copy_from_slice(&MAGIC);
+        let hp_placeholder = VsfType::hp(vec![0u8; 32]).flatten();
+        let hp_len = hp_placeholder.len();
+        buf[4..4 + hp_len].copy_from_slice(&hp_placeholder);
+        buf[4 + hp_len] = b'>';
+        let body_start = 4 + hp_len + 1;
+        let mut cursor = body_start;
+        let mut put = |bytes: Vec<u8>, cursor: &mut usize| {
+            buf[*cursor..*cursor + bytes.len()].copy_from_slice(&bytes);
+            *cursor += bytes.len();
+        };
+        put(VsfType::d(SCHEMA_ROOT.to_string()).flatten(), &mut cursor);
+        let pairs: Vec<(&str, VsfType)> = vec![
+            ("gen", VsfType::u(self.gen as usize, false)),
+            ("prev", VsfType::hp(self.prev_hash.to_vec())),
+            ("ring", VsfType::u(self.ring_log2 as usize, false)),
+            ("at", VsfType::u(self.at as usize, false)),
+            ("was", VsfType::u(self.was as usize, false)),
+            ("since", VsfType::u(self.since as usize, false)),
+            ("band", VsfType::u(self.residences as usize, false)),
+            ("stay", VsfType::u(self.residency as usize, false)),
+            ("time", VsfType::e(EtType::e6(self.eagle_time))),
+        ];
+        for (name, value) in pairs {
+            put(VsfType::d(name.to_string()).flatten(), &mut cursor);
+            put(value.flatten(), &mut cursor);
+        }
+        debug_assert!(cursor < BLOCK, "root entry overflowed 4KB");
+        let hash = blake3::hash(&buf[body_start..]);
+        let hp = VsfType::hp(hash.as_bytes().to_vec()).flatten();
+        buf[4..4 + hp_len].copy_from_slice(&hp);
+        buf
+    }
+
+    pub fn decode(block: &Block) -> Result<Self> {
+        if block[..4] != MAGIC {
+            return Err(Error::BadMagic);
+        }
+        let mut ptr = 4usize;
+        let VsfType::hp(stored) = parse(block, &mut ptr).map_err(decode_err)? else {
+            return Err(Error::Corrupt("expected hp after magic".into()));
+        };
+        if block.get(ptr) != Some(&b'>') {
+            return Err(Error::Corrupt("expected '>' after hp".into()));
+        }
+        ptr += 1;
+        if blake3::hash(&block[ptr..]).as_bytes() != stored.as_slice() {
+            return Err(Error::Seal);
+        }
+        let VsfType::d(schema) = parse(block, &mut ptr).map_err(decode_err)? else {
+            return Err(Error::Corrupt("expected schema id".into()));
+        };
+        if schema != SCHEMA_ROOT {
+            return Err(Error::Corrupt(format!("foreign schema: {schema}")));
+        }
+        let mut gen = None;
+        let mut prev = None;
+        let mut ring = None;
+        let mut at = None;
+        let mut was = None;
+        let mut since = None;
+        let mut band = None;
+        let mut stay = None;
+        let mut time = None;
+        while block.get(ptr) == Some(&b'd') {
+            let VsfType::d(name) = parse(block, &mut ptr).map_err(decode_err)? else {
+                return Err(Error::Corrupt("expected field name".into()));
+            };
+            let value = parse(block, &mut ptr).map_err(decode_err)?;
+            match (name.as_str(), value) {
+                ("gen", v) if as_u64(&v).is_some() => gen = as_u64(&v),
+                ("prev", VsfType::hp(h)) => prev = Some(to32(&h)?),
+                ("ring", v) if as_u64(&v).is_some() => ring = as_u64(&v).map(|x| x as u8),
+                ("at", v) if as_u64(&v).is_some() => at = as_u64(&v),
+                ("was", v) if as_u64(&v).is_some() => was = as_u64(&v),
+                ("since", v) if as_u64(&v).is_some() => since = as_u64(&v),
+                ("band", v) if as_u64(&v).is_some() => band = as_u64(&v),
+                ("stay", v) if as_u64(&v).is_some() => stay = as_u64(&v),
+                ("time", VsfType::e(EtType::e6(t))) => time = Some(t),
+                _ => {}
+            }
+        }
+        Ok(Self {
+            gen: gen.ok_or_else(|| Error::Corrupt("root: missing gen".into()))?,
+            prev_hash: prev.ok_or_else(|| Error::Corrupt("root: missing prev".into()))?,
+            ring_log2: ring.ok_or_else(|| Error::Corrupt("root: missing ring".into()))?,
+            at: at.ok_or_else(|| Error::Corrupt("root: missing at".into()))?,
+            was: was.ok_or_else(|| Error::Corrupt("root: missing was".into()))?,
+            since: since.ok_or_else(|| Error::Corrupt("root: missing since".into()))?,
+            residences: band.ok_or_else(|| Error::Corrupt("root: missing band".into()))?,
+            residency: stay.ok_or_else(|| Error::Corrupt("root: missing stay".into()))?,
+            eagle_time: time.ok_or_else(|| Error::Corrupt("root: missing time".into()))?,
+        })
+    }
+
+    /// hp of this entry's encoded body — the NEXT root entry's prev_hash.
+    pub fn body_hash(&self) -> [u8; 32] {
+        let block = self.encode();
+        let mut ptr = 4usize;
+        let _ = parse(&block, &mut ptr);
+        ptr += 1;
+        *blake3::hash(&block[ptr..]).as_bytes()
+    }
+}
+
+/// Newest valid root entry across the 4 root slots, or None (legacy layout / empty device).
+/// Slot congruence (gen & 3 == slot) is enforced the same way as spine entries.
+pub fn read_root<D: BlockDev>(dev: &mut D) -> Result<Option<RootEntry>> {
+    let mut best: Option<RootEntry> = None;
+    let mut buf = ZERO_BLOCK;
+    for slot in 0..ROOT_SLOTS.min(dev.block_count()) {
+        dev.read(slot, &mut buf)?;
+        if let Ok(e) = RootEntry::decode(&buf) {
+            if e.gen & (ROOT_SLOTS - 1) == slot && best.as_ref().map(|b| e.gen > b.gen).unwrap_or(true) {
+                best = Some(e);
+            }
+        }
+    }
+    Ok(best)
+}
+
+/// Append a root entry at slot gen & 3, write-verified on every present device.
+pub fn append_root<A: BlockDev, B: BlockDev>(
+    mirror: &mut Mirror<A, B>,
+    entry: &RootEntry,
+) -> Result<()> {
+    let block = entry.encode();
+    mirror.write_verified(entry.gen & (ROOT_SLOTS - 1), &block)
 }

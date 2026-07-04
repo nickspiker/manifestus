@@ -27,6 +27,13 @@ pub trait BlockDev: Send {
 
     /// Durability barrier — when this returns, prior writes survive power loss.
     fn flush(&mut self) -> Result<()>;
+
+    /// Extend capacity to `new_blocks` (zeroed). Space-first discipline: the vault grows devices BEFORE committing the new geometry, so power loss between the two leaves unclaimed zeros. Default refuses — fixed-extent devices (kernel partitions) cannot grow.
+    fn grow(&mut self, _new_blocks: u64) -> Result<()> {
+        Err(crate::error::Error::Corrupt(
+            "device does not support grow".into(),
+        ))
+    }
 }
 
 /// Forwarding impl so borrowed devices compose (verified_replicate wraps `&mut A` / `&mut B` in temporary solo Mirrors).
@@ -45,5 +52,8 @@ impl<D: BlockDev + ?Sized> BlockDev for &mut D {
     }
     fn flush(&mut self) -> Result<()> {
         (**self).flush()
+    }
+    fn grow(&mut self, new_blocks: u64) -> Result<()> {
+        (**self).grow(new_blocks)
     }
 }
