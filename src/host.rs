@@ -146,6 +146,10 @@ impl BlockDev for FileDev {
             Ok(())
         }
     }
+
+    fn grow(&mut self, new_blocks: u64) -> Result<()> {
+        FileDev::grow(self, new_blocks)
+    }
 }
 
 /// Read exactly `buf.len()` bytes at file offset `off`. Unix `read_exact_at` loops internally; Windows `seek_read` may return short, so loop until the block is filled (a 0-length read mid-block is a torn/truncated device — Corrupt).

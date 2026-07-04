@@ -37,7 +37,7 @@ fn mk(dir: &TempDir, name: &str, blocks: u64) -> (Mirror<FileDev, FileDev>, Trac
     let b = FileDev::create(&dir.path().join(format!("{name}-b.bin")), blocks).unwrap();
     (
         Mirror::new(a, b),
-        Tract { base: 0, len: blocks, plow: 0, fence_limit: None },
+        Tract { base: 0, len: blocks, plow: 0, reap: 0, fence_limit: None },
     )
 }
 
@@ -48,7 +48,7 @@ fn lone_put_lookup_roundtrip() {
     let mut live = LiveMap::default();
     let mut h = Hamt::empty();
 
-    h.put(&mut m, &mut t, &live, &key(1), b"hello manifestus").unwrap();
+    h.put(&mut m, &mut t, &key(1), b"hello manifestus").unwrap();
     live.apply(h.take_delta());
     assert_eq!(
         h.lookup(&mut m, &t, &key(1)).unwrap(),
@@ -64,9 +64,9 @@ fn overwrite_replaces_value() {
     let mut live = LiveMap::default();
     let mut h = Hamt::empty();
 
-    h.put(&mut m, &mut t, &live, &key(7), b"first").unwrap();
+    h.put(&mut m, &mut t, &key(7), b"first").unwrap();
     live.apply(h.take_delta());
-    h.put(&mut m, &mut t, &live, &key(7), b"second").unwrap();
+    h.put(&mut m, &mut t, &key(7), b"second").unwrap();
     let d = h.take_delta();
     assert!(!d.removed.is_empty(), "old leaf must be superseded");
     live.apply(d);
@@ -82,7 +82,7 @@ fn many_keys_flush_and_cold_reopen() {
 
     for i in 0..200u64 {
         let v = format!("value-{i}");
-        h.put(&mut m, &mut t, &live, &key(i), v.as_bytes()).unwrap();
+        h.put(&mut m, &mut t, &key(i), v.as_bytes()).unwrap();
         live.apply(h.take_delta());
     }
     for i in 0..200u64 {
@@ -93,7 +93,7 @@ fn many_keys_flush_and_cold_reopen() {
         );
     }
 
-    let (root_hash, root_lba) = h.flush(&mut m, &mut t, &live).unwrap();
+    let (root_hash, root_lba) = h.flush(&mut m, &mut t).unwrap();
     live.apply(h.take_delta());
     assert_ne!(root_hash, [0u8; 32]);
 
@@ -121,16 +121,16 @@ fn deep_split_on_shared_prefix() {
     let mut k2 = [0u8; 32];
     k1[31] = 0b0000_0001;
     k2[31] = 0b0000_0010;
-    h.put(&mut m, &mut t, &live, &k1, b"one").unwrap();
+    h.put(&mut m, &mut t, &k1, b"one").unwrap();
     live.apply(h.take_delta());
-    h.put(&mut m, &mut t, &live, &k2, b"two").unwrap();
+    h.put(&mut m, &mut t, &k2, b"two").unwrap();
     live.apply(h.take_delta());
 
     assert_eq!(h.lookup(&mut m, &t, &k1).unwrap(), Some(b"one".to_vec()));
     assert_eq!(h.lookup(&mut m, &t, &k2).unwrap(), Some(b"two".to_vec()));
 
     // Survives a flush + cold reopen.
-    let (rh, rl) = h.flush(&mut m, &mut t, &live).unwrap();
+    let (rh, rl) = h.flush(&mut m, &mut t).unwrap();
     live.apply(h.take_delta());
     let mut cold = Hamt::from_root(rh, rl);
     assert_eq!(cold.lookup(&mut m, &t, &k1).unwrap(), Some(b"one".to_vec()));
@@ -147,12 +147,12 @@ fn direct_leaf_big_value_roundtrip() {
     // 20KB — photon chain blobs are 16KB+, this is the real consumer shape.
     let big: Vec<u8> = (0..20_000).map(|i| (i % 251) as u8).collect();
     assert!(big.len() > lone_capacity());
-    h.put(&mut m, &mut t, &live, &key(42), &big).unwrap();
+    h.put(&mut m, &mut t, &key(42), &big).unwrap();
     live.apply(h.take_delta());
     assert_eq!(h.lookup(&mut m, &t, &key(42)).unwrap(), Some(big.clone()));
 
     // Cold path too.
-    let (rh, rl) = h.flush(&mut m, &mut t, &live).unwrap();
+    let (rh, rl) = h.flush(&mut m, &mut t).unwrap();
     live.apply(h.take_delta());
     let mut cold = Hamt::from_root(rh, rl);
     assert_eq!(cold.lookup(&mut m, &t, &key(42)).unwrap(), Some(big));
@@ -166,9 +166,9 @@ fn delete_zeroes_and_returns_none() {
     let mut h = Hamt::empty();
 
     let big: Vec<u8> = vec![0xAB; 12_000];
-    h.put(&mut m, &mut t, &live, &key(5), &big).unwrap();
+    h.put(&mut m, &mut t, &key(5), &big).unwrap();
     live.apply(h.take_delta());
-    h.put(&mut m, &mut t, &live, &key(6), b"small").unwrap();
+    h.put(&mut m, &mut t, &key(6), b"small").unwrap();
     live.apply(h.take_delta());
 
     assert!(h.delete(&mut m, &mut t, &key(5)).unwrap());
@@ -178,7 +178,7 @@ fn delete_zeroes_and_returns_none() {
     assert!(!h.delete(&mut m, &mut t, &key(5)).unwrap(), "double delete is a no-op");
 
     // Re-put after delete resurrects.
-    h.put(&mut m, &mut t, &live, &key(5), b"reborn").unwrap();
+    h.put(&mut m, &mut t, &key(5), b"reborn").unwrap();
     live.apply(h.take_delta());
     assert_eq!(h.lookup(&mut m, &t, &key(5)).unwrap(), Some(b"reborn".to_vec()));
 }
@@ -190,10 +190,10 @@ fn corrupt_committed_node_is_loud() {
     let mut live = LiveMap::default();
     let mut h = Hamt::empty();
     for i in 0..40u64 {
-        h.put(&mut m, &mut t, &live, &key(i), b"x").unwrap();
+        h.put(&mut m, &mut t, &key(i), b"x").unwrap();
         live.apply(h.take_delta());
     }
-    let (rh, rl) = h.flush(&mut m, &mut t, &live).unwrap();
+    let (rh, rl) = h.flush(&mut m, &mut t).unwrap();
     live.apply(h.take_delta());
 
     // Flip a byte in the committed root block.
@@ -214,38 +214,30 @@ fn corrupt_committed_node_is_loud() {
 }
 
 #[test]
-fn relocation_repair_keeps_index_correct() {
+fn reap_window_moves_survivors_and_repairs_index() {
     let dir = TempDir::new().unwrap();
-    let (mut m, mut t) = mk(&dir, "reloc", 64);
+    let (mut m, mut t) = mk(&dir, "reap", 64);
     let mut live = LiveMap::default();
     let mut h = Hamt::empty();
 
-    h.put(&mut m, &mut t, &live, &key(1), b"alpha").unwrap();
+    h.put(&mut m, &mut t, &key(1), b"alpha").unwrap();
     live.apply(h.take_delta());
-    h.put(&mut m, &mut t, &live, &key(2), b"beta").unwrap();
+    h.put(&mut m, &mut t, &key(2), b"beta").unwrap();
     live.apply(h.take_delta());
-    let (rh, rl) = h.flush(&mut m, &mut t, &live).unwrap();
+    let _ = h.flush(&mut m, &mut t).unwrap();
     live.apply(h.take_delta());
-    let _ = (rh, rl);
 
-    // Force relocations: zero-delete nothing, just spin a window past the live blocks from a later plow position so they compact backward.
-    let lap_start = t.plow;
-    let out = t.spin_window(&mut m, &live, 8).unwrap();
-    let _ = lap_start;
-    if !out.relocations.is_empty() {
-        h.repair_relocs(&mut m, &t, &out.relocations).unwrap();
-        // Vault would update the live map from the relocations:
-        for r in &out.relocations {
-            live.0.remove(&r.from);
-            live.0.insert(r.to, r.hp);
-        }
-    }
+    // Reap the whole occupied prefix: every live block (leaves + index) re-appends at the plow, the index is repaired in the same pass, garbage is left behind.
+    let occupied = t.plow - t.reap;
+    h.reap_window(&mut m, &mut t, &live, occupied).unwrap();
+    live.apply(h.take_delta());
+    assert_eq!(t.reap, occupied, "window retired");
 
     assert_eq!(h.lookup(&mut m, &t, &key(1)).unwrap(), Some(b"alpha".to_vec()));
     assert_eq!(h.lookup(&mut m, &t, &key(2)).unwrap(), Some(b"beta".to_vec()));
 
     // And the repaired index survives a flush + cold reopen.
-    let (rh2, rl2) = h.flush(&mut m, &mut t, &live).unwrap();
+    let (rh2, rl2) = h.flush(&mut m, &mut t).unwrap();
     live.apply(h.take_delta());
     let mut cold = Hamt::from_root(rh2, rl2);
     assert_eq!(cold.lookup(&mut m, &t, &key(1)).unwrap(), Some(b"alpha".to_vec()));
@@ -258,7 +250,7 @@ fn empty_flush_is_zero_root() {
     let (mut m, mut t) = mk(&dir, "empty", 16);
     let live = LiveMap::default();
     let mut h = Hamt::empty();
-    let (rh, _) = h.flush(&mut m, &mut t, &live).unwrap();
+    let (rh, _) = h.flush(&mut m, &mut t).unwrap();
     assert_eq!(rh, [0u8; 32]);
     let _ = m.block_count();
 }
@@ -273,7 +265,7 @@ fn value_byte_sizes_roundtrip_near_lone_boundary() {
     for (i, len) in [0usize, 1, cap - 1, cap, cap + 1, cap * 2 + 7].into_iter().enumerate() {
         let v: Vec<u8> = (0..len).map(|j| (j % 256) as u8).collect();
         let k = key(1000 + i as u64);
-        h.put(&mut m, &mut t, &live, &k, &v).unwrap();
+        h.put(&mut m, &mut t, &k, &v).unwrap();
         live.apply(h.take_delta());
         assert_eq!(h.lookup(&mut m, &t, &k).unwrap(), Some(v), "len {len}");
     }

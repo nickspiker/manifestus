@@ -16,8 +16,12 @@ use vsf::types::VsfType;
 
 pub const SCHEMA_NODE: &str = "manifestus.hamt";
 pub const SCHEMA_LONE: &str = "manifestus.lone";
+pub const SCHEMA_EXTENT: &str = "manifestus.extent";
+/// Legacy per-lba leaf format — decoded for migration, never written. The reap rewrites such values into extent form the first time it touches one of their blocks.
 pub const SCHEMA_DIRECT: &str = "manifestus.direct";
 pub const SCHEMA_FURROW: &str = "manifestus.furrow";
+
+use std::collections::HashMap;
 
 /// 5-bit chunk of the key at `depth`. 256 bits / 5 = 51 full levels — two distinct keys always diverge within 52.
 fn chunk(key: &[u8; 32], depth: u8) -> u8 {
@@ -63,6 +67,9 @@ impl Node {
 enum TractDoc {
     Node(Node),
     Lone { key: [u8; 32], value: Vec<u8> },
+    /// Extent leaf: the value's furrows as (start, count) runs — any size, one block.
+    Extent { key: [u8; 32], size: u64, runs: Vec<(u64, u64)> },
+    /// Legacy per-lba leaf. Read-only; rewritten as Extent by the reap.
     Direct { key: [u8; 32], size: u64, furrows: Vec<u64> },
     Furrow { key: [u8; 32], index: u64, payload: Vec<u8> },
 }
@@ -146,6 +153,13 @@ impl Hamt {
                             }
                             return Ok(Some(read_furrows(mirror, tract, key, size, &furrows)?));
                         }
+                        TractDoc::Extent { key: k, size, runs } => {
+                            if &k != key {
+                                return Ok(None);
+                            }
+                            let positions = expand_runs(&runs, size)?;
+                            return Ok(Some(read_furrows(mirror, tract, key, size, &positions)?));
+                        }
                         TractDoc::Furrow { .. } => {
                             return Err(Error::Corrupt("furrow reached via index walk".into()));
                         }
@@ -157,50 +171,56 @@ impl Hamt {
 
     // ======================================================================== put ====================================================================
 
-    /// Insert or overwrite. Leaf (and furrow) blocks are written to the tract IMMEDIATELY (VAULT.md write path: object first, index second); the index path goes dirty in RAM until `flush`. Tract relocations triggered by these writes are self-repaired before returning.
-    pub fn put<A: BlockDev, B: BlockDev, L: Liveness>(
+    /// Insert or overwrite. Leaf (and furrow) blocks are appended to the tract IMMEDIATELY (VAULT.md write path: object first, index second); the index path goes dirty in RAM until `flush`. A refused append (Fenced/TractFull) leaves no side effects — the delta is rolled back to its entry state.
+    pub fn put<A: BlockDev, B: BlockDev>(
         &mut self,
         mirror: &mut Mirror<A, B>,
         tract: &mut Tract,
-        oracle: &L,
         key: &[u8; 32],
         value: &[u8],
     ) -> Result<()> {
-        // Build leaf (+furrow) blocks.
-        let lone_max = lone_capacity();
-        let mut payload: Vec<Block> = Vec::new();
-        let leaf_block;
-        if value.len() <= lone_max {
-            leaf_block = encode_lone(key, value);
-        } else {
-            // Furrows first (leaf references their lbas, so they must land first).
-            let per = furrow_capacity();
-            for (i, chunk_bytes) in value.chunks(per).enumerate() {
-                payload.push(encode_furrow(key, i as u64, chunk_bytes));
-            }
-            leaf_block = ZERO_BLOCK; // placeholder; rebuilt after furrow lbas known
+        let added_mark = self.delta.added.len();
+        let removed_mark = self.delta.removed.len();
+        let r = self.put_inner(mirror, tract, key, value);
+        if r.is_err() {
+            self.delta.added.truncate(added_mark);
+            self.delta.removed.truncate(removed_mark);
         }
+        r
+    }
 
+    fn put_inner<A: BlockDev, B: BlockDev>(
+        &mut self,
+        mirror: &mut Mirror<A, B>,
+        tract: &mut Tract,
+        key: &[u8; 32],
+        value: &[u8],
+    ) -> Result<()> {
+        let lone_max = lone_capacity();
         let (leaf_lba, leaf_hash) = if value.len() <= lone_max {
-            let out = tract.advance(mirror, oracle, core::slice::from_ref(&leaf_block), 0)?;
-            let lba = out.placed[0];
-            let hash = sealed_hp(&leaf_block).unwrap();
-            self.delta.added.push((lba, hash));
-            self.repair_relocs(mirror, tract, &out.relocations)?;
-            (lba, hash)
-        } else {
-            let out = tract.advance(mirror, oracle, &payload, 0)?;
-            for (lba, b) in out.placed.iter().zip(&payload) {
-                self.delta.added.push((*lba, sealed_hp(b).unwrap()));
-            }
-            let furrow_lbas = out.placed.clone();
-            self.repair_relocs(mirror, tract, &out.relocations)?;
-            let leaf = encode_direct(key, value.len() as u64, &furrow_lbas);
-            let out2 = tract.advance(mirror, oracle, core::slice::from_ref(&leaf), 0)?;
-            let lba = out2.placed[0];
+            let leaf = encode_lone(key, value);
+            let lba = tract.append(mirror, core::slice::from_ref(&leaf))?[0];
             let hash = sealed_hp(&leaf).unwrap();
             self.delta.added.push((lba, hash));
-            self.repair_relocs(mirror, tract, &out2.relocations)?;
+            (lba, hash)
+        } else {
+            // Furrows first (the leaf references their positions, so they must land first).
+            // One contiguous append — the runs come back as one extent, two at a ring wrap.
+            let per = furrow_capacity();
+            let payload: Vec<Block> = value
+                .chunks(per)
+                .enumerate()
+                .map(|(i, c)| encode_furrow(key, i as u64, c))
+                .collect();
+            let placed = tract.append(mirror, &payload)?;
+            for (lba, b) in placed.iter().zip(&payload) {
+                self.delta.added.push((*lba, sealed_hp(b).unwrap()));
+            }
+            let runs = compress_runs(&placed);
+            let leaf = encode_extent(key, value.len() as u64, &runs)?;
+            let lba = tract.append(mirror, core::slice::from_ref(&leaf))?[0];
+            let hash = sealed_hp(&leaf).unwrap();
+            self.delta.added.push((lba, hash));
             (lba, hash)
         };
 
@@ -248,7 +268,9 @@ impl Hamt {
                         self.delta.removed.push((lba, hash));
                         Ok(Child::Dirty(idx))
                     }
-                    TractDoc::Lone { key: k, .. } | TractDoc::Direct { key: k, .. } => {
+                    TractDoc::Lone { key: k, .. }
+                    | TractDoc::Direct { key: k, .. }
+                    | TractDoc::Extent { key: k, .. } => {
                         if &k == key {
                             // Overwrite: the old leaf (and its furrows) become dead.
                             self.remove_leaf_blocks(mirror, tract, lba, &hash)?;
@@ -296,14 +318,20 @@ impl Hamt {
         self.remove_leaf_blocks(mirror, tract, lba, &hash)?;
         // Zero the blocks themselves.
         let Some(doc) = read_doc(mirror, tract, lba, &hash)? else { return Ok(true) };
-        if let TractDoc::Direct { furrows, .. } = doc {
-            for f in furrows {
-                let mut t = Tract { base: tract.base, len: tract.len, plow: tract.plow, fence_limit: tract.fence_limit };
-                t.zero_delete(mirror, f)?;
+        match doc {
+            TractDoc::Direct { furrows, .. } => {
+                for f in furrows {
+                    tract.zero_delete(mirror, f)?;
+                }
             }
+            TractDoc::Extent { size, runs, .. } => {
+                for pos in expand_runs(&runs, size)? {
+                    tract.zero_delete(mirror, pos)?;
+                }
+            }
+            _ => {}
         }
-        let mut t = Tract { base: tract.base, len: tract.len, plow: tract.plow, fence_limit: tract.fence_limit };
-        t.zero_delete(mirror, lba)?;
+        tract.zero_delete(mirror, lba)?;
         Ok(true)
     }
 
@@ -337,7 +365,9 @@ impl Hamt {
                                 depth += 1;
                             }
                         },
-                        TractDoc::Lone { key: k, .. } | TractDoc::Direct { key: k, .. } => {
+                        TractDoc::Lone { key: k, .. }
+                        | TractDoc::Direct { key: k, .. }
+                        | TractDoc::Extent { key: k, .. } => {
                             return Ok(if &k == key { Some((lba, hash)) } else { None });
                         }
                         TractDoc::Furrow { .. } => return Err(Error::Corrupt("furrow in index position".into())),
@@ -356,71 +386,70 @@ impl Hamt {
         hash: &[u8; 32],
     ) -> Result<()> {
         self.delta.removed.push((lba, *hash));
-        if let Some(TractDoc::Direct { furrows, .. }) = read_doc(mirror, tract, lba, hash)? {
-            let mut buf = ZERO_BLOCK;
-            for f in furrows {
-                tract.read(mirror, f, &mut buf)?;
-                if let Some(h) = sealed_hp(&buf) {
-                    self.delta.removed.push((f, h));
+        match read_doc(mirror, tract, lba, hash)? {
+            Some(TractDoc::Direct { furrows, .. }) => {
+                let mut buf = ZERO_BLOCK;
+                for f in furrows {
+                    tract.read(mirror, f, &mut buf)?;
+                    if let Some(h) = sealed_hp(&buf) {
+                        self.delta.removed.push((f, h));
+                    }
                 }
             }
+            Some(TractDoc::Extent { size, runs, .. }) => {
+                let mut buf = ZERO_BLOCK;
+                for pos in expand_runs(&runs, size)? {
+                    tract.read(mirror, pos, &mut buf)?;
+                    if let Some(h) = sealed_hp(&buf) {
+                        self.delta.removed.push((pos, h));
+                    }
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
 
     // ======================================================================== flush ==================================================================
 
-    /// Write every dirty internal node to the tract, bottom-up, and return the new committed root (hash, lba). The all-zero hash means an empty index. Relocations triggered by the flush writes are self-repaired; the flush loops until quiescent.
-    pub fn flush<A: BlockDev, B: BlockDev, L: Liveness>(
+    /// Write every dirty internal node to the tract, bottom-up, and return the new committed root (hash, lba). The all-zero hash means an empty index. Appends never relocate anything, so one pass suffices; a Fenced/TractFull error leaves already-flushed children Committed in the arena and a retry resumes where it stopped.
+    pub fn flush<A: BlockDev, B: BlockDev>(
         &mut self,
         mirror: &mut Mirror<A, B>,
         tract: &mut Tract,
-        oracle: &L,
     ) -> Result<([u8; 32], u64)> {
-        for _ in 0..64 {
-            let root = self.root.clone();
-            let committed = match root {
-                None => return Ok(([0u8; 32], 0)),
-                Some(Child::Committed { hash, lba }) => (hash, lba),
-                Some(Child::Dirty(idx)) => {
-                    let (hash, lba, relocs) = self.flush_node(mirror, tract, oracle, idx)?;
-                    self.root = Some(Child::Committed { hash, lba });
-                    if !relocs.is_empty() {
-                        self.repair_relocs(mirror, tract, &relocs)?;
-                        continue; // repairs re-dirtied paths — flush again
-                    }
-                    (hash, lba)
-                }
-            };
-            self.arena.clear();
-            return Ok(committed);
-        }
-        Err(Error::Corrupt("flush failed to quiesce (relocation storm)".into()))
+        let root = self.root.clone();
+        let committed = match root {
+            None => return Ok(([0u8; 32], 0)),
+            Some(Child::Committed { hash, lba }) => (hash, lba),
+            Some(Child::Dirty(idx)) => {
+                let (hash, lba) = self.flush_node(mirror, tract, idx)?;
+                self.root = Some(Child::Committed { hash, lba });
+                (hash, lba)
+            }
+        };
+        self.arena.clear();
+        Ok(committed)
     }
 
-    fn flush_node<A: BlockDev, B: BlockDev, L: Liveness>(
+    fn flush_node<A: BlockDev, B: BlockDev>(
         &mut self,
         mirror: &mut Mirror<A, B>,
         tract: &mut Tract,
-        oracle: &L,
         idx: usize,
-    ) -> Result<([u8; 32], u64, Vec<Reloc>)> {
-        let mut relocs = Vec::new();
+    ) -> Result<([u8; 32], u64)> {
         // Children first.
         for c in 0..32 {
             if let Some(Child::Dirty(sub)) = self.arena[idx].children[c].clone() {
-                let (hash, lba, mut r) = self.flush_node(mirror, tract, oracle, sub)?;
+                let (hash, lba) = self.flush_node(mirror, tract, sub)?;
                 self.arena[idx].children[c] = Some(Child::Committed { hash, lba });
-                relocs.append(&mut r);
             }
         }
         let block = encode_node(&self.arena[idx]);
-        let out = tract.advance(mirror, oracle, core::slice::from_ref(&block), 0)?;
-        relocs.extend(out.relocations);
-        let lba = out.placed[0];
+        let lba = tract.append(mirror, core::slice::from_ref(&block))?[0];
         let hash = sealed_hp(&block).unwrap();
         self.delta.added.push((lba, hash));
-        Ok((hash, lba, relocs))
+        Ok((hash, lba))
     }
 
     /// Collect (lba, hash) of every live block reachable from the COMMITTED root: internal nodes, leaves, and furrows. The vault rebuilds its live set with this at open. Dirty state is not walked — call after from_root / flush.
@@ -467,14 +496,133 @@ impl Hamt {
                     }
                 }
             }
+            TractDoc::Extent { size, runs, .. } => {
+                let mut buf = ZERO_BLOCK;
+                for pos in expand_runs(&runs, size)? {
+                    tract.read(mirror, pos, &mut buf)?;
+                    if let Some(fh) = sealed_hp(&buf) {
+                        out.push((pos, fh));
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
     }
 
-    // ======================================================================== relocation repair =====================================================
+    // ======================================================================== the reap ==============================================================
 
-    /// Apply plow relocations to the index: each relocated block self-addresses (leaf → key, furrow → owner key + index, node → depth + route), so the repair is a directed descent, no reverse maps.
+    /// Clean one window at the reap: classify [reap, reap + window), re-append every survivor at the plow (clean space — source and target can never overlap), repair the index thru the COW path, and advance the reap. The caller commits the retiring generation; a crash or error before that commit leaves the committed head pointing at the intact originals and the window simply replays.
+    pub fn reap_window<A: BlockDev, B: BlockDev, L: Liveness>(
+        &mut self,
+        mirror: &mut Mirror<A, B>,
+        tract: &mut Tract,
+        oracle: &L,
+        window: u64,
+    ) -> Result<()> {
+        let start = tract.reap;
+        let w = window.min(tract.plow - start);
+        if w == 0 {
+            return Ok(());
+        }
+
+        // 1. Classify the window. Garbage (zeroed, torn, orphaned, superseded) is simply    not collected; survivors are grouped by what their self-address says they are.
+        let mut lones: Vec<(u64, [u8; 32])> = Vec::new();
+        let mut leaves: Vec<(u64, [u8; 32])> = Vec::new();
+        let mut nodes: Vec<(u64, [u8; 32])> = Vec::new();
+        let mut furrow_owners: HashMap<[u8; 32], Vec<(u64, u64)>> = HashMap::new();
+        let mut buf = ZERO_BLOCK;
+        for m in start..start + w {
+            let pos = m % tract.len;
+            tract.read(mirror, pos, &mut buf)?;
+            let Some(hp) = sealed_hp(&buf) else { continue };
+            if !oracle.is_live(pos, &hp) {
+                continue;
+            }
+            match decode_doc(&buf)? {
+                TractDoc::Lone { .. } => lones.push((pos, hp)),
+                TractDoc::Direct { .. } | TractDoc::Extent { .. } => leaves.push((pos, hp)),
+                TractDoc::Node(_) => nodes.push((pos, hp)),
+                TractDoc::Furrow { key, index, .. } => {
+                    furrow_owners.entry(key).or_default().push((pos, index))
+                }
+            }
+        }
+
+        // 2. Value-data moves, grouped per owner so each leaf is rebuilt once. Per move:
+        //    physical copy first, index repair second, liveness delta last — an error    between steps leaves only verified copies that a later window reaps as orphans.
+        for (key, mut group) in furrow_owners {
+            let Some((leaf_lba, leaf_hash)) = self.find_leaf(mirror, tract, &key)? else {
+                continue; // owner deleted — orphan furrows, garbage
+            };
+            match read_doc(mirror, tract, leaf_lba, &leaf_hash)? {
+                Some(TractDoc::Extent { key: k, size, runs }) if k == key => {
+                    group.sort_by_key(|&(_, idx)| idx);
+                    let mut payload = Vec::with_capacity(group.len());
+                    for &(pos, _) in &group {
+                        let mut b = ZERO_BLOCK;
+                        tract.read(mirror, pos, &mut b)?;
+                        payload.push(b);
+                    }
+                    let placed = tract.append(mirror, &payload)?;
+                    // Patch the moved positions into the run list, coalescing.
+                    // TODO(scale): expand_runs materializes one u64 per furrow (~24MB
+                    // transiently for a 12GB value) — fine on hosts, wants a run-walking
+                    // iterator for the no_std kernel profile.
+                    let mut positions = expand_runs(&runs, size)?;
+                    for (&(_, idx), &newpos) in group.iter().zip(&placed) {
+                        let i = idx as usize;
+                        if i >= positions.len() {
+                            return Err(Error::Corrupt("furrow index beyond its extent".into()));
+                        }
+                        positions[i] = newpos;
+                    }
+                    let new_runs = compress_runs(&positions);
+                    let new_leaf = encode_extent(&key, size, &new_runs)?;
+                    let nl = tract.append(mirror, core::slice::from_ref(&new_leaf))?[0];
+                    let nh = sealed_hp(&new_leaf).unwrap();
+                    self.replace_leaf(mirror, tract, &key, (leaf_hash, leaf_lba), (nh, nl))?;
+                    for (b, &lba) in payload.iter().zip(&placed) {
+                        self.delta.added.push((lba, sealed_hp(b).unwrap()));
+                    }
+                    for (&(pos, _), b) in group.iter().zip(&payload) {
+                        self.delta.removed.push((pos, sealed_hp(b).unwrap()));
+                    }
+                    self.delta.added.push((nl, nh));
+                    self.delta.removed.push((leaf_lba, leaf_hash));
+                }
+                Some(TractDoc::Direct { key: k, size, furrows }) if k == key => {
+                    // Legacy per-lba value (bounded by the old ~1MB cap): rewrite whole, upgrading it to extent form. put() retires every old block.
+                    let value = read_furrows(mirror, tract, &key, size, &furrows)?;
+                    self.put(mirror, tract, &key, &value)?;
+                }
+                _ => continue,
+            }
+        }
+
+        // 3. Standalone block moves: leaves first, then nodes (leaf repoints COW ancestor    nodes, superseding some — those are skipped, not moved). A block our own work    already retired (delta.removed) is garbage now.
+        for (pos, hp) in lones.into_iter().chain(leaves).chain(nodes) {
+            if self.delta.removed.iter().any(|&(l, h)| l == pos && h == hp) {
+                continue;
+            }
+            let mut b = ZERO_BLOCK;
+            tract.read(mirror, pos, &mut b)?;
+            if sealed_hp(&b) != Some(hp) {
+                continue; // changed underneath us — retired by an earlier step
+            }
+            let to = tract.append(mirror, core::slice::from_ref(&b))?[0];
+            self.repair_relocs(mirror, tract, &[Reloc { hp, from: pos, to }])?;
+            self.delta.added.push((to, hp));
+            self.delta.removed.push((pos, hp));
+        }
+
+        tract.reap = start + w;
+        Ok(())
+    }
+
+    // ======================================================================== index repair ===========================================================
+
+    /// Apply block moves to the index: each moved block self-addresses (leaf → key, node → depth + route), so the repair is a directed descent, no reverse maps. Furrow moves never arrive here — the reap rebuilds their owner's extent list instead.
     pub fn repair_relocs<A: BlockDev, B: BlockDev>(
         &mut self,
         mirror: &mut Mirror<A, B>,
@@ -489,48 +637,53 @@ impl Hamt {
             };
             debug_assert_eq!(hash, r.hp);
             match decode_doc(&buf)? {
-                TractDoc::Lone { key, .. } | TractDoc::Direct { key, .. } => {
-                    self.repoint_leaf(mirror, tract, &key, r)?;
+                TractDoc::Lone { key, .. }
+                | TractDoc::Direct { key, .. }
+                | TractDoc::Extent { key, .. } => {
+                    let root = self.root.clone();
+                    let new_root =
+                        self.repoint(mirror, tract, root, 0, &key, u8::MAX, (r.hp, r.from), (r.hp, r.to))?;
+                    self.root = new_root;
                 }
-                TractDoc::Furrow { key, index, .. } => {
-                    self.repoint_furrow(mirror, tract, &key, index, r)?;
+                TractDoc::Furrow { .. } => {
+                    return Err(Error::Corrupt("furrow move must be handled by the reap".into()));
                 }
                 TractDoc::Node(node) => {
-                    self.repoint_node(mirror, tract, &node.route, node.depth, r)?;
+                    let root = self.root.clone();
+                    let new_root = self.repoint(
+                        mirror,
+                        tract,
+                        root,
+                        0,
+                        &node.route,
+                        node.depth,
+                        (r.hp, r.from),
+                        (r.hp, r.to),
+                    )?;
+                    self.root = new_root;
                 }
             }
         }
         Ok(())
     }
 
-    fn repoint_leaf<A: BlockDev, B: BlockDev>(
+    /// Swap a leaf pointer for a REBUILT leaf (new hash AND new lba) — the reap's extent-list update.
+    fn replace_leaf<A: BlockDev, B: BlockDev>(
         &mut self,
         mirror: &mut Mirror<A, B>,
         tract: &Tract,
         key: &[u8; 32],
-        r: &Reloc,
+        old: ([u8; 32], u64),
+        new: ([u8; 32], u64),
     ) -> Result<()> {
         let root = self.root.clone();
-        let new_root = self.repoint(mirror, tract, root, 0, key, u8::MAX, r)?;
+        let new_root = self.repoint(mirror, tract, root, 0, key, u8::MAX, old, new)?;
         self.root = new_root;
         Ok(())
     }
 
-    fn repoint_node<A: BlockDev, B: BlockDev>(
-        &mut self,
-        mirror: &mut Mirror<A, B>,
-        tract: &Tract,
-        route: &[u8; 32],
-        depth: u8,
-        r: &Reloc,
-    ) -> Result<()> {
-        let root = self.root.clone();
-        let new_root = self.repoint(mirror, tract, root, 0, route, depth, r)?;
-        self.root = new_root;
-        Ok(())
-    }
-
-    /// Descend along `key` to the child whose (hash, lba) matches the relocation, COWing the path; stop at `target_depth` for internal nodes (u8::MAX = leaf hunt).
+    /// Descend along `key` to the child whose (hash, lba) matches `old`, COWing the path, and swap in `new`; stop at `target_depth` for internal nodes (u8::MAX = leaf hunt).
+    #[allow(clippy::too_many_arguments)]
     fn repoint<A: BlockDev, B: BlockDev>(
         &mut self,
         mirror: &mut Mirror<A, B>,
@@ -539,12 +692,13 @@ impl Hamt {
         depth: u8,
         key: &[u8; 32],
         target_depth: u8,
-        r: &Reloc,
+        old: ([u8; 32], u64),
+        new: ([u8; 32], u64),
     ) -> Result<Option<Child>> {
         match slot {
             None => Ok(None),
-            Some(Child::Committed { hash, lba }) if hash == r.hp && lba == r.from => {
-                Ok(Some(Child::Committed { hash, lba: r.to }))
+            Some(Child::Committed { hash, lba }) if hash == old.0 && lba == old.1 => {
+                Ok(Some(Child::Committed { hash: new.0, lba: new.1 }))
             }
             Some(Child::Committed { hash, lba }) => {
                 if target_depth != u8::MAX && depth > target_depth + 1 {
@@ -560,7 +714,8 @@ impl Hamt {
                         self.delta.removed.push((lba, hash));
                         let c = chunk(key, depth) as usize;
                         let sub = self.arena[idx].children[c].clone();
-                        let new_sub = self.repoint(mirror, tract, sub, depth + 1, key, target_depth, r)?;
+                        let new_sub =
+                            self.repoint(mirror, tract, sub, depth + 1, key, target_depth, old, new)?;
                         self.arena[idx].children[c] = new_sub;
                         Ok(Some(Child::Dirty(idx)))
                     }
@@ -570,35 +725,39 @@ impl Hamt {
             Some(Child::Dirty(idx)) => {
                 let c = chunk(key, depth) as usize;
                 let sub = self.arena[idx].children[c].clone();
-                let new_sub = self.repoint(mirror, tract, sub, depth + 1, key, target_depth, r)?;
+                let new_sub = self.repoint(mirror, tract, sub, depth + 1, key, target_depth, old, new)?;
                 self.arena[idx].children[c] = new_sub;
                 Ok(Some(Child::Dirty(idx)))
             }
         }
     }
 
-    fn repoint_furrow<A: BlockDev, B: BlockDev>(
+    /// TEST/MIGRATION AID — write a value in the LEGACY per-lba direct format, exactly as pre-extent engines did. Exists so migration tests can build old-format state.
+    #[doc(hidden)]
+    pub fn put_legacy_direct_for_tests<A: BlockDev, B: BlockDev>(
         &mut self,
         mirror: &mut Mirror<A, B>,
-        tract: &Tract,
+        tract: &mut Tract,
         key: &[u8; 32],
-        _index: u64,
-        r: &Reloc,
+        value: &[u8],
     ) -> Result<()> {
-        // The furrow's owner leaf lists its lbas; rebuild the leaf with the moved lba. Find the leaf, rewrite it as a fresh tract block, repoint the index at it. v0: the leaf rewrite rides the next flush via a dirty path with a REBUILT leaf — implemented as read-modify-write thru put-like machinery.
-        let Some((leaf_lba, leaf_hash)) = self.find_leaf(mirror, tract, key)? else {
-            return Ok(()); // owner already gone (deleted) — orphan furrow, plow will reap
-        };
-        let Some(TractDoc::Direct { key: k, size, mut furrows }) = read_doc(mirror, tract, leaf_lba, &leaf_hash)? else {
-            return Ok(());
-        };
-        for f in furrows.iter_mut() {
-            if *f == r.from {
-                *f = r.to;
-            }
+        let per = furrow_capacity();
+        let payload: Vec<Block> = value
+            .chunks(per)
+            .enumerate()
+            .map(|(i, c)| encode_furrow(key, i as u64, c))
+            .collect();
+        let placed = tract.append(mirror, &payload)?;
+        for (lba, b) in placed.iter().zip(&payload) {
+            self.delta.added.push((*lba, sealed_hp(b).unwrap()));
         }
-        // Rebuild the leaf in place in the dirty trie: mark old leaf removed, splice a rebuilt one. The rebuilt leaf block is written at flush time? Leaves are committed-on-write by design — write it now WITHOUT an oracle-advance (caller context lacks the oracle here), so we defer: store as dirty-leaf is unsupported in v0 → conservative: leave the OLD lba list in the leaf; the stale furrow lba still holds the original copy until the fence expires, and the next overwrite of this key rebuilds everything. Record nothing.
-        let _ = (k, size, furrows);
+        let leaf = encode_direct(key, value.len() as u64, &placed);
+        let lba = tract.append(mirror, core::slice::from_ref(&leaf))?[0];
+        let hash = sealed_hp(&leaf).unwrap();
+        self.delta.added.push((lba, hash));
+        let root = self.root.clone();
+        let new_root = self.insert_child(mirror, tract, root, 0, key, Child::Committed { hash, lba })?;
+        self.root = Some(new_root);
         Ok(())
     }
 }
@@ -645,6 +804,11 @@ pub fn lone_capacity() -> usize {
     BLOCK - body_start() - (1 << 7)
 }
 
+/// Run slots one extent leaf can hold: each run is two EWE fields (start, count), conservatively ≤ 32 bytes, against a 96-byte envelope margin. Fresh values use 1-2 runs regardless of size; only reap-window boundary crossings add fragments, and consecutive windows re-coalesce them — the bound is never approached in practice.
+pub fn max_runs() -> usize {
+    (BLOCK - body_start() - 96) / 32
+}
+
 /// Max furrow payload per block.
 pub fn furrow_capacity() -> usize {
     BLOCK - body_start() - (1 << 7)
@@ -656,6 +820,55 @@ fn encode_lone(key: &[u8; 32], value: &[u8]) -> Block {
     put_field(&mut buf, &mut cursor, "v", VsfType::v(b'r', value.to_vec()));
     seal_block(&mut buf, body_start());
     buf
+}
+
+fn encode_extent(key: &[u8; 32], size: u64, runs: &[(u64, u64)]) -> Result<Block> {
+    if runs.len() > max_runs() {
+        return Err(Error::Corrupt(format!(
+            "extent leaf overflow: {} runs > {} — value pathologically fragmented",
+            runs.len(),
+            max_runs()
+        )));
+    }
+    let (mut buf, mut cursor) = begin_block(SCHEMA_EXTENT);
+    put_field(&mut buf, &mut cursor, "key", VsfType::hp(key.to_vec()));
+    put_field(&mut buf, &mut cursor, "size", VsfType::u(size as usize, false));
+    for (s, c) in runs {
+        put_field(&mut buf, &mut cursor, "s", VsfType::u(*s as usize, false));
+        put_field(&mut buf, &mut cursor, "c", VsfType::u(*c as usize, false));
+    }
+    seal_block(&mut buf, body_start());
+    Ok(buf)
+}
+
+/// The value's furrow position for every index, in order. Runs never wrap internally (appends split at the ring boundary), so expansion is plain arithmetic.
+fn expand_runs(runs: &[(u64, u64)], size: u64) -> Result<Vec<u64>> {
+    let mut out = Vec::new();
+    for (s, c) in runs {
+        for j in 0..*c {
+            out.push(s + j);
+        }
+    }
+    let expect = size.div_ceil(furrow_capacity() as u64) as usize;
+    if out.len() != expect {
+        return Err(Error::Corrupt(format!(
+            "extent run total {} != furrow count {expect}",
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
+/// Compress an in-order position list back to (start, count) runs.
+fn compress_runs(positions: &[u64]) -> Vec<(u64, u64)> {
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for &p in positions {
+        match runs.last_mut() {
+            Some((s, c)) if *s + *c == p => *c += 1,
+            _ => runs.push((p, 1)),
+        }
+    }
+    runs
 }
 
 fn encode_direct(key: &[u8; 32], size: u64, furrows: &[u64]) -> Block {
@@ -752,6 +965,8 @@ fn decode_doc(block: &Block) -> Result<TractDoc> {
     let mut hashes: Vec<[u8; 32]> = Vec::new();
     let mut lbas: Vec<u64> = Vec::new();
     let mut furrows: Vec<u64> = Vec::new();
+    let mut run_starts: Vec<u64> = Vec::new();
+    let mut run_counts: Vec<u64> = Vec::new();
 
     while block.get(ptr) == Some(&b'd') {
         let VsfType::d(name) = parse(block, &mut ptr).map_err(|e| Error::Corrupt(format!("{e:?}")))? else {
@@ -769,6 +984,8 @@ fn decode_doc(block: &Block) -> Result<TractDoc> {
             ("ch", VsfType::hp(h)) => hashes.push(h.try_into().map_err(|_| Error::Corrupt("ch len".into()))?),
             ("at", ref u) if as_u64(u).is_some() => lbas.push(as_u64(u).unwrap()),
             ("f", ref u) if as_u64(u).is_some() => furrows.push(as_u64(u).unwrap()),
+            ("s", ref u) if as_u64(u).is_some() => run_starts.push(as_u64(u).unwrap()),
+            ("c", ref u) if as_u64(u).is_some() => run_counts.push(as_u64(u).unwrap()),
             _ => {}
         }
     }
@@ -778,6 +995,16 @@ fn decode_doc(block: &Block) -> Result<TractDoc> {
             key: key.ok_or_else(|| Error::Corrupt("lone: missing key".into()))?,
             value: value.ok_or_else(|| Error::Corrupt("lone: missing value".into()))?,
         }),
+        SCHEMA_EXTENT => {
+            if run_starts.len() != run_counts.len() {
+                return Err(Error::Corrupt("extent: run start/count mismatch".into()));
+            }
+            Ok(TractDoc::Extent {
+                key: key.ok_or_else(|| Error::Corrupt("extent: missing key".into()))?,
+                size: size.ok_or_else(|| Error::Corrupt("extent: missing size".into()))?,
+                runs: run_starts.into_iter().zip(run_counts).collect(),
+            })
+        }
         SCHEMA_DIRECT => Ok(TractDoc::Direct {
             key: key.ok_or_else(|| Error::Corrupt("direct: missing key".into()))?,
             size: size.ok_or_else(|| Error::Corrupt("direct: missing size".into()))?,

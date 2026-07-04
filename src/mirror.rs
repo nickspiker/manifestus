@@ -100,6 +100,24 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
         Ok(())
     }
 
+    /// Extend every present device to `new_blocks`, same failure matrix as writes: primary must grow or the op fails; a secondary that refuses is dropped for the session (`degraded` flips) — the primary carries the new geometry alone.
+    pub fn grow(&mut self, new_blocks: u64) -> Result<()> {
+        match (self.a.as_mut(), self.b.as_mut()) {
+            (Some(a), b) => {
+                a.grow(new_blocks)?;
+                if let Some(b) = b {
+                    if b.grow(new_blocks).is_err() {
+                        self.b = None;
+                        self.degraded = true;
+                    }
+                }
+                Ok(())
+            }
+            (None, Some(b)) => b.grow(new_blocks),
+            (None, None) => Err(Error::Corrupt("mirror has no devices".into())),
+        }
+    }
+
     /// Read from the first healthy device. Content validation (hp / Empty / Corrupt classification) is the layer above — the mirror only routes.
     pub fn read(&mut self, lba: u64, buf: &mut Block) -> Result<()> {
         if let Some(a) = self.a.as_mut() {
