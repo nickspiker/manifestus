@@ -119,6 +119,19 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
     }
 
     /// Read from the first healthy device. Content validation (hp / Empty / Corrupt classification) is the layer above — the mirror only routes.
+    ///
+    /// TODO(read-repair): "healthy" here means *present*, not *this block verified* — a Corrupt block on
+    /// the primary is returned even when the sibling holds a clean copy. The intended design is
+    /// relocation-not-repair (see README "Bad-block relocation"), and it SPLITS BY STORAGE PROFILE:
+    ///   - Host profile (managed flash): the FTL below already remaps bad blocks, so stay stateless —
+    ///     relocate forward + rewrite the ref (tract) / burn a generation (ring), re-try the sector next
+    ///     pass, no tombstone map of our own.
+    ///   - Kernel profile (raw NAND we manage): a bad block stays bad, so read/check a bad-block tombstone
+    ///     (distinct from the deleted-zero) on both paths before write/verify; a map only if that check
+    ///     proves too costly.
+    /// Both rings lock-step relocate to stay byte-identical; the ref re-point (tract) / new spine entry
+    /// (ring) is the commit, tombstones advisory. Needed before the calls/attachments layer (one bad
+    /// block in a large recording must self-heal, not surface as Corrupt).
     pub fn read(&mut self, lba: u64, buf: &mut Block) -> Result<()> {
         if let Some(a) = self.a.as_mut() {
             return a.read(lba, buf);
