@@ -10,8 +10,10 @@
 //!
 //! Hybrid write path: the bulk *data* blocks of a commit go through [`Mirror::write_verified_batch`], which writes both rings concurrently (each ring is its own disk — the ferros two-device case, in software for now) and verifies both, reconciled with the same primary-authoritative rule. The single-block [`Mirror::write_verified`] stays sequential and is what the authoritative spine commit uses, so "one device defines the committed generation" is unchanged.
 
+use alloc::boxed::Box;
 use crate::block::{Block, BlockDev, ZERO_BLOCK};
 use crate::error::{Error, Result};
+use crate::events::{EventSink, NullSink, StorageEvent};
 
 /// Below this many blocks a batch writes sequentially — spawning threads to mirror a handful of 4KB blocks costs more than it saves. Bulk writes (furrow shards, large flushes) clear it easily; a prototype knob to tune against benchmarks.
 #[cfg(feature = "std")]
@@ -32,6 +34,8 @@ pub struct Mirror<A: BlockDev, B: BlockDev> {
     b: Option<B>,
     degraded: bool,
     scratch: Block,
+    /// Outbound event sink. Defaults to [`NullSink`]; the embedder attaches its own via [`Mirror::with_events`] (Photon → log.vsf, kernel → Ledger::Vault). Off the hot path — emitted only when a mirror drops to degraded, never per block.
+    events: Box<dyn EventSink>,
 }
 
 impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
@@ -41,7 +45,14 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
             b: Some(b),
             degraded: false,
             scratch: ZERO_BLOCK,
+            events: Box::new(NullSink),
         }
+    }
+
+    /// Attach an event sink. Builder-style so no construction call site changes — the default is silent.
+    pub fn with_events(mut self, sink: Box<dyn EventSink>) -> Self {
+        self.events = sink;
+        self
     }
 
     /// Assemble from whatever survived open — a missing mirror starts the session degraded. Errors if neither device is present.
@@ -55,6 +66,7 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
             b,
             degraded,
             scratch: ZERO_BLOCK,
+            events: Box::new(NullSink),
         })
     }
 
@@ -68,6 +80,7 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
                     if write_one(b, lba, buf, &mut self.scratch).is_err() {
                         self.b = None;
                         self.degraded = true;
+                        self.events.emit(StorageEvent::MirrorDegraded);
                     }
                 }
                 Ok(())
@@ -96,6 +109,7 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
                 if !b_ok {
                     self.b = None;
                     self.degraded = true;
+                    self.events.emit(StorageEvent::MirrorDegraded);
                 }
                 return Ok(());
             }
@@ -115,6 +129,7 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
                     if b.grow(new_blocks).is_err() {
                         self.b = None;
                         self.degraded = true;
+                        self.events.emit(StorageEvent::MirrorDegraded);
                     }
                 }
                 Ok(())
