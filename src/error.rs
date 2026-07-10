@@ -1,9 +1,13 @@
 //! Error type for the manifestus engine.
 
+use alloc::string::String;
+#[cfg(feature = "std")]
 use std::io;
 
 #[derive(Debug)]
 pub enum Error {
+    /// Host-profile I/O failure (FileDev). Kernel BlockDev backends report Verify/Bounds/Corrupt instead — there is no io::Error below them.
+    #[cfg(feature = "std")]
     Io(io::Error),
     BadMagic,
     /// Seal verification failed — the block's hp does not match BLAKE3 of its body.
@@ -20,15 +24,17 @@ pub enum Error {
     TractFull,
 }
 
+#[cfg(feature = "std")]
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
         Error::Io(e)
     }
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            #[cfg(feature = "std")]
             Error::Io(e) => write!(f, "I/O: {}", e),
             Error::BadMagic => write!(f, "not a manifestus file (bad magic)"),
             Error::Seal => write!(f, "seal verification failed"),
@@ -41,6 +47,6 @@ impl std::fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = core::result::Result<T, Error>;

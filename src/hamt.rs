@@ -21,7 +21,8 @@ pub const SCHEMA_EXTENT: &str = "manifestus.extent";
 pub const SCHEMA_DIRECT: &str = "manifestus.direct";
 pub const SCHEMA_FURROW: &str = "manifestus.furrow";
 
-use std::collections::HashMap;
+use alloc::{format, string::ToString, vec, vec::Vec};
+use hashbrown::HashMap;
 
 /// 5-bit chunk of the key at `depth`. 256 bits / 5 = 51 full levels — two distinct keys always diverge within 52.
 fn chunk(key: &[u8; 32], depth: u8) -> u8 {

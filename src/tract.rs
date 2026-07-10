@@ -10,6 +10,7 @@
 //! The tract interprets NOTHING about block contents beyond sealedness (RÅ + hp).
 //! Liveness is the caller's knowledge (the HAMT), injected via [`Liveness`].
 
+use alloc::vec::Vec;
 use crate::block::{Block, BlockDev};
 use crate::error::{Error, Result};
 use crate::mirror::Mirror;

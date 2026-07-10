@@ -4,10 +4,15 @@
 //!
 //! Layering: [`Vault`] composes [`ring::Ring`] + [`tract::Tract`] + [`hamt::Hamt`] over a [`Mirror`] of [`BlockDev`]s. Host backs devices with [`FileDev`] (O_DIRECT discipline); the ferros kernel backs them with UFS/SD HAL. Design contract: the ferros specs (RING.md / VAULT.md / HAMT.md) + the host-profile resolutions in the README.
 //!
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
 pub mod block;
 pub mod error;
+pub mod events;
 pub mod hamt;
-#[cfg(any(unix, windows))]
+#[cfg(all(feature = "std", any(unix, windows)))]
 pub mod host;
 pub mod inspect;
 pub mod mirror;
@@ -16,7 +21,8 @@ pub mod tract;
 pub mod vault;
 
 pub use block::{Block, BlockDev, BLOCK, ZERO_BLOCK};
-#[cfg(any(unix, windows))]
+pub use events::{EventSink, NullSink, StorageEvent};
+#[cfg(all(feature = "std", any(unix, windows)))]
 pub use host::FileDev;
 pub use inspect::{inspect, InspectOptions, InspectReport};
 pub use mirror::Mirror;

@@ -14,9 +14,11 @@ use crate::block::{Block, BlockDev, ZERO_BLOCK};
 use crate::error::{Error, Result};
 
 /// Below this many blocks a batch writes sequentially — spawning threads to mirror a handful of 4KB blocks costs more than it saves. Bulk writes (furrow shards, large flushes) clear it easily; a prototype knob to tune against benchmarks.
+#[cfg(feature = "std")]
 const PAR_BATCH_THRESHOLD: usize = 4;
 
 /// Write + verify every block of a batch on one device, with a device-local scratch (so concurrent device threads never share the read-back buffer).
+#[cfg(feature = "std")]
 fn write_each<D: BlockDev>(dev: &mut D, blocks: &[(u64, &Block)]) -> Result<()> {
     let mut scratch = ZERO_BLOCK;
     for &(lba, buf) in blocks {
@@ -77,25 +79,29 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
 
     /// Concurrent bulk write: fan the whole batch out to both rings on separate threads (each writes + read-back-verifies its own device with a private scratch), then reconcile. The primary stays authoritative — its failure fails the op; a secondary failure drops the ring and flips `degraded`. This is the hybrid for the data-block phase of a commit; the authoritative spine commit still uses the sequential [`write_verified`]. A single device, or a batch below [`PAR_BATCH_THRESHOLD`], falls back to sequential. Per-block discipline is unchanged: write → flush → read back → compare → retry once.
     pub fn write_verified_batch(&mut self, blocks: &[(u64, &Block)]) -> Result<()> {
-        let both = self.a.is_some() && self.b.is_some();
-        if !both || blocks.len() < PAR_BATCH_THRESHOLD {
-            for &(lba, buf) in blocks {
-                self.write_verified(lba, buf)?;
+        // The parallel fan-out needs std threads; the kernel profile always takes the sequential path below (per-block discipline is identical, wall-clock is the only difference).
+        #[cfg(feature = "std")]
+        {
+            let both = self.a.is_some() && self.b.is_some();
+            if both && blocks.len() >= PAR_BATCH_THRESHOLD {
+                let a = self.a.as_mut().unwrap();
+                let b = self.b.as_mut().unwrap();
+                let (a_res, b_ok) = std::thread::scope(|s| {
+                    let bh = s.spawn(move || write_each(b, blocks));
+                    let a_res = write_each(a, blocks);
+                    (a_res, matches!(bh.join(), Ok(Ok(()))))
+                });
+                // Primary authoritative: the secondary's writes landed in uncommitted COW slack, so dropping the ring on failure loses nothing committed.
+                a_res?;
+                if !b_ok {
+                    self.b = None;
+                    self.degraded = true;
+                }
+                return Ok(());
             }
-            return Ok(());
         }
-        let a = self.a.as_mut().unwrap();
-        let b = self.b.as_mut().unwrap();
-        let (a_res, b_ok) = std::thread::scope(|s| {
-            let bh = s.spawn(move || write_each(b, blocks));
-            let a_res = write_each(a, blocks);
-            (a_res, matches!(bh.join(), Ok(Ok(()))))
-        });
-        // Primary authoritative: the secondary's writes landed in uncommitted COW slack, so dropping the ring on failure loses nothing committed.
-        a_res?;
-        if !b_ok {
-            self.b = None;
-            self.degraded = true;
+        for &(lba, buf) in blocks {
+            self.write_verified(lba, buf)?;
         }
         Ok(())
     }

@@ -6,7 +6,8 @@
 //!
 //! Layering: reads via [`crate::block::BlockDev`] only — one ring file is one `FileDev`; the mirror-compare path opens the two ring files independently and compares heads. No `Mirror`, no `Vault::open` (except the optional cross-check), so the inspector sees each physical side as it is, including divergence.
 
-use std::collections::BTreeSet;
+use alloc::collections::BTreeSet;
+use alloc::{format, string::{String, ToString}, vec::Vec};
 
 use crate::block::{Block, BlockDev, BLOCK, ZERO_BLOCK};
 use crate::error::Result;

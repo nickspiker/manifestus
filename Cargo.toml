@@ -7,15 +7,25 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/nickspiker/manifestus"
 readme = "README.md"
 
+[features]
+# std (default): host profile — FileDev, threaded mirror writes, io::Error interop, fast blake3.
+# Without it the engine core is no_std + alloc for the ferros kernel (BlockDev over UFS/SD HAL).
+default = ["std"]
+std = ["blake3/std", "vsf/std"]
+
 [dependencies]
-blake3 = "1"
+# "pure": pure-Rust BLAKE3, no C/asm — the ferros convention (same incantation as ferros_pt), and required for the bare-metal target where blake3's C build script has no cross compiler.
+blake3 = { version = "1", default-features = false, features = ["pure"] }
 # EWE + typed fields for spine entries / furrows / HAMT nodes. No text features — the engine uses d/u/h/e types only, never x.
-vsf = { path = "../vsf", default-features = false, features = ["std"] }
+vsf = { path = "../vsf", default-features = false }
+# The two engine maps (LiveSet, reap furrow_owners). hashbrown IS std's HashMap — same O(1) behavior (preserving the vault.rs HashMap PROOF), available under no_std. Keys are u64 positions / BLAKE3 outputs, so bucket-collision attacks are not a concern for the default hasher.
+hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }
 
 # Structural vault inspector (vsfinfo-style). Host-only — it backs the device with FileDev.
 [[bin]]
 name = "vaultinfo"
 path = "src/bin/vaultinfo.rs"
+required-features = ["std"]
 
 [dev-dependencies]
 tempfile = "3"
