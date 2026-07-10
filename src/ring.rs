@@ -7,6 +7,7 @@
 //! - Empty: zeroed / no magic — expected state (sparse ring, pre-genesis), sorts below all valid.
 //! - Corrupt: magic present but hp fails, OR valid-but-misplaced (congruence fails) — AMBIGUOUS, never compared; head search branches both halves around it.
 
+use alloc::{format, string::ToString, vec, vec::Vec};
 use crate::block::{Block, BlockDev, BLOCK, ZERO_BLOCK};
 use crate::error::{Error, Result};
 use crate::mirror::Mirror;

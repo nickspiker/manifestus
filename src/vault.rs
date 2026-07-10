@@ -13,7 +13,8 @@ use crate::hamt::{Delta, Hamt};
 use crate::mirror::Mirror;
 use crate::ring::{any_sealed_block, append_root, read_root, zero_ring, zero_ring_at, Ring, RootEntry, SpineEntry, FENCE_K, ROOT_SLOTS};
 use crate::tract::{Liveness, Tract};
-use std::collections::HashMap;
+use alloc::{format, vec::Vec};
+use hashbrown::HashMap;
 
 /// The vault's knowledge of what is referenced: tract lba → sealing hash. Rebuilt from the committed HAMT at open; maintained by deltas afterward. This IS the reap's liveness oracle.
 ///
