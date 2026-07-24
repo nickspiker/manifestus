@@ -21,7 +21,14 @@ use vsf::types::VsfType;
 const SCHEMA_NODE: &str = "manifestus.hamt";
 const SCHEMA_LONE: &str = "manifestus.lone";
 const SCHEMA_DIRECT: &str = "manifestus.direct";
+const SCHEMA_EXTENT: &str = "manifestus.extent";
 const SCHEMA_FURROW: &str = "manifestus.furrow";
+
+/// Furrow payload capacity — computed the same way the engine computes it (block minus envelope), locally so the decoder stands alone.
+fn furrow_capacity() -> u64 {
+    let body_start = 4 + VsfType::hp(alloc::vec![0u8; 32]).flatten().len() + 1;
+    (BLOCK - body_start - (1 << 7)) as u64
+}
 
 /// What to show + how hard to look.
 #[derive(Clone, Copy)]
@@ -65,6 +72,14 @@ pub enum TractBlock {
         size: u64,
         furrows: Vec<u64>,
     },
+    /// Extent value leaf: owner key, total size, furrow (start, count) runs.
+    Extent {
+        key: [u8; 32],
+        size: u64,
+        runs: Vec<(u64, u64)>,
+    },
+    /// A committed pointer whose target block is all-zero: a fast-deleted leaf. Legal state (lookups return None); the pointer is stale, not corrupt, and the block is NOT live.
+    Stale,
     /// One shard of a sharded value.
     Furrow {
         key: [u8; 32],
@@ -317,6 +332,8 @@ pub fn decode_tract(block: &Block) -> core::result::Result<([u8; 32], TractBlock
     let mut hashes: Vec<[u8; 32]> = Vec::new();
     let mut lbas: Vec<u64> = Vec::new();
     let mut furrows: Vec<u64> = Vec::new();
+    let mut run_starts: Vec<u64> = Vec::new();
+    let mut run_counts: Vec<u64> = Vec::new();
 
     while block.get(ptr) == Some(&b'd') {
         let VsfType::d(name) = parse(block, &mut ptr).map_err(|e| format!("name: {e:?}"))? else {
@@ -346,6 +363,16 @@ pub fn decode_tract(block: &Block) -> core::result::Result<([u8; 32], TractBlock
                     furrows.push(x);
                 }
             }
+            ("s", ref u) => {
+                if let Some(x) = as_u64(u) {
+                    run_starts.push(x);
+                }
+            }
+            ("c", ref u) => {
+                if let Some(x) = as_u64(u) {
+                    run_counts.push(x);
+                }
+            }
             _ => {}
         }
     }
@@ -360,6 +387,20 @@ pub fn decode_tract(block: &Block) -> core::result::Result<([u8; 32], TractBlock
             size: size.ok_or("direct: missing size")?,
             furrows,
         },
+        SCHEMA_EXTENT => {
+            if run_starts.len() != run_counts.len() {
+                return Err(format!(
+                    "extent: {} run starts != {} run counts",
+                    run_starts.len(),
+                    run_counts.len()
+                ));
+            }
+            TractBlock::Extent {
+                key: key.ok_or("extent: missing key")?,
+                size: size.ok_or("extent: missing size")?,
+                runs: run_starts.into_iter().zip(run_counts).collect(),
+            }
+        }
         SCHEMA_FURROW => TractBlock::Furrow {
             key: key.ok_or("furrow: missing key")?,
             index: index.ok_or("furrow: missing index")?,
@@ -431,9 +472,22 @@ fn walk_tree<D: BlockDev>(
         });
         return Ok(());
     }
-    reachable.insert(lba);
     let mut buf = ZERO_BLOCK;
     dev.read(abs, &mut buf)?;
+
+    // All-zero target = fast-deleted leaf behind a stale committed pointer: legal, not live, not reachable (mirrors the engine's walk_live skip).
+    if buf == ZERO_BLOCK {
+        out.push(TreeNode {
+            indent,
+            lba,
+            doc: TractBlock::Stale,
+            seal_ok: true,
+            self_addr_ok: true,
+            note: Some(format!("stale pointer {} -> zeroed block (fast-deleted; not live)", hex8(&expected_hash))),
+        });
+        return Ok(());
+    }
+    reachable.insert(lba);
 
     match decode_tract(&buf) {
         Err(reason) => {
@@ -474,22 +528,45 @@ fn walk_tree<D: BlockDev>(
                         )?;
                     }
                 }
-                TractBlock::Lone { key, .. } | TractBlock::Direct { key, .. } => {
+                TractBlock::Lone { key, .. }
+                | TractBlock::Direct { key, .. }
+                | TractBlock::Extent { key, .. } => {
                     *n_leaves += 1;
                     // Self-address: the leaf's key must route to here — every chunk 0..depth of the key matches the path taken.
                     let self_addr_ok = (0..depth).all(|d| chunk(key, d) == chunk(&path_route, d));
-                    let furrow_lbas = if let TractBlock::Direct { furrows, .. } = &doc {
-                        furrows.clone()
-                    } else {
-                        Vec::new()
+                    // Furrow positions: Direct lists them one by one; Extent lists (start, count) runs whose expansion must total ceil(size / furrow_capacity).
+                    let (furrow_lbas, run_note) = match &doc {
+                        TractBlock::Direct { furrows, .. } => (furrows.clone(), None),
+                        TractBlock::Extent { size, runs, .. } => {
+                            let mut positions = Vec::new();
+                            for (s, c) in runs {
+                                for j in 0..*c {
+                                    positions.push(s + j);
+                                }
+                            }
+                            let expect = size.div_ceil(furrow_capacity());
+                            let rn = if positions.len() as u64 != expect {
+                                Some(format!("extent run total {} != furrow count {expect}", positions.len()))
+                            } else {
+                                None
+                            };
+                            (positions, rn)
+                        }
+                        _ => (Vec::new(), None),
+                    };
+                    let run_bad = run_note.is_some();
+                    let note = match (note, run_note) {
+                        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+                        (a, b) => a.or(b),
                     };
                     let key_copy = *key;
-                    out.push(TreeNode { indent, lba, doc, seal_ok, self_addr_ok, note });
-                    // Walk furrows of a Direct leaf (their hashes aren't in the index — verify seal + owner only).
+                    out.push(TreeNode { indent, lba, doc, seal_ok, self_addr_ok: self_addr_ok && !run_bad, note });
+                    // Walk furrows (their hashes aren't in the index — verify seal + owner/index only).
                     for (i, flba) in furrow_lbas.iter().enumerate() {
                         walk_furrow(dev, tract_base, *flba, &key_copy, i as u64, indent + 1, out, reachable, n_furrows)?;
                     }
                 }
+                TractBlock::Stale => unreachable!("Stale is synthesized above, never decoded"),
                 TractBlock::Furrow { .. } => {
                     // A furrow in index position is malformed; record it.
                     out.push(TreeNode {
@@ -821,6 +898,11 @@ impl InspectReport {
                     TractBlock::Direct { key, size, furrows } => {
                         format!("direct key {}  size {} ({}), {} furrow(s)", hex8(key), size, humanize(*size as usize), furrows.len())
                     }
+                    TractBlock::Extent { key, size, runs } => {
+                        let rs: Vec<String> = runs.iter().map(|(s, c)| format!("{s}+{c}")).collect();
+                        format!("extent key {}  size {} ({}), runs [{}]", hex8(key), size, humanize(*size as usize), rs.join(", "))
+                    }
+                    TractBlock::Stale => "stale (fast-deleted target)".to_string(),
                     TractBlock::Furrow { index, payload_len, .. } => {
                         format!("furrow #{index}  ({} bytes)", payload_len)
                     }

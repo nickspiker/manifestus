@@ -22,7 +22,8 @@ pub enum StorageEvent {
 }
 
 /// The injected sink. Implementations must be cheap and non-blocking from the engine's point of view — buffering and durability are the embedder's problem, not the engine's.
-pub trait EventSink {
+/// `Send` because embedders hold the storage (and the boxed sink inside it) across threads — kete's FlatStorage is cloned into worker threads thruout photon, and an un-Send sink poisons every one of those spawns.
+pub trait EventSink: Send {
     fn emit(&mut self, event: StorageEvent);
 }
 

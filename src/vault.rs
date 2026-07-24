@@ -9,7 +9,7 @@
 
 use crate::block::{BlockDev, ZERO_BLOCK};
 use crate::error::{Error, Result};
-use crate::hamt::{Delta, Hamt};
+use crate::hamt::{DanglingPointer, Delta, Hamt, StalePointer};
 use crate::mirror::Mirror;
 use crate::ring::{any_sealed_block, append_root, read_root, zero_ring, zero_ring_at, Ring, RootEntry, SpineEntry, FENCE_K, ROOT_SLOTS};
 use crate::tract::{Liveness, Tract};
@@ -51,6 +51,13 @@ impl Liveness for LiveSet {
     fn is_live(&self, lba: u64, hp: &[u8; 32]) -> bool {
         self.map.get(&lba) == Some(hp)
     }
+}
+
+/// What `Vault::open_repairing` pruned: stale pointers (target zeroed — the deleted-but-never-unlinked legal state, no data behind them) and dangling pointers (target reused/corrupt — the referenced value is LOST).
+#[derive(Debug, Default)]
+pub struct RepairReport {
+    pub stale: Vec<StalePointer>,
+    pub dangling: Vec<DanglingPointer>,
 }
 
 /// Proactive reap trigger: dead > 25% of the tract → one window after the commit.
@@ -241,6 +248,39 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         })
     }
 
+    /// Open with DANGLING-POINTER REPAIR — the recovery entry point for vaults bricked by the pre-fix tombstone bug (a fast-deleted key's pointer surviving into a reused slot). Walks the committed index tolerantly, prunes every pointer whose target is stale (zeroed) or dangling (reused/corrupt), COMMITS the pruned index, and reports exactly what was dropped. The values behind dangling pointers are unrecoverable by construction (their blocks were overwritten); everything else is preserved byte-for-byte. NEVER the default open: a strict open must keep refusing damage loudly — this is the explicitly-invoked salvage.
+    pub fn open_repairing(mut mirror: Mirror<A, B>, ring_log2: u8, now: i64) -> Result<(Self, RepairReport)> {
+        let mut report = RepairReport::default();
+        {
+            let (a, b) = mirror.devices();
+            let root = match (a, b) {
+                (Some(a), _) => read_root(a)?,
+                (None, Some(b)) => read_root(b)?,
+                (None, None) => None,
+            };
+            if let Some(root) = root {
+                let mut ring = Ring::open_at(mirror, root.ring_log2, root.at)?;
+                if ring.head().is_none() && root.was != root.at {
+                    let mirror = ring.into_mirror();
+                    ring = Ring::open_at(mirror, root.ring_log2, root.was)?;
+                }
+                let tract_base = ROOT_SLOTS + root.residences * (1u64 << root.ring_log2);
+                let mut vault = Self::resume_common_with(ring, tract_base, Some(root), Some(&mut report))?;
+                vault.commit(now)?;
+                return Ok((vault, report));
+            }
+        }
+        let Some(r) = Ring::bootstrap_n(&mut mirror)? else {
+            return Err(Error::Corrupt("nothing bootstraps: not a vault (repair needs an existing spine)".into()));
+        };
+        let ring = Ring::open(mirror, r)?;
+        let n = 1u64 << r;
+        let _ = ring_log2;
+        let mut vault = Self::resume_common_with(ring, n, None, Some(&mut report))?;
+        vault.commit(now)?;
+        Ok((vault, report))
+    }
+
     /// Resume a migrating vault: spine at the root's current residence, falling back to the previous residence when the current one is empty (crash between the root update and the first commit at the new base — the A/B pattern).
     fn resume_migrating(mirror: Mirror<A, B>, root: RootEntry) -> Result<Self> {
         let mut ring = Ring::open_at(mirror, root.ring_log2, root.at)?;
@@ -258,7 +298,11 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         Self::resume_common(ring, n, None)
     }
 
-    fn resume_common(mut ring: Ring<A, B>, tract_base: u64, root: Option<RootEntry>) -> Result<Self> {
+    fn resume_common(ring: Ring<A, B>, tract_base: u64, root: Option<RootEntry>) -> Result<Self> {
+        Self::resume_common_with(ring, tract_base, root, None)
+    }
+
+    fn resume_common_with(mut ring: Ring<A, B>, tract_base: u64, root: Option<RootEntry>, repair: Option<&mut RepairReport>) -> Result<Self> {
         let head = ring
             .head()
             .ok_or_else(|| Error::Corrupt("bootstrap found entries but head search found none".into()))?
@@ -279,7 +323,23 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         }
         let mut hamt = Hamt::from_root(head.hamt_hash, head.hamt_lba);
         let mut live_blocks = Vec::new();
-        hamt.walk_live(ring.mirror(), &tract, &mut live_blocks)?;
+        let mut stale = Vec::new();
+        let mut dangling = Vec::new();
+        match repair {
+            None => hamt.walk_live_collect(ring.mirror(), &tract, &mut live_blocks, &mut stale)?,
+            Some(_) => hamt.walk_live_repair(ring.mirror(), &tract, &mut live_blocks, &mut stale, &mut dangling)?,
+        }
+        // Pre-fix vaults (and a crash between a delete's zero and its retiring commit) leave stale pointers at zeroed slots. They are time bombs: the reap retires the slot, the plow reuses it, and the pointer flips from "reads as deleted" to Seal-on-open. Unlink them now, in RAM — the next commit persists the pruned index; a session that never commits changes nothing.
+        for s in &stale {
+            hamt.prune(ring.mirror(), &tract, &s.route, (s.hash, s.lba))?;
+        }
+        for d in &dangling {
+            hamt.prune(ring.mirror(), &tract, &d.route, (d.hash, d.lba))?;
+        }
+        if let Some(report) = repair {
+            report.stale = stale;
+            report.dangling = dangling;
+        }
         let mut live = LiveSet::default();
         for (lba, hp) in live_blocks {
             live.map.insert(lba, hp);
