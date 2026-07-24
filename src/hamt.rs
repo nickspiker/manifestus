@@ -41,6 +41,41 @@ pub struct Delta {
     pub removed: Vec<(u64, [u8; 32])>,
 }
 
+/// A committed pointer whose target reads as all-zero: a fast-deleted leaf whose index unlink never landed. `route` is a key that descends to the pointer (path chunks set, rest zero).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StalePointer {
+    pub route: [u8; 32],
+    pub hash: [u8; 32],
+    pub lba: u64,
+}
+
+/// A committed pointer whose target no longer holds the block it names — the reap retired the slot and the plow reused it while the pointer survived (pre-fix tombstone damage), or the target decodes but its furrows are gone. Whatever it referenced is LOST; repair prunes the pointer and reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DanglingPointer {
+    pub route: [u8; 32],
+    pub hash: [u8; 32],
+    pub lba: u64,
+    /// The leaf's own key when the leaf still decodes (furrow loss); None when the block itself is foreign/corrupt.
+    pub key: Option<[u8; 32]>,
+    pub reason: alloc::string::String,
+}
+
+/// `base` with the 5-bit chunk at `depth` set to `slot` — threads the descent path down to children so a stale pointer can be routed back to.
+fn route_with_chunk(mut base: [u8; 32], depth: u8, slot: u8) -> [u8; 32] {
+    let bit = depth as usize * 5;
+    let byte = bit / 8;
+    let off = bit % 8;
+    let window = ((base[byte] as u16) << 8) | if byte + 1 < 32 { base[byte + 1] as u16 } else { 0 };
+    let shift = 11 - off;
+    let mask = 0x1Fu16 << shift;
+    let new = (window & !mask) | ((slot as u16) << shift);
+    base[byte] = (new >> 8) as u8;
+    if byte + 1 < 32 {
+        base[byte + 1] = (new & 0xFF) as u8;
+    }
+    base
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Child {
     /// On-disk, verified by hash before trust.
@@ -305,7 +340,9 @@ impl Hamt {
 
     // ======================================================================== delete =================================================================
 
-    /// Fast delete per VAULT.md: zero the leaf (and furrows) on both mirrors. The index pointer goes stale — lookups hit the zeroed block and return None; the plow reaps the slots. O(1) + furrow count, no COW path.
+    /// Delete: zero the leaf (and furrows) on both mirrors, then COW-unlink the pointer from the index.
+    ///
+    /// The unlink is load-bearing, not hygiene. The original fast-delete design left the committed pointer stale ("lookups hit the zeroed block and return None; the plow reaps the slots") — but that safety argument only holds while the slot stays zero. The reap correctly retires the zeroed slot as dead, and one plow lap later an append REUSES it; the stale pointer then aims at foreign sealed content, `read_doc` reports Seal instead of None, and the next `walk_live` at open bricks the vault. (Forensic case 2026-07-24: root slot 18 → a leaf deleted ~1500 generations earlier, its slot reused by another key's value.)
     pub fn delete<A: BlockDev, B: BlockDev>(
         &mut self,
         mirror: &mut Mirror<A, B>,
@@ -318,22 +355,80 @@ impl Hamt {
         };
         self.remove_leaf_blocks(mirror, tract, lba, &hash)?;
         // Zero the blocks themselves.
-        let Some(doc) = read_doc(mirror, tract, lba, &hash)? else { return Ok(true) };
-        match doc {
-            TractDoc::Direct { furrows, .. } => {
-                for f in furrows {
-                    tract.zero_delete(mirror, f)?;
+        if let Some(doc) = read_doc(mirror, tract, lba, &hash)? {
+            match doc {
+                TractDoc::Direct { furrows, .. } => {
+                    for f in furrows {
+                        tract.zero_delete(mirror, f)?;
+                    }
                 }
-            }
-            TractDoc::Extent { size, runs, .. } => {
-                for pos in expand_runs(&runs, size)? {
-                    tract.zero_delete(mirror, pos)?;
+                TractDoc::Extent { size, runs, .. } => {
+                    for pos in expand_runs(&runs, size)? {
+                        tract.zero_delete(mirror, pos)?;
+                    }
                 }
+                _ => {}
             }
-            _ => {}
+            tract.zero_delete(mirror, lba)?;
         }
-        tract.zero_delete(mirror, lba)?;
+        // Unlink the pointer thru the COW path so no committed generation past this one carries it. A crash before the retiring commit leaves the OLD head, whose pointer targets the now-zero slot — still the legal "deleted, reads None" state, and resume prunes it.
+        self.prune(mirror, tract, key, (hash, lba))?;
         Ok(true)
+    }
+
+    /// COW-unlink the child that points at exactly `old` (hash, lba), descending along `route`. No-op if the pointer is not on that path.
+    pub(crate) fn prune<A: BlockDev, B: BlockDev>(
+        &mut self,
+        mirror: &mut Mirror<A, B>,
+        tract: &Tract,
+        route: &[u8; 32],
+        old: ([u8; 32], u64),
+    ) -> Result<()> {
+        let root = self.root.clone();
+        let new_root = self.prune_child(mirror, tract, root, 0, route, old)?;
+        self.root = new_root;
+        Ok(())
+    }
+
+    fn prune_child<A: BlockDev, B: BlockDev>(
+        &mut self,
+        mirror: &mut Mirror<A, B>,
+        tract: &Tract,
+        slot: Option<Child>,
+        depth: u8,
+        route: &[u8; 32],
+        old: ([u8; 32], u64),
+    ) -> Result<Option<Child>> {
+        match slot {
+            None => Ok(None),
+            Some(Child::Committed { hash, lba }) if hash == old.0 && lba == old.1 => Ok(None),
+            Some(Child::Dirty(idx)) => {
+                let c = chunk(route, depth) as usize;
+                let sub = self.arena[idx].children[c].clone();
+                let new_sub = self.prune_child(mirror, tract, sub, depth + 1, route, old)?;
+                self.arena[idx].children[c] = new_sub;
+                Ok(Some(Child::Dirty(idx)))
+            }
+            Some(Child::Committed { hash, lba }) => {
+                let Some(doc) = read_doc(mirror, tract, lba, &hash)? else {
+                    // A different stale target on the path (someone else's tombstone) — not ours to touch here.
+                    return Ok(Some(Child::Committed { hash, lba }));
+                };
+                match doc {
+                    TractDoc::Node(node) => {
+                        let idx = self.arena.len();
+                        self.arena.push(node);
+                        self.delta.removed.push((lba, hash));
+                        let c = chunk(route, depth) as usize;
+                        let sub = self.arena[idx].children[c].clone();
+                        let new_sub = self.prune_child(mirror, tract, sub, depth + 1, route, old)?;
+                        self.arena[idx].children[c] = new_sub;
+                        Ok(Some(Child::Dirty(idx)))
+                    }
+                    _ => Ok(Some(Child::Committed { hash, lba })), // a leaf that isn't the target
+                }
+            }
+        }
     }
 
     fn find_leaf<A: BlockDev, B: BlockDev>(
@@ -460,31 +555,50 @@ impl Hamt {
         tract: &Tract,
         out: &mut Vec<(u64, [u8; 32])>,
     ) -> Result<()> {
+        let mut stale = Vec::new();
+        self.walk_live_collect(mirror, tract, out, &mut stale)
+    }
+
+    /// `walk_live` that also reports stale pointers — committed pointers whose target reads as all-zero (a fast-deleted leaf whose unlink never landed: pre-fix vaults, or a crash between the zero and the retiring commit). `route` descends back to the pointer for [`Self::prune`].
+    pub fn walk_live_collect<A: BlockDev, B: BlockDev>(
+        &mut self,
+        mirror: &mut Mirror<A, B>,
+        tract: &Tract,
+        out: &mut Vec<(u64, [u8; 32])>,
+        stale: &mut Vec<StalePointer>,
+    ) -> Result<()> {
         let root = self.root.clone();
         if let Some(Child::Committed { hash, lba }) = root {
-            self.walk_child(mirror, tract, lba, &hash, out)?;
+            self.walk_child(mirror, tract, lba, &hash, [0u8; 32], 0, out, stale)?;
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn walk_child<A: BlockDev, B: BlockDev>(
         &mut self,
         mirror: &mut Mirror<A, B>,
         tract: &Tract,
         lba: u64,
         hash: &[u8; 32],
+        route: [u8; 32],
+        depth: u8,
         out: &mut Vec<(u64, [u8; 32])>,
+        stale: &mut Vec<StalePointer>,
     ) -> Result<()> {
         let Some(doc) = read_doc(mirror, tract, lba, hash)? else {
-            return Ok(()); // fast-deleted leaf: stale pointer, not live
+            // Fast-deleted leaf behind a stale pointer: not live — and report it so resume can unlink it before the slot is ever reused.
+            stale.push(StalePointer { route, hash: *hash, lba });
+            return Ok(());
         };
         out.push((lba, *hash));
         match doc {
             TractDoc::Node(node) => {
-                for c in node.children.iter().flatten() {
-                    if let Child::Committed { hash, lba } = c {
+                for (slot, c) in node.children.iter().enumerate() {
+                    if let Some(Child::Committed { hash, lba }) = c {
                         let (h, l) = (*hash, *lba);
-                        self.walk_child(mirror, tract, l, &h, out)?;
+                        let child_route = route_with_chunk(route, depth, slot as u8);
+                        self.walk_child(mirror, tract, l, &h, child_route, depth + 1, out, stale)?;
                     }
                 }
             }
@@ -508,6 +622,136 @@ impl Hamt {
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    /// REPAIR walk — `walk_live_collect` that survives dangling pointers instead of erroring. A pointer whose target fails the seal, fails decode, or names furrows that no longer verify is recorded in `dangling` (and contributes nothing to `out`); everything sound is collected exactly as `walk_live` would. Used by `Vault::open_repairing`.
+    pub fn walk_live_repair<A: BlockDev, B: BlockDev>(
+        &mut self,
+        mirror: &mut Mirror<A, B>,
+        tract: &Tract,
+        out: &mut Vec<(u64, [u8; 32])>,
+        stale: &mut Vec<StalePointer>,
+        dangling: &mut Vec<DanglingPointer>,
+    ) -> Result<()> {
+        let root = self.root.clone();
+        if let Some(Child::Committed { hash, lba }) = root {
+            self.walk_child_repair(mirror, tract, lba, &hash, [0u8; 32], 0, out, stale, dangling)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_child_repair<A: BlockDev, B: BlockDev>(
+        &mut self,
+        mirror: &mut Mirror<A, B>,
+        tract: &Tract,
+        lba: u64,
+        hash: &[u8; 32],
+        route: [u8; 32],
+        depth: u8,
+        out: &mut Vec<(u64, [u8; 32])>,
+        stale: &mut Vec<StalePointer>,
+        dangling: &mut Vec<DanglingPointer>,
+    ) -> Result<()> {
+        let doc = match read_doc(mirror, tract, lba, hash) {
+            Ok(None) => {
+                stale.push(StalePointer { route, hash: *hash, lba });
+                return Ok(());
+            }
+            Ok(Some(d)) => d,
+            Err(Error::Seal) => {
+                dangling.push(DanglingPointer {
+                    route,
+                    hash: *hash,
+                    lba,
+                    key: None,
+                    reason: "target reused: sealed block does not match the pointer hash".into(),
+                });
+                return Ok(());
+            }
+            Err(Error::Corrupt(reason)) => {
+                dangling.push(DanglingPointer { route, hash: *hash, lba, key: None, reason });
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        match doc {
+            TractDoc::Node(node) => {
+                out.push((lba, *hash));
+                for (slot, c) in node.children.iter().enumerate() {
+                    if let Some(Child::Committed { hash, lba }) = c {
+                        let (h, l) = (*hash, *lba);
+                        let child_route = route_with_chunk(route, depth, slot as u8);
+                        self.walk_child_repair(mirror, tract, l, &h, child_route, depth + 1, out, stale, dangling)?;
+                    }
+                }
+            }
+            TractDoc::Lone { .. } => out.push((lba, *hash)),
+            TractDoc::Direct { key, furrows, .. } => {
+                self.repair_check_furrows(mirror, tract, lba, hash, route, &key, &furrows, out, dangling)?;
+            }
+            TractDoc::Extent { key, size, runs } => match expand_runs(&runs, size) {
+                Ok(positions) => {
+                    self.repair_check_furrows(mirror, tract, lba, hash, route, &key, &positions, out, dangling)?;
+                }
+                Err(Error::Corrupt(reason)) => {
+                    dangling.push(DanglingPointer { route, hash: *hash, lba, key: Some(key), reason });
+                }
+                Err(e) => return Err(e),
+            },
+            TractDoc::Furrow { .. } => {
+                dangling.push(DanglingPointer {
+                    route,
+                    hash: *hash,
+                    lba,
+                    key: None,
+                    reason: "furrow block in index position".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify a sharded value's furrows (seal + owner + index). All sound → leaf and furrows join `out`; any loss → the whole leaf is dangling (a partial value cannot be served).
+    #[allow(clippy::too_many_arguments)]
+    fn repair_check_furrows<A: BlockDev, B: BlockDev>(
+        &mut self,
+        mirror: &mut Mirror<A, B>,
+        tract: &Tract,
+        leaf_lba: u64,
+        leaf_hash: &[u8; 32],
+        route: [u8; 32],
+        key: &[u8; 32],
+        positions: &[u64],
+        out: &mut Vec<(u64, [u8; 32])>,
+        dangling: &mut Vec<DanglingPointer>,
+    ) -> Result<()> {
+        let mut furrow_live = Vec::with_capacity(positions.len());
+        for (i, pos) in positions.iter().enumerate() {
+            let mut buf = ZERO_BLOCK;
+            tract.read(mirror, *pos, &mut buf)?;
+            let ok = sealed_hp(&buf)
+                .filter(|_| {
+                    matches!(decode_doc(&buf), Ok(TractDoc::Furrow { key: k, index, .. }) if &k == key && index as usize == i)
+                })
+                .map(|h| (*pos, h));
+            match ok {
+                Some(entry) => furrow_live.push(entry),
+                None => {
+                    dangling.push(DanglingPointer {
+                        route,
+                        hash: *leaf_hash,
+                        lba: leaf_lba,
+                        key: Some(*key),
+                        reason: format!("furrow {i} @{pos} lost (unsealed/foreign/mismatched owner)"),
+                    });
+                    return Ok(());
+                }
+            }
+        }
+        out.push((leaf_lba, *leaf_hash));
+        out.extend(furrow_live);
         Ok(())
     }
 
