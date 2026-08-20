@@ -559,6 +559,48 @@ impl Hamt {
         self.walk_live_collect(mirror, tract, out, &mut stale)
     }
 
+    /// Collect the KEY of every live leaf reachable from the COMMITTED root — the entry enumeration a full-fidelity vault migration needs (copy every (key, value) pair with zero domain knowledge). Committed state only, like walk_live.
+    pub fn walk_keys<A: BlockDev, B: BlockDev>(
+        &mut self,
+        mirror: &mut Mirror<A, B>,
+        tract: &Tract,
+        out: &mut Vec<[u8; 32]>,
+    ) -> Result<()> {
+        let root = self.root.clone();
+        if let Some(Child::Committed { hash, lba }) = root {
+            self.walk_keys_child(mirror, tract, lba, &hash, out)?;
+        }
+        Ok(())
+    }
+
+    fn walk_keys_child<A: BlockDev, B: BlockDev>(
+        &mut self,
+        mirror: &mut Mirror<A, B>,
+        tract: &Tract,
+        lba: u64,
+        hash: &[u8; 32],
+        out: &mut Vec<[u8; 32]>,
+    ) -> Result<()> {
+        let Some(doc) = read_doc(mirror, tract, lba, hash)? else {
+            return Ok(()); // fast-deleted leaf behind a stale pointer — not live, walk_live's repair path owns reporting it
+        };
+        match doc {
+            TractDoc::Node(node) => {
+                for c in node.children.iter() {
+                    if let Some(Child::Committed { hash, lba }) = c {
+                        let (h, l) = (*hash, *lba);
+                        self.walk_keys_child(mirror, tract, l, &h, out)?;
+                    }
+                }
+            }
+            TractDoc::Lone { key, .. }
+            | TractDoc::Extent { key, .. }
+            | TractDoc::Direct { key, .. } => out.push(key),
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// `walk_live` that also reports stale pointers — committed pointers whose target reads as all-zero (a fast-deleted leaf whose unlink never landed: pre-fix vaults, or a crash between the zero and the retiring commit). `route` descends back to the pointer for [`Self::prune`].
     pub fn walk_live_collect<A: BlockDev, B: BlockDev>(
         &mut self,
