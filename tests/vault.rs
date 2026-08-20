@@ -415,3 +415,34 @@ fn vault_survives_kill_nine_with_exact_committed_prefix() {
     }
     assert!(last_gen > 0, "at least one put committed across the rounds");
 }
+
+#[test]
+fn live_keys_enumerates_every_committed_entry() {
+    let dir = TempDir::new().unwrap();
+    let (pa, pb) = paths(&dir, "keys");
+    let mut v = open_vault(&pa, &pb, RING + 512);
+    // Small (Lone), medium (Direct), and big-enough-to-extent values so every leaf variant is walked.
+    for i in 0..40u64 {
+        v.put(&key(i), &val(i), 1_100 + i as i64).unwrap();
+    }
+    v.put(&key(100), &vec![0xEE; 200_000], 1_200).unwrap();
+    assert!(v.delete(&key(7), 1_300).unwrap());
+    let mut keys = v.live_keys().unwrap();
+    keys.sort();
+    let mut expect: Vec<[u8; 32]> = (0..40u64).filter(|i| *i != 7).map(key).collect();
+    expect.push(key(100));
+    expect.sort();
+    assert_eq!(keys, expect, "live_keys is the complete committed entry set — the migration walk's contract");
+    // Migration-by-enumeration round trip: raw-copy every enumerated (key, value) into a fresh vault.
+    let (pc, pd) = paths(&dir, "keys-dest");
+    let mut dest = open_vault(&pc, &pd, RING + 512);
+    for k in &keys {
+        let value = v.get(k).unwrap().expect("live key reads back");
+        dest.put(k, &value, 2_000).unwrap();
+    }
+    for i in (0..40u64).filter(|i| *i != 7) {
+        assert_eq!(dest.get(&key(i)).unwrap(), Some(val(i)));
+    }
+    assert_eq!(dest.get(&key(100)).unwrap(), Some(vec![0xEE; 200_000]));
+    assert_eq!(dest.get(&key(7)).unwrap(), None);
+}

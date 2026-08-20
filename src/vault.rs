@@ -359,6 +359,14 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
 
     // ======================================================================== KV API =================================================================
 
+    /// Every live entry key — the enumeration a full-fidelity migration walks (`for k in live_keys { dest.put(k, src.get(k)) }`). Committed state only.
+    pub fn live_keys(&mut self) -> Result<Vec<[u8; 32]>> {
+        let Self { ring, tract, hamt, .. } = self;
+        let mut out = Vec::new();
+        hamt.walk_keys(ring.mirror(), tract, &mut out)?;
+        Ok(out)
+    }
+
     pub fn get(&mut self, key: &[u8; 32]) -> Result<Option<Vec<u8>>> {
         let Self { ring, tract, hamt, .. } = self;
         hamt.lookup(ring.mirror(), tract, key)
