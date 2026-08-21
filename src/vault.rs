@@ -374,6 +374,14 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
 
     /// Insert/overwrite, durable on return (commit-per-write). A refused append has no side effects, so the ladder simply makes room and retries: Fenced → commit generations to slide the K-window (heartbeats inside commit if the flush itself is fenced); TractFull → reap windows until space exists. Only a tract that stays full after a complete reap lap surfaces TractFull to the caller — grow or refuse.
     pub fn put(&mut self, key: &[u8; 32], value: &[u8], now: i64) -> Result<()> {
+        self.put_no_commit(key, value, now)?;
+        self.commit(now)?;
+        self.maybe_reap(now)?;
+        Ok(())
+    }
+
+    /// The put ladder WITHOUT the final commit — the entry sits provisional in the arena until the next [`commit`](Self::commit) (which [`put`](Self::put) and [`put_batch`](Self::put_batch) supply). A Fenced retry still commits mid-ladder (that IS how the fence rises), so a tight window degrades toward commit-per-write, never past it.
+    fn put_no_commit(&mut self, key: &[u8; 32], value: &[u8], now: i64) -> Result<()> {
         // Bound: cleaning advances the reap every iteration, so a full lap of windows plus the fence ladder is guaranteed to terminate.
         for _ in 0..(FENCE_K + 3 + (self.tract.len / self.reap_window()) + 8) {
             let attempt = {
@@ -381,11 +389,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 hamt.put(ring.mirror(), tract, key, value)
             };
             match attempt {
-                Ok(()) => {
-                    self.commit(now)?;
-                    self.maybe_reap(now)?;
-                    return Ok(());
-                }
+                Ok(()) => return Ok(()),
                 Err(Error::Fenced(_)) => {
                     self.commit(now)?; // slides old entries out of the K-window → fence rises
                 }
@@ -398,6 +402,19 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             }
         }
         Err(Error::TractFull)
+    }
+
+    /// GROUP COMMIT: insert/overwrite MANY entries, durable on return, under ONE spine commit instead of one per write. The commit's flush is the dominant per-op cost in the field (~900ms per put on a busy BTRFS desktop, SIZE-INDEPENDENT — 53 bytes cost the same as 22KB, 2026-08-21), and callers arrive in bursts (kete's librarian drains a queue): N puts under one commit turn N flushes into one. Failure is all-or-nothing from the caller's view — no batch entry is spine-referenced until the single commit lands (a mid-batch Fenced heartbeat-commit can land earlier entries early, which is harmless: durability sooner, never later).
+    pub fn put_batch(&mut self, items: &[(&[u8; 32], &[u8])], now: i64) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        for (key, value) in items {
+            self.put_no_commit(key, value, now)?;
+        }
+        self.commit(now)?;
+        self.maybe_reap(now)?;
+        Ok(())
     }
 
     /// Delete, durable on return. Returns false if the key was absent.
