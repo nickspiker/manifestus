@@ -446,3 +446,40 @@ fn live_keys_enumerates_every_committed_entry() {
     assert_eq!(dest.get(&key(100)).unwrap(), Some(vec![0xEE; 200_000]));
     assert_eq!(dest.get(&key(7)).unwrap(), None);
 }
+
+#[test]
+fn put_batch_is_one_generation_and_survives_resume() {
+    let dir = TempDir::new().unwrap();
+    let (pa, pb) = paths(&dir, "batch");
+    {
+        let mut v = open_vault(&pa, &pb, RING + 256);
+        let items: Vec<([u8; 32], Vec<u8>)> = (0..20).map(|i| (key(i), val(i))).collect();
+        let refs: Vec<(&[u8; 32], &[u8])> = items.iter().map(|(k, d)| (k, d.as_slice())).collect();
+        v.put_batch(&refs, 1_001).unwrap();
+        // THE point of the batch: one spine commit for the whole burst, not one per entry.
+        assert_eq!(v.generation(), Some(1), "20 puts, ONE generation");
+        for (k, d) in &items {
+            assert_eq!(v.get(k).unwrap().as_deref(), Some(d.as_slice()));
+        }
+        // A later single put still advances normally alongside batch entries.
+        v.put(&key(100), b"solo", 1_002).unwrap();
+        assert_eq!(v.generation(), Some(2));
+        // Overwrites inside a batch behave like puts (last value wins on read-back).
+        let newv = b"rewritten".to_vec();
+        let refs2: Vec<(&[u8; 32], &[u8])> = vec![(&items[0].0, newv.as_slice())];
+        v.put_batch(&refs2, 1_003).unwrap();
+        assert_eq!(v.get(&items[0].0).unwrap(), Some(newv.clone()));
+        // Empty batch is a free no-op — no generation burned.
+        let g = v.generation();
+        v.put_batch(&[], 1_004).unwrap();
+        assert_eq!(v.generation(), g);
+    }
+    // Cold resume sees every batch entry — the single commit really carried them all.
+    let a = FileDev::open(&pa).unwrap();
+    let b = FileDev::open(&pb).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 2_000).unwrap();
+    for i in 1..20 {
+        assert_eq!(v.get(&key(i)).unwrap().as_deref(), Some(val(i).as_slice()));
+    }
+    assert_eq!(v.get(&key(100)).unwrap(), Some(b"solo".to_vec()));
+}
