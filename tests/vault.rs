@@ -483,3 +483,41 @@ fn put_batch_is_one_generation_and_survives_resume() {
     }
     assert_eq!(v.get(&key(100)).unwrap(), Some(b"solo".to_vec()));
 }
+
+#[test]
+fn fence_wedge_rescues_at_open_and_puts_flow_again() {
+    // THE FIELD WEDGE (2026-08-21/23/24, plows 422745 / 307312 / 1110637): batched churn runs the plow on credit until the committed head's budget cannot stage even one reap window — cleaning needs budget, budget needs cleaning, and the state survives reopen because the head IS the wedge. Reproduced with put_batch (the group-commit era's exact shape) churning four keys with multi-block values on a tiny tract; terminal = the batch refuses AND a small single put refuses (transient tightness self-heals, the wedge does not).
+    let dir = TempDir::new().unwrap();
+    let (pa, pb) = paths(&dir, "wedge");
+    {
+        let mut v = open_vault(&pa, &pb, RING + 64);
+        let big = |r: u64, k: u64| format!("wedge-{r}-{k}-{}", "y".repeat(9000)).into_bytes();
+        let mut wedged = false;
+        for round in 0..400u64 {
+            let vals: Vec<Vec<u8>> = (0..4).map(|k| big(round, k)).collect();
+            let keys: Vec<[u8; 32]> = (0..4u64).map(key).collect();
+            let items: Vec<(&[u8; 32], &[u8])> =
+                keys.iter().zip(vals.iter().map(|v| v.as_slice())).collect();
+            if v.put_batch(&items, 1_000 + round as i64).is_err()
+                && v.put(&key(9_999), b"probe", 30_000 + round as i64).is_err()
+            {
+                wedged = true;
+                break;
+            }
+        }
+        assert!(wedged, "tiny tract never wedged under batched churn");
+    }
+    // Reopen: pre-rescue this restored the wedge faithfully (the field signature — both desktops wedged across restarts); with the open-time rescue, every committed key survives and fresh puts flow.
+    let a = FileDev::open(&pa).unwrap();
+    let b = FileDev::open(&pb).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 50_000).unwrap();
+    for k in 0..4u64 {
+        assert!(v.get(&key(k)).unwrap().is_some(), "key {k} lost across the rescue");
+    }
+    for j in 500..520u64 {
+        v.put(&key(j), &val(j), 60_000 + j as i64).unwrap();
+    }
+    for j in 500..520u64 {
+        assert_eq!(v.get(&key(j)).unwrap(), Some(val(j)), "post-rescue write lost");
+    }
+}
