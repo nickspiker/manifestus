@@ -626,7 +626,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             for i in 0..max_w {
                 let pos = (self.tract.reap + i) % self.tract.len;
                 surv += self.live.map.contains_key(&pos) as u64;
-                if surv + RESERVE > clean {
+                // The reserve is charged only when something actually stages: a pure-dead window appends NOTHING, so even clean-of-zero reaps it whole — without this guard the field vault (91% dead, clean 3) was refused at its very first block and ground forward in 4-block bites (2026-08-24).
+                if surv > 0 && surv + RESERVE > clean {
                     break;
                 }
                 w = i + 1;
