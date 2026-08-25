@@ -519,8 +519,7 @@ fn walk_tree<D: BlockDev>(
                     let children_copy = children.clone();
                     let route_copy = *route;
                     out.push(TreeNode { indent, lba, doc, seal_ok, self_addr_ok, note });
-                    // 256/5 tops out at depth 51 — deeper means a cycle or bogus node (field 2026-08-24: the wedged Mac vault recursed past u8); report-and-stop beats overflowing the walk.
-                    for (slot, h, child_lba) in children_copy.into_iter().filter(|_| depth < 52) {
+                    for (slot, h, child_lba) in children_copy {
                         // Descend; the child's route is the parent's route with this slot's chunk implied (we pass the parent route; leaf self-check uses the leaf's own key).
                         let _ = route_copy;
                         walk_tree(
@@ -589,10 +588,6 @@ fn walk_tree<D: BlockDev>(
 fn key_with_chunk(mut base: [u8; 32], depth: u8, slot: u8) -> [u8; 32] {
     let bit = depth as usize * 5;
     let byte = bit / 8;
-    // 256 bits / 5-bit chunks tops out at depth 51; a route claiming deeper is bogus data the WALK reports — the inspector must survive it, not index past the key (field 2026-08-24: panicked at byte 32 on the wedged Mac vault).
-    if byte >= 32 {
-        return base;
-    }
     let off = bit % 8;
     // Clear the 5 bits then set them. The chunk spans bits [11-off .. 11-off+5) across byte and byte+1 of a 16-bit window.
     let window = ((base[byte] as u16) << 8) | if byte + 1 < 32 { base[byte + 1] as u16 } else { 0 };
