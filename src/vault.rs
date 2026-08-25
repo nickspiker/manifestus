@@ -364,7 +364,10 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 l.saturating_sub(v.tract.plow) < v.reap_window() + 8
             });
         if wedged {
-            let _ = v.rescue(rescue_now);
+            // Dead-heavy → the rescue reaps its way out; live-full (rescue says TractFull) → grow, the spine-only move no fence refuses. Best-effort both ways: a vault that can't heal still opens readable.
+            if let Err(Error::TractFull) = v.rescue(rescue_now) {
+                let _ = v.grow(v.tract.len * 2, rescue_now);
+            }
         }
         Ok(v)
     }
@@ -394,6 +397,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
 
     /// The put ladder WITHOUT the final commit — the entry sits provisional in the arena until the next [`commit`](Self::commit) (which [`put`](Self::put) and [`put_batch`](Self::put_batch) supply). A Fenced retry still commits mid-ladder (that IS how the fence rises), so a tight window degrades toward commit-per-write, never past it.
     fn put_no_commit(&mut self, key: &[u8; 32], value: &[u8], now: i64) -> Result<()> {
+        // One growth per call: repeated doubling inside the retry loop would balloon the device on a vault whose real ailment is something else.
+        let mut grew = false;
         // Bound: cleaning advances the reap every iteration, so a full lap of windows plus the fence ladder is guaranteed to terminate.
         for _ in 0..(FENCE_K + 3 + (self.tract.len / self.reap_window()) + 8) {
             let attempt = {
@@ -403,9 +408,16 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             match attempt {
                 Ok(()) => return Ok(()),
                 Err(Error::Fenced(_)) => {
-                    // Slides old entries out of the K-window → fence rises. A commit that is ITSELF fenced past the heartbeat ladder is the terminal deadlock — the rescue is the one remaining exit (see rescue's safety note).
+                    // Slides old entries out of the K-window → fence rises. A commit that is ITSELF fenced past the heartbeat ladder is the terminal deadlock — the rescue exits it for dead-heavy occupancy; a rescue that answers TractFull means the tract is genuinely live-full, and the answer to THAT is growth (spine-only appends — the one move the fence can never refuse).
                     if let Err(Error::Fenced(_)) = self.commit(now) {
-                        self.rescue(now)?;
+                        match self.rescue(now) {
+                            Ok(_) => {}
+                            Err(Error::TractFull) if !grew => {
+                                self.grow(self.tract.len * 2, now)?;
+                                grew = true;
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                 }
                 Err(Error::TractFull) => {
