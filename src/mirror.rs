@@ -20,11 +20,19 @@ use crate::events::{EventSink, NullSink, StorageEvent};
 const PAR_BATCH_THRESHOLD: usize = 4;
 
 /// Write + verify every block of a batch on one device, with a device-local scratch (so concurrent device threads never share the read-back buffer).
+/// ONE flush for the whole batch, not one per block (field 2026-08-25: per-block F_FULLFSYNC made a one-note put cost 12-20 drive-cache flushes — a flat, size-independent 0.3-1.4s; ferros boots faster). The crash contract needs ORDERING (everything a spine entry references on media before the spine lands), which the caller's final spine write_one still provides; the media read-back property (F_NOCACHE) is preserved because verification happens AFTER the single flush. A verify miss retries write+flush+verify once for just the failed block — write_one's exact discipline, paid only on damage.
 #[cfg(feature = "std")]
 fn write_each<D: BlockDev>(dev: &mut D, blocks: &[(u64, &Block)]) -> Result<()> {
     let mut scratch = ZERO_BLOCK;
     for &(lba, buf) in blocks {
-        write_one(dev, lba, buf, &mut scratch)?;
+        dev.write(lba, buf)?;
+    }
+    dev.flush()?;
+    for &(lba, buf) in blocks {
+        dev.read(lba, &mut scratch)?;
+        if &scratch != buf {
+            write_one(dev, lba, buf, &mut scratch)?;
+        }
     }
     Ok(())
 }
@@ -114,10 +122,32 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
                 return Ok(());
             }
         }
-        for &(lba, buf) in blocks {
-            self.write_verified(lba, buf)?;
+        // Sequential (single device / small batch): the same one-flush-per-device discipline — the smallest batches are the commonest (a one-note put), exactly where per-block flushing hurt most. The kernel profile keeps the per-block loop (no std, and its flush is not a drive-cache round-trip).
+        #[cfg(feature = "std")]
+        {
+            match (self.a.as_mut(), self.b.as_mut()) {
+                (Some(a), b) => {
+                    write_each(a, blocks)?;
+                    if let Some(b) = b {
+                        if write_each(b, blocks).is_err() {
+                            self.b = None;
+                            self.degraded = true;
+                            self.events.emit(StorageEvent::MirrorDegraded);
+                        }
+                    }
+                    return Ok(());
+                }
+                (None, Some(b)) => return write_each(b, blocks),
+                (None, None) => return Err(Error::Corrupt("mirror has no devices".into())),
+            }
         }
-        Ok(())
+        #[cfg(not(feature = "std"))]
+        {
+            for &(lba, buf) in blocks {
+                self.write_verified(lba, buf)?;
+            }
+            Ok(())
+        }
     }
 
     /// Extend every present device to `new_blocks`, same failure matrix as writes: primary must grow or the op fails; a secondary that refuses is dropped for the session (`degraded` flips) — the primary carries the new geometry alone.

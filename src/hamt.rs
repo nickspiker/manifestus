@@ -433,7 +433,7 @@ impl Hamt {
         }
     }
 
-    fn find_leaf<A: BlockDev, B: BlockDev>(
+    pub(crate) fn find_leaf<A: BlockDev, B: BlockDev>(
         &mut self,
         mirror: &mut Mirror<A, B>,
         tract: &Tract,
