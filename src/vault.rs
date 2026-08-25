@@ -388,7 +388,25 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     }
 
     /// Insert/overwrite, durable on return (commit-per-write). A refused append has no side effects, so the ladder simply makes room and retries: Fenced → commit generations to slide the K-window (heartbeats inside commit if the flush itself is fenced); TractFull → reap windows until space exists. Only a tract that stays full after a complete reap lap surfaces TractFull to the caller — grow or refuse.
+    /// True iff `value` is already the COMMITTED value at `key` — the identical-overwrite skip's gate. Committed matters: matching a provisional copy and skipping would claim durability a crash could revoke. One index read against ~1s of flushes; same-value churn (fstate ping-pong, phonebook re-adoption) was pure plow pressure toward the fence cliff (field 2026-08-24/25).
+    fn holds_committed(&mut self, key: &[u8; 32], value: &[u8]) -> Result<bool> {
+        let leaf = {
+            let Self { ring, tract, hamt, .. } = self;
+            hamt.find_leaf(ring.mirror(), tract, key)?
+        };
+        let Some((lba, hash)) = leaf else {
+            return Ok(false);
+        };
+        if self.live.map.get(&lba) != Some(&hash) {
+            return Ok(false);
+        }
+        Ok(self.get(key)?.as_deref() == Some(value))
+    }
+
     pub fn put(&mut self, key: &[u8; 32], value: &[u8], now: i64) -> Result<()> {
+        if self.holds_committed(key, value)? {
+            return Ok(());
+        }
         self.put_no_commit(key, value, now)?;
         // A commit whose FLUSH finds no room surfaces TractFull raw (grow inside commit would discard the very state being flushed). We still hold the item, so the verdict is ours: grow — a barrier that reloads the committed head — and replay from pristine.
         if let Err(Error::TractFull) = self.commit(now) {
@@ -468,6 +486,17 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         if items.is_empty() {
             return Ok(());
         }
+        // The identical-overwrite skip, batch form: an all-skipped batch commits nothing at all.
+        let mut fresh: Vec<(&[u8; 32], &[u8])> = Vec::with_capacity(items.len());
+        for &(key, value) in items {
+            if !self.holds_committed(key, value)? {
+                fresh.push((key, value));
+            }
+        }
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        let items = &fresh[..];
         for (key, value) in items {
             self.put_no_commit(key, value, now)?;
         }

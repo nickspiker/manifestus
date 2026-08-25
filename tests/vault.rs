@@ -516,3 +516,20 @@ fn churn_grows_never_wedges_and_loses_nothing() {
         v.put(&key(j), &val(j), 60_000 + j as i64).unwrap();
     }
 }
+
+#[test]
+fn identical_overwrites_append_nothing() {
+    // Same-value churn was pure plow pressure toward the fence cliff (fstate ping-pong, phonebook re-adoption — field 2026-08-24/25): a log-structured store pays a fresh append + ~4 drive flushes for a byte-identical overwrite unless it looks first. Committed-match skips must not move the plow.
+    let dir = TempDir::new().unwrap();
+    let (pa, pb) = paths(&dir, "idem");
+    let mut v = open_vault(&pa, &pb, RING + 64);
+    v.put(&key(1), &val(1), 1_000).unwrap();
+    let plow_after_first = v.tract_blocks_plowed();
+    for i in 0..50u64 {
+        v.put(&key(1), &val(1), 2_000 + i as i64).unwrap();
+    }
+    assert_eq!(v.tract_blocks_plowed(), plow_after_first, "identical overwrites moved the plow");
+    v.put(&key(1), &val(2), 9_000).unwrap();
+    assert!(v.tract_blocks_plowed() > plow_after_first, "a REAL overwrite must append");
+    assert_eq!(v.get(&key(1)).unwrap(), Some(val(2)));
+}
