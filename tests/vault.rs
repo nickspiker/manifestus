@@ -483,3 +483,36 @@ fn put_batch_is_one_generation_and_survives_resume() {
     }
     assert_eq!(v.get(&key(100)).unwrap(), Some(b"solo".to_vec()));
 }
+
+#[test]
+fn churn_grows_never_wedges_and_loses_nothing() {
+    // THE NEW LAW (2026-08-25, born of the field wedges at plows 422745 / 307312 / 1110637): batched churn on a tiny tract must never reach a terminal refusal — the ladder reaps what is dead, grows thru the airlock (the wedge parks the reap head ON the live index cluster with clean≈3, so survivors have nowhere to stage), and every rescue preserves every survivor. The 2026-08-24 grind lost 214 live blocks to repoint descents hunting thru a half-mutated arena; the ladder now rolls the in-flight put back to the committed root before reaping, and a repoint that swaps nothing is an ERROR, never a silent orphaning. Old-era wedged vaults heal thru the same rescue at open — the Linux box is the field test.
+    let dir = TempDir::new().unwrap();
+    let (pa, pb) = paths(&dir, "law");
+    let big = |r: u64, k: u64| format!("law-{r}-{k}-{}", "y".repeat(9000)).into_bytes();
+    {
+        let mut v = open_vault(&pa, &pb, RING + 64);
+        for round in 0..120u64 {
+            let vals: Vec<Vec<u8>> = (0..4).map(|k| big(round, k)).collect();
+            let keys: Vec<[u8; 32]> = (0..4u64).map(key).collect();
+            let items: Vec<(&[u8; 32], &[u8])> =
+                keys.iter().zip(vals.iter().map(|v| v.as_slice())).collect();
+            v.put_batch(&items, 1_000 + round as i64).unwrap();
+        }
+        // Growth is allowed, ballooning is not: four ~3-block values live at once.
+        assert!(v.tract_blocks() <= 64 * 16, "tract ballooned to {}", v.tract_blocks());
+        for k in 0..4u64 {
+            assert_eq!(v.get(&key(k)).unwrap(), Some(big(119, k)), "latest value lost in churn");
+        }
+    }
+    // Strict reopen: walk_live dies loudly on any dangling; every key resolves; fresh puts flow.
+    let a = FileDev::open(&pa).unwrap();
+    let b = FileDev::open(&pb).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 50_000).unwrap();
+    for k in 0..4u64 {
+        assert_eq!(v.get(&key(k)).unwrap(), Some(big(119, k)), "value lost across reopen");
+    }
+    for j in 500..510u64 {
+        v.put(&key(j), &val(j), 60_000 + j as i64).unwrap();
+    }
+}

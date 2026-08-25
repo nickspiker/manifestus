@@ -114,11 +114,13 @@ pub struct Hamt {
     root: Option<Child>,
     arena: Vec<Node>,
     delta: Delta,
+    /// Swaps performed by repoint since construction. A relocation that repoints NOTHING is a lost parent — the silent no-op behind the 2026-08-24 field loss (214 live blocks, danglings at reused positions); callers compare before/after and refuse to orphan.
+    repoint_hits: u64,
 }
 
 impl Hamt {
     pub fn empty() -> Self {
-        Self { root: None, arena: Vec::new(), delta: Delta::default() }
+        Self { root: None, arena: Vec::new(), delta: Delta::default(), repoint_hits: 0 }
     }
 
     /// Resume from a committed root (spine entry's hamt_root). All-zero hash = empty index (genesis convention).
@@ -128,7 +130,7 @@ impl Hamt {
         } else {
             Some(Child::Committed { hash, lba })
         };
-        Self { root, arena: Vec::new(), delta: Delta::default() }
+        Self { root, arena: Vec::new(), delta: Delta::default(), repoint_hits: 0 }
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -923,6 +925,8 @@ impl Hamt {
                 return Err(Error::Corrupt("relocated block unreadable at destination".into()));
             };
             debug_assert_eq!(hash, r.hp);
+            // LOUD ON MISS (field 2026-08-24): a repoint that swaps nothing means the index no longer references the original — moving it anyway and letting the reap retire the source is how 214 live blocks became danglings, silently. Refuse instead; the caller's window fails whole and the originals stay live.
+            let before = self.repoint_hits;
             match decode_doc(&buf)? {
                 TractDoc::Lone { key, .. }
                 | TractDoc::Direct { key, .. }
@@ -950,6 +954,12 @@ impl Hamt {
                     self.root = new_root;
                 }
             }
+            if self.repoint_hits == before {
+                return Err(Error::Corrupt(format!(
+                    "relocation repointed nothing for block at {} — refusing to orphan a live block",
+                    r.from
+                )));
+            }
         }
         Ok(())
     }
@@ -963,9 +973,16 @@ impl Hamt {
         old: ([u8; 32], u64),
         new: ([u8; 32], u64),
     ) -> Result<()> {
+        let before = self.repoint_hits;
         let root = self.root.clone();
         let new_root = self.repoint(mirror, tract, root, 0, key, u8::MAX, old, new)?;
         self.root = new_root;
+        // Same loud-on-miss law as repair_relocs — a rebuilt leaf nobody points at is the old extent silently surviving with its furrows doomed.
+        if self.repoint_hits == before {
+            return Err(Error::Corrupt(
+                "leaf replacement repointed nothing — refusing to orphan the rebuilt extent".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -985,6 +1002,7 @@ impl Hamt {
         match slot {
             None => Ok(None),
             Some(Child::Committed { hash, lba }) if hash == old.0 && lba == old.1 => {
+                self.repoint_hits += 1;
                 Ok(Some(Child::Committed { hash: new.0, lba: new.1 }))
             }
             Some(Child::Committed { hash, lba }) => {
