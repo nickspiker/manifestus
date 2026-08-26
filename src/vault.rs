@@ -336,10 +336,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         for d in &dangling {
             hamt.prune(ring.mirror(), &tract, &d.route, (d.hash, d.lba))?;
         }
-        if let Some(report) = repair {
-            report.stale = stale;
-            report.dangling = dangling;
-        }
+        let pruned_any = !stale.is_empty() || !dangling.is_empty();
         let mut live = LiveSet::default();
         for (lba, hp) in live_blocks {
             live.map.insert(lba, hp);
@@ -358,8 +355,29 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             live,
             root,
         };
+        // REPAIR COMMIT FIRST (field 2026-08-25, the boot that re-pruned the same 84 danglings forever): every rescue's opening move is rolling the index back to the COMMITTED head (the survivor law), so prunes still in RAM evaporate the moment the wedge probe below fires — and a broken vault is USUALLY wedge-shaped, which is why the repair open kept "succeeding" while the disk never changed. Commit the pruned index NOW so the pruned head is the one every later rollback restores. A refused commit (a broken vault is usually FULL-shaped too) gets one grow — and because grow is a barrier that reloads the committed (unpruned) head, the recorded routes are re-pruned before the retry. If even that fails, skip the probe: the prunes then survive in RAM until the session's first successful commit lands them.
+        let mut probe_allowed = true;
+        if pruned_any {
+            // FENCE WAIVER (rescue's own privilege, same reasoning): the fence preserves rollback to older generations — but the generations a repairing vault would roll back TO are the broken ones being replaced, and the commit's heartbeat ladder can't raise a fence whose head still carries the pre-repair geometry. Waive, land, recompute from the ring.
+            v.tract.fence_limit = None;
+            let mut committed = v.commit(rescue_now).is_ok();
+            if !committed {
+                // A broken vault is usually FULL-shaped too — grow WITHOUT the barrier reload (the reload would resurrect the danglings and then fail Seal on them); the pruned index rides across and the grow's own commit lands it.
+                committed = v.grow_preserving(v.tract.len * 2, rescue_now + 1).is_ok();
+            }
+            let fences = v.ring.recent_fences(FENCE_K)?;
+            v.tract.fence_limit = fence_from(&fences);
+            if !committed {
+                probe_allowed = false;
+            }
+        }
+        if let Some(report) = repair {
+            report.stale = stale;
+            report.dangling = dangling;
+        }
         // WEDGE PROBE (field 2026-08-21/23/24): a head restored with less budget than one reap window + reserve is the fence deadlock arriving — nothing the ladders do can slide it. Rescue NOW, before any caller writes; best-effort, because a genuinely live-full tract must still open readable (the wedged field boxes served every boot load). NEVER on a migrating-era vault (root present): its legacy mixed layout derives near-zero clean space and looks wedge-shaped by definition — the migration sweep owns that state.
-        let wedged = !migrating
+        let wedged = probe_allowed
+            && !migrating
             && v.tract.fence_limit.map_or(false, |l| {
                 l.saturating_sub(v.tract.plow) < v.reap_window() + 8
             });
@@ -400,7 +418,12 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         if self.live.map.get(&lba) != Some(&hash) {
             return Ok(false);
         }
-        Ok(self.get(key)?.as_deref() == Some(value))
+        // A committed value that can no longer be READ is a value the vault does not hold — full stop. Field 2026-08-25: a reused furrow passes the repair walk (its own seal is valid, just someone else's content), then this get propagated the Seal and killed every subsequent put of that key BEFORE its write — the one operation that would have healed the key by overwriting it. Unreadable = not held = let the put proceed.
+        match self.get(key) {
+            Ok(stored) => Ok(stored.as_deref() == Some(value)),
+            Err(Error::Seal) | Err(Error::Corrupt(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     pub fn put(&mut self, key: &[u8; 32], value: &[u8], now: i64) -> Result<()> {
@@ -561,6 +584,22 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
 
         // Re-align the cursors so the CLEAN region is exactly the appended zeros and the OCCUPIED region is exactly the old tract: plow' ≡ old_len (appends start at the first new block), reap' = plow' − old_len (≡ 0 — the whole old region awaits the reap, which migrates its live blocks and retires its dead ones window by window).
         // Monotone order is preserved (plow' ≥ plow), so fence comparisons stay sound; pre-grow entries keep their smaller budgets until they age out of the K-window.
+        let plow = self.tract.plow;
+        let delta = (old_len + new_tract_blocks - plow % new_tract_blocks) % new_tract_blocks;
+        self.tract.plow = plow + delta;
+        self.tract.reap = self.tract.plow - old_len;
+        self.tract.len = new_tract_blocks;
+        self.commit(now)
+    }
+
+    /// Grow WITHOUT the barrier reload — for the one caller whose in-RAM index is MORE authoritative than the committed head: the repair open, whose prunes exist only in RAM. The normal grow discards RAM state and re-walks the committed head STRICTLY, which on a vault mid-repair (a) resurrects the pruned danglings and (b) fails Seal on them — the 2026-08-25 loop where the "repaired" vault re-pruned the same 84 pointers every boot while the disk never changed. Here the pruned hamt + its live set ride across the grow untouched; the trailing commit flushes them into the fresh clean region, landing the repair durably. Sound ONLY when the caller guarantees the RAM state is clean-by-construction (no half-applied put) — the repair open is exactly that.
+    pub(crate) fn grow_preserving(&mut self, new_tract_blocks: u64, now: i64) -> Result<()> {
+        let old_len = self.tract.len;
+        if new_tract_blocks <= old_len {
+            return Ok(());
+        }
+        let need = self.tract.base + new_tract_blocks;
+        self.ring.mirror().grow(need)?;
         let plow = self.tract.plow;
         let delta = (old_len + new_tract_blocks - plow % new_tract_blocks) % new_tract_blocks;
         self.tract.plow = plow + delta;
