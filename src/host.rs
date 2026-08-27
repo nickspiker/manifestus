@@ -73,11 +73,9 @@ impl FileDev {
 
     /// Extend the file to `new_blocks` (zeroed, preallocated). Tract growth: fallocate first, commit the new geometry in a spine entry second — power loss between the two leaves unclaimed zeros, which is harmless.
     pub fn grow(&mut self, new_blocks: u64) -> Result<()> {
-        if new_blocks < self.blocks {
-            return Err(Error::Corrupt(format!(
-                "grow cannot shrink: {} -> {}",
-                self.blocks, new_blocks
-            )));
+        // At-or-below current is a NO-OP, never an error — by this file's own design: a crash between fallocate and the spine commit leaves the file LARGER than the committed geometry ("unclaimed zeros, harmless"), so the next legitimate grow computes a need smaller than the file and must simply find it already satisfied. The old refusal turned that harmless crash residue into a permanent wound: every chains persist on the Mac failed "grow cannot shrink: 35072 -> 18752" against a 143MB file whose committed tract was ~9K blocks (field 2026-08-27).
+        if new_blocks <= self.blocks {
+            return Ok(());
         }
         preallocate(&self.file, new_blocks * BLOCK as u64)?;
         self.file.sync_all()?;

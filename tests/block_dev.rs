@@ -105,7 +105,9 @@ fn filedev_grow() {
     assert_eq!(out, pattern(7, 0x22));
     dev.read(15, &mut out).unwrap();
     assert_eq!(out, ZERO_BLOCK);
-    assert!(dev.grow(8).is_err(), "grow cannot shrink");
+    // At-or-below current = satisfied no-op (crash-between-fallocate-and-commit residue must not wound later grows); the file NEVER shrinks.
+    dev.grow(8).unwrap();
+    assert_eq!(dev.block_count(), 16, "a smaller request leaves the file untouched");
 }
 
 #[test]

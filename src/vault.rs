@@ -553,12 +553,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     /// The plow is re-aligned to the smallest monotone value ≥ the current plow whose wrapped position under the NEW length equals the current wrapped position, so the sweep continues from the same physical block. With that continuity, any position's revisit gap stays ≥ the tract length at its previous visit, and the per-generation fence (min of plow_i + tract_blocks_i) keeps every pre-grow generation in the K-window fully restorable. The alignment jump only burns fence budget, never adds any — strictly conservative; the put/commit heartbeat ladders absorb a tight window.
     pub fn grow(&mut self, new_tract_blocks: u64, now: i64) -> Result<()> {
         let old_len = self.tract.len;
-        if new_tract_blocks < old_len {
-            return Err(Error::Corrupt(format!(
-                "grow cannot shrink tract: {old_len} -> {new_tract_blocks}"
-            )));
-        }
-        if new_tract_blocks == old_len {
+        // A target at or below the current length is a NO-OP, never an error (field 2026-08-27): callers compute their target from a tract_blocks() read, and between that read and this call other queued work may have grown the tract past it — the request isn't wrong, it's already satisfied. Erroring here failed every chains persist on the Mac with "grow cannot shrink 35072 -> 18752" while the vault was perfectly healthy at 35072.
+        if new_tract_blocks <= old_len {
             return Ok(());
         }
         let need = self.tract.base + new_tract_blocks;
