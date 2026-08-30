@@ -855,9 +855,7 @@ impl Hamt {
                     }
                     let placed = tract.append(mirror, &payload)?;
                     // Patch the moved positions into the run list, coalescing.
-                    // TODO(scale): expand_runs materializes one u64 per furrow (~24MB
-                    // transiently for a 12GB value) — fine on hosts, wants a run-walking
-                    // iterator for the no_std kernel profile.
+                    // TODO(scale): expand_runs materializes one u64 per furrow (~24MB transiently for a 12GB value) — fine on hosts, wants a run-walking iterator for the no_std kernel profile.
                     let mut positions = expand_runs(&runs, size)?;
                     for (&(_, idx), &newpos) in group.iter().zip(&placed) {
                         let i = idx as usize;
