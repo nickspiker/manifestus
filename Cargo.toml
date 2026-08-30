@@ -1,6 +1,6 @@
 [package]
 name = "manifestus"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 description = "ferros storage engine: mirrored 4KB block devices, generation ring, plow-managed tract, COW HAMT. Every block guards itself; the guards verify each other."
 license = "MIT OR Apache-2.0"
@@ -17,7 +17,7 @@ std = ["blake3/std", "vsf/std"]
 # "pure": pure-Rust BLAKE3, no C/asm — the ferros convention (same incantation as ferros_pt), and required for the bare-metal target where blake3's C build script has no cross compiler.
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 # EWE + typed fields for spine entries / furrows / HAMT nodes. No text features — the engine uses d/u/h/e types only, never x.
-vsf = { path = "../vsf", default-features = false }
+vsf = { version = "0.9.3", path = "../vsf", default-features = false }
 # The two engine maps (LiveSet, reap furrow_owners). hashbrown IS std's HashMap — same O(1) behavior (preserving the vault.rs HashMap PROOF), available under no_std. Keys are u64 positions / BLAKE3 outputs, so bucket-collision attacks are not a concern for the default hasher.
 hashbrown = { version = "0.15", default-features = false, features = ["default-hasher"] }
 
