@@ -535,6 +535,63 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         Ok(())
     }
 
+    /// GROUP COMMIT with deletes: apply MANY put-or-delete ops IN ORDER, durable on return, under ONE spine commit (put_batch's law extended to mixed ops — a rarangi transaction's apply phase is [row puts + catalog put + superroot put + WAL retire-delete], and each riding its own commit was the 4-5x amplification behind the field's 40s message sends, 2026-09-02). `Some(value)` = put (identical-overwrite skipped), `None` = delete (absent key skipped). Order is preserved, which is load-bearing for callers whose LAST op is their visibility/cleanup edge (rarangi puts the WAL retire last): a mid-ladder Fenced heartbeat commit can land a PREFIX of the batch early — durability sooner, never out of order — so an op only ever lands after everything before it. NOT atomic under that heartbeat window: a caller needing all-or-nothing must anchor on its own journal (rarangi's WAL put precedes this and replays the full set on crash).
+    pub fn apply_batch(&mut self, items: &[(&[u8; 32], Option<&[u8]>)], now: i64) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut dirty = false;
+        for &(key, value) in items {
+            match value {
+                Some(v) => {
+                    if self.holds_committed(key, v)? {
+                        continue;
+                    }
+                    self.put_no_commit(key, v, now)?;
+                    dirty = true;
+                }
+                None => {
+                    // The delete ladder: deletion mutates index nodes (arena appends), so it can be Fenced like a put — commit to slide the fence and retry. A commit Fenced past its own heartbeat ladder propagates, same as vault::delete today.
+                    let existed = loop {
+                        let attempt = {
+                            let Self { ring, tract, hamt, .. } = self;
+                            hamt.delete(ring.mirror(), tract, key)
+                        };
+                        match attempt {
+                            Ok(e) => break e,
+                            Err(Error::Fenced(_)) => self.commit(now)?,
+                            Err(e) => return Err(e),
+                        }
+                    };
+                    dirty |= existed;
+                }
+            }
+        }
+        if !dirty {
+            return Ok(());
+        }
+        // Same replay law as put_batch: commit's TractFull means grow-the-barrier (reloads the committed head, arena pristine) and re-run the whole batch — holds_committed skips whatever a mid-ladder heartbeat already landed, deletes re-run idempotently.
+        if let Err(Error::TractFull) = self.commit(now) {
+            self.grow(self.tract.len * 2, now)?;
+            for &(key, value) in items {
+                match value {
+                    Some(v) => {
+                        if !self.holds_committed(key, v)? {
+                            self.put_no_commit(key, v, now)?;
+                        }
+                    }
+                    None => {
+                        let Self { ring, tract, hamt, .. } = self;
+                        hamt.delete(ring.mirror(), tract, key)?;
+                    }
+                }
+            }
+            self.commit(now)?;
+        }
+        self.maybe_reap(now)?;
+        Ok(())
+    }
+
     /// Delete, durable on return. Returns false if the key was absent.
     pub fn delete(&mut self, key: &[u8; 32], now: i64) -> Result<bool> {
         let existed = {
