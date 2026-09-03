@@ -485,6 +485,46 @@ fn put_batch_is_one_generation_and_survives_resume() {
 }
 
 #[test]
+fn apply_batch_mixes_puts_and_deletes_in_one_generation() {
+    let dir = TempDir::new().unwrap();
+    let (pa, pb) = paths(&dir, "apply");
+    {
+        let mut v = open_vault(&pa, &pb, RING + 256);
+        // Seed rows the batch will delete/overwrite.
+        v.put(&key(0), &val(0), 1_000).unwrap();
+        v.put(&key(1), &val(1), 1_001).unwrap();
+        let g0 = v.generation().unwrap();
+        // One mixed batch: overwrite k0, delete k1, insert k2 — ONE generation for the lot.
+        let newv = b"overwritten".to_vec();
+        let ins = val(2);
+        let keys: Vec<[u8; 32]> = (0..3).map(key).collect();
+        let ops: Vec<(&[u8; 32], Option<&[u8]>)> = vec![
+            (&keys[0], Some(newv.as_slice())),
+            (&keys[1], None),
+            (&keys[2], Some(ins.as_slice())),
+        ];
+        v.apply_batch(&ops, 1_002).unwrap();
+        assert_eq!(v.generation().unwrap(), g0 + 1, "mixed batch = ONE spine commit");
+        assert_eq!(v.get(&keys[0]).unwrap(), Some(newv.clone()));
+        assert_eq!(v.get(&keys[1]).unwrap(), None, "batched delete landed");
+        assert_eq!(v.get(&keys[2]).unwrap(), Some(ins.clone()));
+        // All-skipped batch (identical put + delete of an absent key) burns NO generation.
+        let g1 = v.generation();
+        let ops: Vec<(&[u8; 32], Option<&[u8]>)> =
+            vec![(&keys[0], Some(newv.as_slice())), (&keys[1], None)];
+        v.apply_batch(&ops, 1_003).unwrap();
+        assert_eq!(v.generation(), g1, "no-op batch commits nothing");
+    }
+    // Cold resume: the single commit carried put, overwrite, and delete alike.
+    let a = FileDev::open(&pa).unwrap();
+    let b = FileDev::open(&pb).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 2_000).unwrap();
+    assert_eq!(v.get(&key(0)).unwrap(), Some(b"overwritten".to_vec()));
+    assert_eq!(v.get(&key(1)).unwrap(), None);
+    assert_eq!(v.get(&key(2)).unwrap(), Some(val(2)));
+}
+
+#[test]
 fn churn_grows_never_wedges_and_loses_nothing() {
     // THE NEW LAW (2026-08-25, born of the field wedges at plows 422745 / 307312 / 1110637): batched churn on a tiny tract must never reach a terminal refusal — the ladder reaps what is dead, grows thru the airlock (the wedge parks the reap head ON the live index cluster with clean≈3, so survivors have nowhere to stage), and every rescue preserves every survivor. The 2026-08-24 grind lost 214 live blocks to repoint descents hunting thru a half-mutated arena; the ladder now rolls the in-flight put back to the committed root before reaping, and a repoint that swaps nothing is an ERROR, never a silent orphaning. Old-era wedged vaults heal thru the same rescue at open — the Linux box is the field test.
     let dir = TempDir::new().unwrap();
