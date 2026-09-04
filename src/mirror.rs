@@ -217,6 +217,11 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
         self.degraded
     }
 
+    /// Emit an engine event thru the mirror's sink — for layers (tract, ring) that route their I/O thru the mirror and have no sink of their own.
+    pub fn emit(&mut self, event: StorageEvent) {
+        self.events.emit(event);
+    }
+
     pub fn has_a(&self) -> bool {
         self.a.is_some()
     }

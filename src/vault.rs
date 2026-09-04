@@ -51,6 +51,9 @@ impl Liveness for LiveSet {
     fn is_live(&self, lba: u64, hp: &[u8; 32]) -> bool {
         self.map.get(&lba) == Some(hp)
     }
+    fn is_referenced(&self, lba: u64) -> bool {
+        self.map.contains_key(&lba)
+    }
 }
 
 /// What `Vault::open_repairing` pruned: stale pointers (target zeroed — the deleted-but-never-unlinked legal state, no data behind them) and dangling pointers (target reused/corrupt — the referenced value is LOST).
@@ -449,8 +452,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         // Bound: cleaning advances the reap every iteration, so a full lap of windows plus the fence ladder is guaranteed to terminate.
         for _ in 0..(FENCE_K + 3 + (self.tract.len / self.reap_window()) + 8) {
             let attempt = {
-                let Self { ring, tract, hamt, .. } = self;
-                hamt.put(ring.mirror(), tract, key, value)
+                let Self { ring, tract, hamt, live, .. } = self;
+                hamt.put(ring.mirror(), tract, live, key, value)
             };
             match attempt {
                 Ok(()) => return Ok(()),                Err(Error::Fenced(_)) => {
@@ -668,8 +671,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         let mut attempts = 0u64;
         let (root_hash, root_lba) = loop {
             let r = {
-                let Self { ring, tract, hamt, .. } = self;
-                hamt.flush(ring.mirror(), tract)
+                let Self { ring, tract, hamt, live, .. } = self;
+                hamt.flush(ring.mirror(), tract, live)
             };
             match r {
                 Ok(x) => {
@@ -799,7 +802,13 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 if airlock_grown {
                     return Err(Error::TractFull);
                 }
-                self.grow(self.tract.len + self.reap_window() * 4, now)?;
+                // Size the key to the disease (field 2026-09-03, Leviathan: 7.5 HOURS of failing writes). A dead-heavy wedge needs only staging room — the modest 4-window grow. But a LIVE-heavy tract (>50% live) has genuinely outgrown itself, and the modest grow is a token: its fresh lap is consumed at once and the vault re-enters the wedge, looping grow→wedge→grow for hours while every put fails. Every other grow site doubles; when the working set is the problem, double here too — disk is cheap, hours of refused writes are not.
+                let target = if self.live.len() as u64 * 2 > self.tract.len {
+                    self.tract.len * 2
+                } else {
+                    self.tract.len + self.reap_window() * 4
+                };
+                self.grow(target, now)?;
                 airlock_grown = true;
                 continue;
             }
@@ -880,8 +889,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     #[doc(hidden)]
     pub fn put_legacy_direct_for_tests(&mut self, key: &[u8; 32], value: &[u8], now: i64) -> Result<()> {
         {
-            let Self { ring, tract, hamt, .. } = self;
-            hamt.put_legacy_direct_for_tests(ring.mirror(), tract, key, value)?;
+            let Self { ring, tract, hamt, live, .. } = self;
+            hamt.put_legacy_direct_for_tests(ring.mirror(), tract, live, key, value)?;
         }
         self.commit(now)
     }

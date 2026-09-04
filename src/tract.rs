@@ -39,6 +39,20 @@ pub fn sealed_hp(block: &Block) -> Option<[u8; 32]> {
 /// The caller's knowledge of what is referenced. The vault implements this over its (in-memory, batch-current) HAMT: live iff the index maps this hp to exactly this lba.
 pub trait Liveness {
     fn is_live(&self, lba: u64, hp: &[u8; 32]) -> bool;
+    /// Whether ANY committed pointer references this lba, hp-independent — the append lap guard's question. `is_live` answers "is this exact block current"; this answers "would writing here destroy something the index still points at".
+    fn is_referenced(&self, lba: u64) -> bool;
+}
+
+/// The nothing-is-referenced oracle: genesis paths and tests, where no committed index exists to lap.
+pub struct NoLive;
+
+impl Liveness for NoLive {
+    fn is_live(&self, _lba: u64, _hp: &[u8; 32]) -> bool {
+        false
+    }
+    fn is_referenced(&self, _lba: u64) -> bool {
+        false
+    }
 }
 
 /// A live block that moved during a reap window: the caller must update its index (batched into the retiring spine commit).
@@ -78,10 +92,11 @@ impl Tract {
     }
 
     /// Append `blocks` contiguously at the plow (already sealed by the layer above).
-    /// Returns the tract-relative lbas, in order — consecutive positions, wrapping at most once. Checks space and fence BEFORE writing a byte: a refused append has no side effects.
+    /// Returns the tract-relative lbas, in order — consecutive positions, wrapping at most once. Checks space, fence AND liveness BEFORE writing a byte: a refused append has no side effects.
     pub fn append<A: BlockDev, B: BlockDev>(
         &mut self,
         mirror: &mut Mirror<A, B>,
+        live: &dyn Liveness,
         blocks: &[Block],
     ) -> Result<Vec<u64>> {
         let n = blocks.len() as u64;
@@ -91,6 +106,14 @@ impl Tract {
         if let Some(limit) = self.fence_limit {
             if self.plow + n > limit {
                 return Err(Error::Fenced(self.plow));
+            }
+        }
+        // THE LAP GUARD (field 2026-09-03: Leviathan's 43 danglings, no bad byte anywhere — the pointers were wrong, and blind appends turned wrong pointers into destroyed values). The clean invariant says no live block sits in [plow, reap+len); every historical loss class (missed repoint, cursor desync, pre-fix tombstone reuse) ends with exactly that broken, and the append is the moment breakage becomes loss. One map lookup per block makes lapping physically impossible: refuse before writing, emit so the embedder's log names the averted lap, and surface TractFull — the caller's ladder grows, the grow barrier realigns cursors onto provably live-free space, and the referenced bytes survive untouched.
+        for i in 0..n {
+            let pos = (self.plow + i) % self.len;
+            if live.is_referenced(pos) {
+                mirror.emit(crate::events::StorageEvent::LiveLapAverted { lba: pos });
+                return Err(Error::TractFull);
             }
         }
         let batch: Vec<(u64, &Block)> = blocks
