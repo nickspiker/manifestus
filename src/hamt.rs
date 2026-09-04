@@ -214,12 +214,13 @@ impl Hamt {
         &mut self,
         mirror: &mut Mirror<A, B>,
         tract: &mut Tract,
+        live: &dyn Liveness,
         key: &[u8; 32],
         value: &[u8],
     ) -> Result<()> {
         let added_mark = self.delta.added.len();
         let removed_mark = self.delta.removed.len();
-        let r = self.put_inner(mirror, tract, key, value);
+        let r = self.put_inner(mirror, tract, live, key, value);
         if r.is_err() {
             self.delta.added.truncate(added_mark);
             self.delta.removed.truncate(removed_mark);
@@ -231,13 +232,14 @@ impl Hamt {
         &mut self,
         mirror: &mut Mirror<A, B>,
         tract: &mut Tract,
+        live: &dyn Liveness,
         key: &[u8; 32],
         value: &[u8],
     ) -> Result<()> {
         let lone_max = lone_capacity();
         let (leaf_lba, leaf_hash) = if value.len() <= lone_max {
             let leaf = encode_lone(key, value);
-            let lba = tract.append(mirror, core::slice::from_ref(&leaf))?[0];
+            let lba = tract.append(mirror, live, core::slice::from_ref(&leaf))?[0];
             let hash = sealed_hp(&leaf).unwrap();
             self.delta.added.push((lba, hash));
             (lba, hash)
@@ -250,13 +252,13 @@ impl Hamt {
                 .enumerate()
                 .map(|(i, c)| encode_furrow(key, i as u64, c))
                 .collect();
-            let placed = tract.append(mirror, &payload)?;
+            let placed = tract.append(mirror, live, &payload)?;
             for (lba, b) in placed.iter().zip(&payload) {
                 self.delta.added.push((*lba, sealed_hp(b).unwrap()));
             }
             let runs = compress_runs(&placed);
             let leaf = encode_extent(key, value.len() as u64, &runs)?;
-            let lba = tract.append(mirror, core::slice::from_ref(&leaf))?[0];
+            let lba = tract.append(mirror, live, core::slice::from_ref(&leaf))?[0];
             let hash = sealed_hp(&leaf).unwrap();
             self.delta.added.push((lba, hash));
             (lba, hash)
@@ -515,13 +517,14 @@ impl Hamt {
         &mut self,
         mirror: &mut Mirror<A, B>,
         tract: &mut Tract,
+        live: &dyn Liveness,
     ) -> Result<([u8; 32], u64)> {
         let root = self.root.clone();
         let committed = match root {
             None => return Ok(([0u8; 32], 0)),
             Some(Child::Committed { hash, lba }) => (hash, lba),
             Some(Child::Dirty(idx)) => {
-                let (hash, lba) = self.flush_node(mirror, tract, idx)?;
+                let (hash, lba) = self.flush_node(mirror, tract, live, idx)?;
                 self.root = Some(Child::Committed { hash, lba });
                 (hash, lba)
             }
@@ -534,17 +537,18 @@ impl Hamt {
         &mut self,
         mirror: &mut Mirror<A, B>,
         tract: &mut Tract,
+        live: &dyn Liveness,
         idx: usize,
     ) -> Result<([u8; 32], u64)> {
         // Children first.
         for c in 0..32 {
             if let Some(Child::Dirty(sub)) = self.arena[idx].children[c].clone() {
-                let (hash, lba) = self.flush_node(mirror, tract, sub)?;
+                let (hash, lba) = self.flush_node(mirror, tract, live, sub)?;
                 self.arena[idx].children[c] = Some(Child::Committed { hash, lba });
             }
         }
         let block = encode_node(&self.arena[idx]);
-        let lba = tract.append(mirror, core::slice::from_ref(&block))?[0];
+        let lba = tract.append(mirror, live, core::slice::from_ref(&block))?[0];
         let hash = sealed_hp(&block).unwrap();
         self.delta.added.push((lba, hash));
         Ok((hash, lba))
@@ -853,7 +857,7 @@ impl Hamt {
                         tract.read(mirror, pos, &mut b)?;
                         payload.push(b);
                     }
-                    let placed = tract.append(mirror, &payload)?;
+                    let placed = tract.append(mirror, oracle, &payload)?;
                     // Patch the moved positions into the run list, coalescing.
                     // TODO(scale): expand_runs materializes one u64 per furrow (~24MB transiently for a 12GB value) — fine on hosts, wants a run-walking iterator for the no_std kernel profile.
                     let mut positions = expand_runs(&runs, size)?;
@@ -866,7 +870,7 @@ impl Hamt {
                     }
                     let new_runs = compress_runs(&positions);
                     let new_leaf = encode_extent(&key, size, &new_runs)?;
-                    let nl = tract.append(mirror, core::slice::from_ref(&new_leaf))?[0];
+                    let nl = tract.append(mirror, oracle, core::slice::from_ref(&new_leaf))?[0];
                     let nh = sealed_hp(&new_leaf).unwrap();
                     self.replace_leaf(mirror, tract, &key, (leaf_hash, leaf_lba), (nh, nl))?;
                     for (b, &lba) in payload.iter().zip(&placed) {
@@ -881,7 +885,7 @@ impl Hamt {
                 Some(TractDoc::Direct { key: k, size, furrows }) if k == key => {
                     // Legacy per-lba value (bounded by the old ~1MB cap): rewrite whole, upgrading it to extent form. put() retires every old block.
                     let value = read_furrows(mirror, tract, &key, size, &furrows)?;
-                    self.put(mirror, tract, &key, &value)?;
+                    self.put(mirror, tract, oracle, &key, &value)?;
                 }
                 _ => continue,
             }
@@ -897,7 +901,7 @@ impl Hamt {
             if sealed_hp(&b) != Some(hp) {
                 continue; // changed underneath us — retired by an earlier step
             }
-            let to = tract.append(mirror, core::slice::from_ref(&b))?[0];
+            let to = tract.append(mirror, oracle, core::slice::from_ref(&b))?[0];
             self.repair_relocs(mirror, tract, &[Reloc { hp, from: pos, to }])?;
             self.delta.added.push((to, hp));
             self.delta.removed.push((pos, hp));
@@ -1041,6 +1045,7 @@ impl Hamt {
         &mut self,
         mirror: &mut Mirror<A, B>,
         tract: &mut Tract,
+        live: &dyn Liveness,
         key: &[u8; 32],
         value: &[u8],
     ) -> Result<()> {
@@ -1050,12 +1055,12 @@ impl Hamt {
             .enumerate()
             .map(|(i, c)| encode_furrow(key, i as u64, c))
             .collect();
-        let placed = tract.append(mirror, &payload)?;
+        let placed = tract.append(mirror, live, &payload)?;
         for (lba, b) in placed.iter().zip(&payload) {
             self.delta.added.push((*lba, sealed_hp(b).unwrap()));
         }
         let leaf = encode_direct(key, value.len() as u64, &placed);
-        let lba = tract.append(mirror, core::slice::from_ref(&leaf))?[0];
+        let lba = tract.append(mirror, live, core::slice::from_ref(&leaf))?[0];
         let hash = sealed_hp(&leaf).unwrap();
         self.delta.added.push((lba, hash));
         let root = self.root.clone();

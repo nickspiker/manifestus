@@ -2,7 +2,7 @@
 
 use manifestus::block::Block;
 use manifestus::ring::MAGIC;
-use manifestus::{sealed_hp, BlockDev, FileDev, Mirror, Tract, ZERO_BLOCK};
+use manifestus::{sealed_hp, BlockDev, FileDev, Mirror, NoLive, Tract, ZERO_BLOCK};
 use tempfile::TempDir;
 
 /// Minimal sealed block: RÅ< hp > + tag payload + zero pad. Content-agnostic from the tract's view.
@@ -47,7 +47,7 @@ fn appends_are_sequential_and_contiguous() {
     let dir = TempDir::new().unwrap();
     let mut m = mk(&dir, "fresh", 8);
     let mut t = tract(8);
-    let placed = t.append(&mut m, &[seal(1), seal(2), seal(3)]).unwrap();
+    let placed = t.append(&mut m, &NoLive, &[seal(1), seal(2), seal(3)]).unwrap();
     assert_eq!(placed, vec![0, 1, 2]);
     assert_eq!(t.plow, 3);
     assert_eq!(t.position(), 3);
@@ -63,11 +63,11 @@ fn append_wraps_once_reap_has_advanced() {
     let dir = TempDir::new().unwrap();
     let mut m = mk(&dir, "wrap", 8);
     let mut t = tract(8);
-    t.append(&mut m, &[seal(1), seal(2), seal(3), seal(4), seal(5), seal(6)]).unwrap();
+    t.append(&mut m, &NoLive, &[seal(1), seal(2), seal(3), seal(4), seal(5), seal(6)]).unwrap();
     // The reap retires the first 4 positions (their content is garbage now).
     t.reap = 4;
     assert_eq!(t.clean_blocks(), 6);
-    let placed = t.append(&mut m, &[seal(7), seal(8), seal(9)]).unwrap();
+    let placed = t.append(&mut m, &NoLive, &[seal(7), seal(8), seal(9)]).unwrap();
     assert_eq!(placed, vec![6, 7, 0], "run split exactly once at the ring boundary");
     assert_eq!(t.position(), 1);
 }
@@ -78,8 +78,8 @@ fn fence_refuses_before_writing() {
     let mut m = mk(&dir, "fence", 8);
     let mut t = tract(8);
     t.fence_limit = Some(2);
-    t.append(&mut m, &[seal(1), seal(2)]).unwrap();
-    let err = t.append(&mut m, &[seal(3)]);
+    t.append(&mut m, &NoLive, &[seal(1), seal(2)]).unwrap();
+    let err = t.append(&mut m, &NoLive, &[seal(3)]);
     assert!(matches!(err, Err(manifestus::Error::Fenced(2))));
     // Refusal had no side effects.
     assert_eq!(t.plow, 2);
@@ -94,9 +94,9 @@ fn full_tract_refuses_before_writing() {
     let mut m = mk(&dir, "full", 8);
     let mut t = tract(8);
     let blocks: Vec<Block> = (0..8).map(seal).collect();
-    t.append(&mut m, &blocks).unwrap();
+    t.append(&mut m, &NoLive, &blocks).unwrap();
     assert_eq!(t.clean_blocks(), 0);
-    assert!(matches!(t.append(&mut m, &[seal(9)]), Err(manifestus::Error::TractFull)));
+    assert!(matches!(t.append(&mut m, &NoLive, &[seal(9)]), Err(manifestus::Error::TractFull)));
     assert_eq!(t.plow, 8, "refusal is side-effect free");
 }
 
@@ -105,7 +105,7 @@ fn zero_delete_zeroes_both_mirrors() {
     let dir = TempDir::new().unwrap();
     let mut m = mk(&dir, "zero", 8);
     let mut t = tract(8);
-    t.append(&mut m, &[seal(1)]).unwrap();
+    t.append(&mut m, &NoLive, &[seal(1)]).unwrap();
     t.zero_delete(&mut m, 0).unwrap();
     let (a, b) = m.devices();
     let mut buf = ZERO_BLOCK;
@@ -121,8 +121,8 @@ fn originals_survive_until_reap_retires_them() {
     let dir = TempDir::new().unwrap();
     let mut m = mk(&dir, "intact", 8);
     let mut t = tract(8);
-    t.append(&mut m, &[seal(1), seal(2), seal(3)]).unwrap();
-    t.append(&mut m, &[seal(4), seal(5)]).unwrap();
+    t.append(&mut m, &NoLive, &[seal(1), seal(2), seal(3)]).unwrap();
+    t.append(&mut m, &NoLive, &[seal(4), seal(5)]).unwrap();
     for (lba, tag) in [(0u64, 1u64), (1, 2), (2, 3), (3, 4), (4, 5)] {
         let mut buf = ZERO_BLOCK;
         t.read(&mut m, lba, &mut buf).unwrap();

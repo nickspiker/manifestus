@@ -19,6 +19,8 @@ pub enum StorageEvent {
     MirrorDegraded,
     /// A reap window completed. (scanned, live, moved — block counts)
     ReapWindow { scanned: u64, live: u64, moved: u64 },
+    /// An append was about to overwrite a block the committed index still references — the lap guard refused before a byte was written (the 43-dangling class, caught pre-loss). The clean invariant was already broken upstream when this fires; the refusal preserves the value, this event is the confession.
+    LiveLapAverted { lba: u64 },
 }
 
 /// The injected sink. Implementations must be cheap and non-blocking from the engine's point of view — buffering and durability are the embedder's problem, not the engine's.

@@ -487,7 +487,18 @@ fn walk_tree<D: BlockDev>(
         });
         return Ok(());
     }
-    reachable.insert(lba);
+    // CYCLE GUARD (field 2026-09-03: the Leviathan pre-repair vault wedged the inspector for MINUTES with zero output). A healthy COW HAMT is a tree — every block has exactly one parent — so a revisit is corruption by definition (a dangling pointer led into a reused block whose children point back into walked territory). Without this, the walk re-explores the cyclic subgraph 32-way at every depth: capped at 52 deep but exponential in breadth, i.e. forever. Report and prune; an inspector that hangs on a broken vault is useless exactly when it is needed.
+    if !reachable.insert(lba) {
+        out.push(TreeNode {
+            indent,
+            lba,
+            doc: TractBlock::Lone { key: [0; 32], value_len: 0 },
+            seal_ok: false,
+            self_addr_ok: false,
+            note: Some(format!("cycle: lba {lba} already reached — walk pruned (a block with two parents cannot exist in a healthy tree)")),
+        });
+        return Ok(());
+    }
 
     match decode_tract(&buf) {
         Err(reason) => {
@@ -519,8 +530,8 @@ fn walk_tree<D: BlockDev>(
                     let children_copy = children.clone();
                     let route_copy = *route;
                     out.push(TreeNode { indent, lba, doc, seal_ok, self_addr_ok, note });
-                    // 256/5 tops out at depth 51 — deeper means a cycle or bogus node (field 2026-08-24: the wedged Mac vault recursed past u8); report-and-stop beats overflowing the walk.
-                    for (slot, h, child_lba) in children_copy.into_iter().filter(|_| depth < 52) {
+                    // 256/5 tops out at depth 51 — deeper means a cycle or bogus node (field 2026-08-24: the wedged Mac vault recursed past u8); report-and-stop beats overflowing the walk. And a node whose seal MISMATCHES its pointer is not the block the pointer meant — its children belong to whatever subtree got reused here, so descending walks a stranger's tree (the other half of the 2026-09-03 wedge); the mismatch note above is the whole finding.
+                    for (slot, h, child_lba) in children_copy.into_iter().filter(|_| depth < 52 && seal_ok) {
                         // Descend; the child's route is the parent's route with this slot's chunk implied (we pass the parent route; leaf self-check uses the leaf's own key).
                         let _ = route_copy;
                         walk_tree(
