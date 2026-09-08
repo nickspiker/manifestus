@@ -418,7 +418,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     /// True iff `value` is already the COMMITTED value at `key` — the identical-overwrite skip's gate. Committed matters: matching a provisional copy and skipping would claim durability a crash could revoke. One index read against ~1s of flushes; same-value churn (fstate ping-pong, phonebook re-adoption) was pure plow pressure toward the fence cliff (field 2026-08-24/25).
     fn holds_committed(&mut self, key: &[u8; 32], value: &[u8]) -> Result<bool> {
         let leaf = {
-            let Self { ring, tract, hamt, policy, .. } = self;
+            let Self { ring, tract, hamt, .. } = self;
             hamt.find_leaf(ring.mirror(), tract, key)?
         };
         let Some((lba, hash)) = leaf else {
@@ -636,7 +636,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         self.tract.plow = head.plow;
         let mut live_blocks = Vec::new();
         {
-            let Self { ring, tract, hamt, policy, .. } = self;
+            let Self { ring, tract, hamt, .. } = self;
             hamt.walk_live(ring.mirror(), tract, &mut live_blocks)?;
         }
         self.live = LiveSet::default();
