@@ -352,30 +352,33 @@ impl Hamt {
         mirror: &mut Mirror<A, B>,
         tract: &mut Tract,
         key: &[u8; 32],
+        policy: crate::DeletePolicy,
     ) -> Result<bool> {
         // Find the leaf lba by walking (without mutating).
         let Some((lba, hash)) = self.find_leaf(mirror, tract, key)? else {
             return Ok(false);
         };
         self.remove_leaf_blocks(mirror, tract, lba, &hash)?;
-        // Zero the blocks themselves.
-        if let Some(doc) = read_doc(mirror, tract, lba, &hash)? {
-            match doc {
-                TractDoc::Direct { furrows, .. } => {
-                    for f in furrows {
-                        tract.zero_delete(mirror, f)?;
+        // ZeroIsErase only (see crate::DeletePolicy — a true erase solely on engine-owned NAND where erased == zero): everywhere else the zero-write erases nothing (CoW snapshots + vendor FTLs keep the bytes), frees nothing (the unlink + reap below is the reclamation), and costs a full-value write of wear. UnlinkOnly's crash window is BENIGNLY different: a crash before the retiring commit leaves the old head pointing at INTACT blocks — the value simply survives, re-deletable — instead of the legal zeroed-leaf state.
+        if policy == crate::DeletePolicy::ZeroIsErase {
+            if let Some(doc) = read_doc(mirror, tract, lba, &hash)? {
+                match doc {
+                    TractDoc::Direct { furrows, .. } => {
+                        for f in furrows {
+                            tract.zero_delete(mirror, f)?;
+                        }
                     }
-                }
-                TractDoc::Extent { size, runs, .. } => {
-                    for pos in expand_runs(&runs, size)? {
-                        tract.zero_delete(mirror, pos)?;
+                    TractDoc::Extent { size, runs, .. } => {
+                        for pos in expand_runs(&runs, size)? {
+                            tract.zero_delete(mirror, pos)?;
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
+                tract.zero_delete(mirror, lba)?;
             }
-            tract.zero_delete(mirror, lba)?;
         }
-        // Unlink the pointer thru the COW path so no committed generation past this one carries it. A crash before the retiring commit leaves the OLD head, whose pointer targets the now-zero slot — still the legal "deleted, reads None" state, and resume prunes it.
+        // Unlink the pointer thru the COW path so no committed generation past this one carries it.
         self.prune(mirror, tract, key, (hash, lba))?;
         Ok(true)
     }

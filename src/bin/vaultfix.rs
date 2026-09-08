@@ -41,7 +41,7 @@ fn main() -> ExitCode {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    match Vault::open_repairing(mirror, HOST_RING_LOG2, now) {
+    match Vault::open_repairing(mirror, HOST_RING_LOG2, now, manifestus::DeletePolicy::UnlinkOnly) {
         Err(e) => {
             eprintln!("vaultfix: repair open failed: {e}");
             ExitCode::from(1)

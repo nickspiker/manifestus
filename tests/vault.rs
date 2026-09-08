@@ -1,6 +1,6 @@
 //! The composition: genesis ladder, KV durability, cold resume, replication, spin, and the final-form kill -9 test — murder mid-commit, reopen, assert the committed prefix is exactly intact.
 
-use manifestus::{verified_replicate, BlockDev, FileDev, Mirror, Vault, ZERO_BLOCK, HOST_RING_LOG2};
+use manifestus::{DeletePolicy, verified_replicate, BlockDev, FileDev, Mirror, Vault, ZERO_BLOCK, HOST_RING_LOG2};
 use tempfile::TempDir;
 
 const RING: u64 = 1 << HOST_RING_LOG2;
@@ -23,7 +23,7 @@ fn paths(dir: &TempDir, name: &str) -> (std::path::PathBuf, std::path::PathBuf) 
 fn open_vault(pa: &std::path::Path, pb: &std::path::Path, blocks: u64) -> Vault<FileDev, FileDev> {
     let a = FileDev::create(pa, blocks).unwrap();
     let b = FileDev::create(pb, blocks).unwrap();
-    Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 1_000).unwrap()
+    Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 1_000, DeletePolicy::UnlinkOnly).unwrap()
 }
 
 #[test]
@@ -45,7 +45,7 @@ fn genesis_kv_and_resume() {
     // Cold resume: geometry/index/live from the head entry alone.
     let a = FileDev::open(&pa).unwrap();
     let b = FileDev::open(&pb).unwrap();
-    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 2_000).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 2_000, DeletePolicy::UnlinkOnly).unwrap();
     assert_eq!(v.generation(), Some(3));
     assert_eq!(v.get(&key(2)).unwrap(), Some(b"beta".to_vec()));
     assert_eq!(v.get(&key(1)).unwrap(), None);
@@ -69,7 +69,7 @@ fn open_ladder_genesis_over_trash_refuses_real() {
     }
     let a = FileDev::open(&pa).unwrap();
     let b = FileDev::open(&pb).unwrap();
-    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 1_000).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 1_000, DeletePolicy::UnlinkOnly).unwrap();
     v.put(&key(9), b"reborn over trash", 1_001).unwrap();
     assert_eq!(v.get(&key(9)).unwrap(), Some(b"reborn over trash".to_vec()));
     drop(v);
@@ -95,7 +95,7 @@ fn open_ladder_genesis_over_trash_refuses_real() {
     }
     let c = FileDev::open(&pc).unwrap();
     let d = FileDev::open(&pd).unwrap();
-    let err = Vault::open(Mirror::new(c, d), HOST_RING_LOG2, 1_000);
+    let err = Vault::open(Mirror::new(c, d), HOST_RING_LOG2, 1_000, DeletePolicy::UnlinkOnly);
     assert!(err.is_err(), "sealed block anywhere = real vault = never format");
 }
 
@@ -113,7 +113,7 @@ fn many_keys_cold_resume_with_big_values() {
     }
     let a = FileDev::open(&pa).unwrap();
     let b = FileDev::open(&pb).unwrap();
-    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 3_000).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 3_000, DeletePolicy::UnlinkOnly).unwrap();
     for i in 0..60 {
         assert_eq!(v.get(&key(i)).unwrap(), Some(val(i)), "key {i}");
     }
@@ -135,7 +135,7 @@ fn replication_converges_stale_mirror() {
     {
         let a = FileDev::open(&pa).unwrap();
         let mirror: Mirror<FileDev, FileDev> = Mirror::from_parts(Some(a), None).unwrap();
-        let mut v = Vault::open(mirror, HOST_RING_LOG2, 2_000).unwrap();
+        let mut v = Vault::open(mirror, HOST_RING_LOG2, 2_000, DeletePolicy::UnlinkOnly).unwrap();
         for i in 10..20 {
             v.put(&key(i), &val(i), 2_000 + i as i64).unwrap();
         }
@@ -152,7 +152,7 @@ fn replication_converges_stale_mirror() {
     assert_eq!((out2.spine_copied, out2.tract_copied), (0, 0));
 
     // The converged pair opens and serves everything.
-    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 3_000).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 3_000, DeletePolicy::UnlinkOnly).unwrap();
     for i in 0..20 {
         assert_eq!(v.get(&key(i)).unwrap(), Some(val(i)), "key {i} after replication");
     }
@@ -213,7 +213,7 @@ fn grow_expands_full_tract_and_survives_resume() {
     // Cold resume adopts the grown geometry from the head entry alone.
     let a = FileDev::open(&pa).unwrap();
     let b = FileDev::open(&pb).unwrap();
-    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 9_000).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 9_000, DeletePolicy::UnlinkOnly).unwrap();
     for &j in &written {
         assert_eq!(v.get(&key(j)).unwrap(), Some(val(j)), "key {j} lost across resume");
     }
@@ -260,7 +260,7 @@ fn replication_grows_smaller_loser() {
     {
         let a = FileDev::open(&pa).unwrap();
         let mirror: Mirror<FileDev, FileDev> = Mirror::from_parts(Some(a), None).unwrap();
-        let mut v = Vault::open(mirror, HOST_RING_LOG2, 2_000).unwrap();
+        let mut v = Vault::open(mirror, HOST_RING_LOG2, 2_000, DeletePolicy::UnlinkOnly).unwrap();
         v.grow(1024, 2_100).unwrap();
         for i in 5..40 {
             v.put(&key(i), &val(i), 2_200 + i as i64).unwrap();
@@ -273,7 +273,7 @@ fn replication_grows_smaller_loser() {
     verified_replicate(&mut a, &mut b, HOST_RING_LOG2).unwrap();
     assert_eq!(b.block_count(), a.block_count(), "loser extended to winner's extent");
 
-    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 3_000).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 3_000, DeletePolicy::UnlinkOnly).unwrap();
     assert_eq!(v.tract_blocks(), 1024);
     for i in 0..40 {
         assert_eq!(v.get(&key(i)).unwrap(), Some(val(i)), "key {i} after grow+replicate");
@@ -310,7 +310,7 @@ fn huge_value_survives_reap_laps() {
     // Cold resume: extent leaves + migrated runs all reconstruct from the head alone.
     let a = FileDev::open(&pa).unwrap();
     let b = FileDev::open(&pb).unwrap();
-    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 99_000).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 99_000, DeletePolicy::UnlinkOnly).unwrap();
     assert_eq!(v.get(&key(9000)).unwrap().as_deref(), Some(&big[..]), "read after cold resume");
 }
 
@@ -338,7 +338,7 @@ fn legacy_direct_value_migrates_thru_reap() {
     }
     let a = FileDev::open(&pa).unwrap();
     let b = FileDev::open(&pb).unwrap();
-    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 99_000).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 99_000, DeletePolicy::UnlinkOnly).unwrap();
     assert_eq!(v.get(&key(7000)).unwrap().as_deref(), Some(&old[..]), "readable after cold resume");
 }
 
@@ -352,7 +352,7 @@ fn vault_kill_child_worker() {
     };
     let a = FileDev::open(std::path::Path::new(&format!("{base}-a.vsf"))).unwrap();
     let b = FileDev::open(std::path::Path::new(&format!("{base}-b.vsf"))).unwrap();
-    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 5_000).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 5_000, DeletePolicy::UnlinkOnly).unwrap();
     // Resume the sequence where the committed history says we are.
     let mut i = v.generation().unwrap_or(0); // gen g = g puts committed (genesis is gen 0)
     loop {
@@ -374,7 +374,7 @@ fn vault_survives_kill_nine_with_exact_committed_prefix() {
     {
         let a = FileDev::open(std::path::Path::new(&format!("{base}-a.vsf"))).unwrap();
         let b = FileDev::open(std::path::Path::new(&format!("{base}-b.vsf"))).unwrap();
-        Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 4_000).unwrap();
+        Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 4_000, DeletePolicy::UnlinkOnly).unwrap();
     }
 
     let mut last_gen = 0u64;
@@ -395,7 +395,7 @@ fn vault_survives_kill_nine_with_exact_committed_prefix() {
         // Reopen the whole stack cold. The committed generation G defines EXACTLY which puts are visible: keys 0..G present with correct values, key G absent (the in-flight put died provisional).
         let a = FileDev::open(std::path::Path::new(&format!("{base}-a.vsf"))).unwrap();
         let b = FileDev::open(std::path::Path::new(&format!("{base}-b.vsf"))).unwrap();
-        let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 6_000).unwrap();
+        let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 6_000, DeletePolicy::UnlinkOnly).unwrap();
         let g = v.generation().expect("a committed head must survive");
         assert!(g >= last_gen, "round {round}: generations must be monotone");
         last_gen = g;
@@ -477,7 +477,7 @@ fn put_batch_is_one_generation_and_survives_resume() {
     // Cold resume sees every batch entry — the single commit really carried them all.
     let a = FileDev::open(&pa).unwrap();
     let b = FileDev::open(&pb).unwrap();
-    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 2_000).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 2_000, DeletePolicy::UnlinkOnly).unwrap();
     for i in 1..20 {
         assert_eq!(v.get(&key(i)).unwrap().as_deref(), Some(val(i).as_slice()));
     }
@@ -518,7 +518,7 @@ fn apply_batch_mixes_puts_and_deletes_in_one_generation() {
     // Cold resume: the single commit carried put, overwrite, and delete alike.
     let a = FileDev::open(&pa).unwrap();
     let b = FileDev::open(&pb).unwrap();
-    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 2_000).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 2_000, DeletePolicy::UnlinkOnly).unwrap();
     assert_eq!(v.get(&key(0)).unwrap(), Some(b"overwritten".to_vec()));
     assert_eq!(v.get(&key(1)).unwrap(), None);
     assert_eq!(v.get(&key(2)).unwrap(), Some(val(2)));
@@ -548,7 +548,7 @@ fn churn_grows_never_wedges_and_loses_nothing() {
     // Strict reopen: walk_live dies loudly on any dangling; every key resolves; fresh puts flow.
     let a = FileDev::open(&pa).unwrap();
     let b = FileDev::open(&pb).unwrap();
-    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 50_000).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 50_000, DeletePolicy::UnlinkOnly).unwrap();
     for k in 0..4u64 {
         assert_eq!(v.get(&key(k)).unwrap(), Some(big(119, k)), "value lost across reopen");
     }

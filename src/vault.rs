@@ -74,11 +74,13 @@ pub struct Vault<A: BlockDev, B: BlockDev> {
     live: LiveSet,
     /// Migrating profile (RING.md "Migrating Rings"): the newest root entry. None on the legacy/host layout (spine fixed at block 0, R = ∞).
     root: Option<RootEntry>,
+    /// What delete physically does (see [`crate::DeletePolicy`]) — a required open parameter, stored for the life of the handle.
+    policy: crate::DeletePolicy,
 }
 
 impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     /// Open an existing vault or genesis a fresh one, per the open ladder above. `default_tract_blocks` sizes genesis only — an existing vault's geometry comes from its head entry, never from arguments.
-    pub fn open(mut mirror: Mirror<A, B>, ring_log2: u8, now: i64) -> Result<Self> {
+    pub fn open(mut mirror: Mirror<A, B>, ring_log2: u8, now: i64, policy: crate::DeletePolicy) -> Result<Self> {
         // Migrating layout first: a root entry at blocks [0, 4) names the spine's residence.
         {
             let (a, b) = mirror.devices();
@@ -88,11 +90,11 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 (None, None) => None,
             };
             if let Some(root) = root {
-                return Self::resume_migrating(mirror, root);
+                return Self::resume_migrating(mirror, root, policy);
             }
         }
         match Ring::bootstrap_n(&mut mirror)? {
-            Some(r) => Self::resume(mirror, r),
+            Some(r) => Self::resume(mirror, r, policy),
             None => {
                 // Nothing bootstrappable: trash-vs-real decided by the WHOLE file, both sides — a valid block is its own proof (2^-256 false positive).
                 let (a, b) = mirror.devices();
@@ -108,12 +110,12 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                         "sealed blocks exist but no spine bootstraps: real vault needing recovery — refusing to format".into(),
                     ));
                 }
-                Self::genesis(mirror, ring_log2, now)
+                Self::genesis(mirror, ring_log2, now, policy)
             }
         }
     }
 
-    fn genesis(mut mirror: Mirror<A, B>, ring_log2: u8, now: i64) -> Result<Self> {
+    fn genesis(mut mirror: Mirror<A, B>, ring_log2: u8, now: i64, policy: crate::DeletePolicy) -> Result<Self> {
         let n = 1u64 << ring_log2;
         let total = mirror.block_count();
         if total <= n {
@@ -150,6 +152,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             hamt: Hamt::empty(),
             live: LiveSet::default(),
             root: None,
+            policy,
         })
     }
 
@@ -160,6 +163,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         residences: u64,
         residency: u64,
         now: i64,
+        policy: crate::DeletePolicy,
     ) -> Result<Self> {
         {
             let (a, b) = mirror.devices();
@@ -169,7 +173,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 (None, None) => None,
             };
             if let Some(root) = root {
-                return Self::resume_migrating(mirror, root);
+                return Self::resume_migrating(mirror, root, policy);
             }
         }
         if Ring::bootstrap_n(&mut mirror)?.is_some() {
@@ -248,11 +252,12 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             hamt: Hamt::empty(),
             live: LiveSet::default(),
             root: Some(root),
+            policy,
         })
     }
 
     /// Open with DANGLING-POINTER REPAIR — the recovery entry point for vaults bricked by the pre-fix tombstone bug (a fast-deleted key's pointer surviving into a reused slot). Walks the committed index tolerantly, prunes every pointer whose target is stale (zeroed) or dangling (reused/corrupt), COMMITS the pruned index, and reports exactly what was dropped. The values behind dangling pointers are unrecoverable by construction (their blocks were overwritten); everything else is preserved byte-for-byte. NEVER the default open: a strict open must keep refusing damage loudly — this is the explicitly-invoked salvage.
-    pub fn open_repairing(mut mirror: Mirror<A, B>, ring_log2: u8, now: i64) -> Result<(Self, RepairReport)> {
+    pub fn open_repairing(mut mirror: Mirror<A, B>, ring_log2: u8, now: i64, policy: crate::DeletePolicy) -> Result<(Self, RepairReport)> {
         let mut report = RepairReport::default();
         {
             let (a, b) = mirror.devices();
@@ -268,7 +273,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                     ring = Ring::open_at(mirror, root.ring_log2, root.was)?;
                 }
                 let tract_base = ROOT_SLOTS + root.residences * (1u64 << root.ring_log2);
-                let mut vault = Self::resume_common_with(ring, tract_base, Some(root), Some(&mut report))?;
+                let mut vault = Self::resume_common_with(ring, tract_base, Some(root), Some(&mut report), policy)?;
                 vault.commit(now)?;
                 return Ok((vault, report));
             }
@@ -279,33 +284,33 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         let ring = Ring::open(mirror, r)?;
         let n = 1u64 << r;
         let _ = ring_log2;
-        let mut vault = Self::resume_common_with(ring, n, None, Some(&mut report))?;
+        let mut vault = Self::resume_common_with(ring, n, None, Some(&mut report), policy)?;
         vault.commit(now)?;
         Ok((vault, report))
     }
 
     /// Resume a migrating vault: spine at the root's current residence, falling back to the previous residence when the current one is empty (crash between the root update and the first commit at the new base — the A/B pattern).
-    fn resume_migrating(mirror: Mirror<A, B>, root: RootEntry) -> Result<Self> {
+    fn resume_migrating(mirror: Mirror<A, B>, root: RootEntry, policy: crate::DeletePolicy) -> Result<Self> {
         let mut ring = Ring::open_at(mirror, root.ring_log2, root.at)?;
         if ring.head().is_none() && root.was != root.at {
             let mirror = ring.into_mirror();
             ring = Ring::open_at(mirror, root.ring_log2, root.was)?;
         }
         let tract_base = ROOT_SLOTS + root.residences * (1u64 << root.ring_log2);
-        Self::resume_common(ring, tract_base, Some(root))
+        Self::resume_common(ring, tract_base, Some(root), policy)
     }
 
-    fn resume(mirror: Mirror<A, B>, ring_log2: u8) -> Result<Self> {
+    fn resume(mirror: Mirror<A, B>, ring_log2: u8, policy: crate::DeletePolicy) -> Result<Self> {
         let ring = Ring::open(mirror, ring_log2)?;
         let n = 1u64 << ring_log2;
-        Self::resume_common(ring, n, None)
+        Self::resume_common(ring, n, None, policy)
     }
 
-    fn resume_common(ring: Ring<A, B>, tract_base: u64, root: Option<RootEntry>) -> Result<Self> {
-        Self::resume_common_with(ring, tract_base, root, None)
+    fn resume_common(ring: Ring<A, B>, tract_base: u64, root: Option<RootEntry>, policy: crate::DeletePolicy) -> Result<Self> {
+        Self::resume_common_with(ring, tract_base, root, None, policy)
     }
 
-    fn resume_common_with(mut ring: Ring<A, B>, tract_base: u64, root: Option<RootEntry>, repair: Option<&mut RepairReport>) -> Result<Self> {
+    fn resume_common_with(mut ring: Ring<A, B>, tract_base: u64, root: Option<RootEntry>, repair: Option<&mut RepairReport>, policy: crate::DeletePolicy) -> Result<Self> {
         let head = ring
             .head()
             .ok_or_else(|| Error::Corrupt("bootstrap found entries but head search found none".into()))?
@@ -357,6 +362,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             hamt,
             live,
             root,
+            policy,
         };
         // REPAIR COMMIT FIRST (field 2026-08-25, the boot that re-pruned the same 84 danglings forever): every rescue's opening move is rolling the index back to the COMMITTED head (the survivor law), so prunes still in RAM evaporate the moment the wedge probe below fires — and a broken vault is USUALLY wedge-shaped, which is why the repair open kept "succeeding" while the disk never changed. Commit the pruned index NOW so the pruned head is the one every later rollback restores. A refused commit (a broken vault is usually FULL-shaped too) gets one grow — and because grow is a barrier that reloads the committed (unpruned) head, the recorded routes are re-pruned before the retry. If even that fails, skip the probe: the prunes then survive in RAM until the session's first successful commit lands them.
         let mut probe_allowed = true;
@@ -412,7 +418,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     /// True iff `value` is already the COMMITTED value at `key` — the identical-overwrite skip's gate. Committed matters: matching a provisional copy and skipping would claim durability a crash could revoke. One index read against ~1s of flushes; same-value churn (fstate ping-pong, phonebook re-adoption) was pure plow pressure toward the fence cliff (field 2026-08-24/25).
     fn holds_committed(&mut self, key: &[u8; 32], value: &[u8]) -> Result<bool> {
         let leaf = {
-            let Self { ring, tract, hamt, .. } = self;
+            let Self { ring, tract, hamt, policy, .. } = self;
             hamt.find_leaf(ring.mirror(), tract, key)?
         };
         let Some((lba, hash)) = leaf else {
@@ -557,8 +563,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                     // The delete ladder: deletion mutates index nodes (arena appends), so it can be Fenced like a put — commit to slide the fence and retry. A commit Fenced past its own heartbeat ladder propagates, same as vault::delete today.
                     let existed = loop {
                         let attempt = {
-                            let Self { ring, tract, hamt, .. } = self;
-                            hamt.delete(ring.mirror(), tract, key)
+                            let Self { ring, tract, hamt, policy, .. } = self;
+                            hamt.delete(ring.mirror(), tract, key, *policy)
                         };
                         match attempt {
                             Ok(e) => break e,
@@ -584,8 +590,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                         }
                     }
                     None => {
-                        let Self { ring, tract, hamt, .. } = self;
-                        hamt.delete(ring.mirror(), tract, key)?;
+                        let Self { ring, tract, hamt, policy, .. } = self;
+                        hamt.delete(ring.mirror(), tract, key, *policy)?;
                     }
                 }
             }
@@ -598,8 +604,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     /// Delete, durable on return. Returns false if the key was absent.
     pub fn delete(&mut self, key: &[u8; 32], now: i64) -> Result<bool> {
         let existed = {
-            let Self { ring, tract, hamt, .. } = self;
-            hamt.delete(ring.mirror(), tract, key)?
+            let Self { ring, tract, hamt, policy, .. } = self;
+            hamt.delete(ring.mirror(), tract, key, *policy)?
         };
         if existed {
             self.commit(now)?;
@@ -630,7 +636,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         self.tract.plow = head.plow;
         let mut live_blocks = Vec::new();
         {
-            let Self { ring, tract, hamt, .. } = self;
+            let Self { ring, tract, hamt, policy, .. } = self;
             hamt.walk_live(ring.mirror(), tract, &mut live_blocks)?;
         }
         self.live = LiveSet::default();

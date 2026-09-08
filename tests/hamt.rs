@@ -1,7 +1,7 @@
 //! HAMT behavior: COW put/lookup/delete, lone + direct leaves, splits, flush + cold reopen, corruption, relocation repair.
 
 use manifestus::block::Block;
-use manifestus::{lone_capacity, Delta, FileDev, Hamt, Liveness, Mirror, NoLive, Tract, ZERO_BLOCK};
+use manifestus::{DeletePolicy, lone_capacity, Delta, FileDev, Hamt, Liveness, Mirror, NoLive, Tract, ZERO_BLOCK};
 use std::collections::HashMap;
 use tempfile::TempDir;
 
@@ -174,11 +174,11 @@ fn delete_zeroes_and_returns_none() {
     h.put(&mut m, &mut t, &NoLive, &key(6), b"small").unwrap();
     live.apply(h.take_delta());
 
-    assert!(h.delete(&mut m, &mut t, &key(5)).unwrap());
+    assert!(h.delete(&mut m, &mut t, &key(5), DeletePolicy::ZeroIsErase).unwrap());
     live.apply(h.take_delta());
     assert_eq!(h.lookup(&mut m, &t, &key(5)).unwrap(), None, "fast delete → None");
     assert_eq!(h.lookup(&mut m, &t, &key(6)).unwrap(), Some(b"small".to_vec()), "neighbor untouched");
-    assert!(!h.delete(&mut m, &mut t, &key(5)).unwrap(), "double delete is a no-op");
+    assert!(!h.delete(&mut m, &mut t, &key(5), DeletePolicy::ZeroIsErase).unwrap(), "double delete is a no-op");
 
     // Re-put after delete resurrects.
     h.put(&mut m, &mut t, &NoLive, &key(5), b"reborn").unwrap();

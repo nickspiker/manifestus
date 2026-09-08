@@ -1,12 +1,12 @@
 //! List live values by size (key hex + bytes), largest first — for hunting a growth disease.
-use manifestus::{FileDev, Mirror, Vault, HOST_RING_LOG2};
+use manifestus::{DeletePolicy, FileDev, Mirror, Vault, HOST_RING_LOG2};
 fn main() {
     let mut args = std::env::args().skip(1);
     let pa = args.next().expect("primary");
     let pb = args.next().expect("shadow");
     let a = FileDev::open(std::path::Path::new(&pa)).unwrap();
     let b = FileDev::open(std::path::Path::new(&pb)).unwrap();
-    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 9_000_000_000_000).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 9_000_000_000_000, DeletePolicy::UnlinkOnly).unwrap();
     let keys = v.live_keys().unwrap();
     let mut sized: Vec<([u8; 32], usize)> = keys
         .into_iter()

@@ -1,6 +1,6 @@
 //! Migrating rings (RING.md "Migrating Rings"): two-level bootstrap, fixed-residency hops, A/B crash fallback, replication across a migration.
 
-use manifestus::{
+use manifestus::{DeletePolicy, 
     append_root, read_root, verified_replicate, FileDev, Mirror, RootEntry, Vault, ROOT_SLOTS,
 };
 use tempfile::TempDir;
@@ -30,14 +30,14 @@ fn paths(dir: &TempDir, name: &str) -> (std::path::PathBuf, std::path::PathBuf) 
 fn genesis(pa: &std::path::Path, pb: &std::path::Path) -> Vault<FileDev, FileDev> {
     let a = FileDev::create(pa, BLOCKS).unwrap();
     let b = FileDev::create(pb, BLOCKS).unwrap();
-    Vault::open_migrating(Mirror::new(a, b), R_LOG2, RESIDENCES, RESIDENCY, 1_000).unwrap()
+    Vault::open_migrating(Mirror::new(a, b), R_LOG2, RESIDENCES, RESIDENCY, 1_000, DeletePolicy::UnlinkOnly).unwrap()
 }
 
 fn reopen(pa: &std::path::Path, pb: &std::path::Path) -> Vault<FileDev, FileDev> {
     let a = FileDev::open(pa).unwrap();
     let b = FileDev::open(pb).unwrap();
     // Plain open — the layout is self-describing; no migrating-specific entry point needed.
-    Vault::open(Mirror::new(a, b), R_LOG2, 2_000).unwrap()
+    Vault::open(Mirror::new(a, b), R_LOG2, 2_000, DeletePolicy::UnlinkOnly).unwrap()
 }
 
 #[test]
@@ -151,7 +151,7 @@ fn replication_converges_migrating_pair() {
     {
         let a = FileDev::open(&pa).unwrap();
         let mirror: Mirror<FileDev, FileDev> = Mirror::from_parts(Some(a), None).unwrap();
-        let mut v = Vault::open(mirror, R_LOG2, 2_000).unwrap();
+        let mut v = Vault::open(mirror, R_LOG2, 2_000, DeletePolicy::UnlinkOnly).unwrap();
         for i in 10..60u64 {
             v.put(&key(i), &val(i), 2_000 + i as i64).unwrap();
         }
@@ -163,7 +163,7 @@ fn replication_converges_migrating_pair() {
     let out2 = verified_replicate(&mut a, &mut b, R_LOG2).unwrap();
     assert_eq!((out2.spine_copied, out2.tract_copied), (0, 0));
 
-    let mut v = Vault::open(Mirror::new(a, b), R_LOG2, 3_000).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), R_LOG2, 3_000, DeletePolicy::UnlinkOnly).unwrap();
     for i in 0..60u64 {
         assert_eq!(v.get(&key(i)).unwrap(), Some(val(i)), "key {i} after replication");
     }
@@ -183,7 +183,7 @@ fn migrating_kill_child_worker() {
     };
     let a = FileDev::open(std::path::Path::new(&format!("{base}-a.vsf"))).unwrap();
     let b = FileDev::open(std::path::Path::new(&format!("{base}-b.vsf"))).unwrap();
-    let mut v = Vault::open(Mirror::new(a, b), R_LOG2, 5_000).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), R_LOG2, 5_000, DeletePolicy::UnlinkOnly).unwrap();
     let mut i = match v.get(&counter_key()).unwrap() {
         Some(bytes) => u64::from_le_bytes(bytes.try_into().unwrap()),
         None => 0,
@@ -216,7 +216,7 @@ fn migrating_survives_kill_nine_with_exact_committed_prefix() {
     {
         let a = FileDev::open(std::path::Path::new(&format!("{base}-a.vsf"))).unwrap();
         let b = FileDev::open(std::path::Path::new(&format!("{base}-b.vsf"))).unwrap();
-        Vault::open_migrating(Mirror::new(a, b), R_LOG2, RESIDENCES, 1, 4_000).unwrap();
+        Vault::open_migrating(Mirror::new(a, b), R_LOG2, RESIDENCES, 1, 4_000, DeletePolicy::UnlinkOnly).unwrap();
     }
 
     let mut last_count = 0u64;
@@ -238,7 +238,7 @@ fn migrating_survives_kill_nine_with_exact_committed_prefix() {
         // Reopen cold thru the two-level bootstrap. The committed counter C defines the exact visible prefix: keys 0..C intact; key C either fully present (payload committed, counter in flight) or fully absent; key C+1 impossible.
         let a = FileDev::open(std::path::Path::new(&format!("{base}-a.vsf"))).unwrap();
         let b = FileDev::open(std::path::Path::new(&format!("{base}-b.vsf"))).unwrap();
-        let mut v = Vault::open(Mirror::new(a, b), R_LOG2, 6_000).unwrap();
+        let mut v = Vault::open(Mirror::new(a, b), R_LOG2, 6_000, DeletePolicy::UnlinkOnly).unwrap();
         let c = match v.get(&counter_key()).unwrap() {
             Some(bytes) => u64::from_le_bytes(bytes.try_into().unwrap()),
             None => 0,

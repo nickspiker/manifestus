@@ -998,7 +998,7 @@ mod tests {
         {
             let a = FileDev::create(&pa, blocks).unwrap();
             let b = FileDev::create(&pb, blocks).unwrap();
-            let mut vault = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 0).unwrap();
+            let mut vault = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 0, crate::DeletePolicy::UnlinkOnly).unwrap();
             let k1 = blake3::hash(b"alpha");
             let k2 = blake3::hash(b"beta");
             vault.put(k1.as_bytes(), b"hello world", 1).unwrap();

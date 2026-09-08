@@ -6,7 +6,7 @@
 //!
 //! The test builds exactly that: put a victim (plus a legacy-Direct value so the migration path runs too), delete the victim, churn overwrites until the plow laps past the victim's old slot, then assert every committed pointer still resolves — in-session get AND a cold reopen.
 
-use manifestus::{Error, FileDev, Mirror, Vault, HOST_RING_LOG2};
+use manifestus::{DeletePolicy, Error, FileDev, Mirror, Vault, HOST_RING_LOG2};
 use tempfile::TempDir;
 
 const RING: u64 = 1 << HOST_RING_LOG2;
@@ -28,7 +28,7 @@ fn deleted_key_pointer_survives_slot_reuse() {
     {
         let a = FileDev::create(&pa, RING + TRACT).unwrap();
         let b = FileDev::create(&pb, RING + TRACT).unwrap();
-        let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 0).unwrap();
+        let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 0, DeletePolicy::UnlinkOnly).unwrap();
 
         // The victim leaf lands at a low tract lba; a legacy-format value exercises the mid-sweep Direct→extent migration alongside.
         v.put(&victim, &[0xAAu8; 700], 1).unwrap();
@@ -64,7 +64,7 @@ fn deleted_key_pointer_survives_slot_reuse() {
     // Cold reopen: every committed pointer must resolve + seal. This is where the real vault died (walk_live at resume).
     let a = FileDev::open(&pa).unwrap();
     let b = FileDev::open(&pb).unwrap();
-    let mut v = match Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 100_000) {
+    let mut v = match Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 100_000, DeletePolicy::UnlinkOnly) {
         Ok(v) => v,
         Err(e) => panic!("BUG: reopen after delete + lap failed ({e}) — the committed index holds a dangling tombstone pointer"),
     };
