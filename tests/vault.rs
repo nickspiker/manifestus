@@ -573,3 +573,76 @@ fn identical_overwrites_append_nothing() {
     assert!(v.tract_blocks_plowed() > plow_after_first, "a REAL overwrite must append");
     assert_eq!(v.get(&key(1)).unwrap(), Some(val(2)));
 }
+
+/// The field bug of 2026-09-08 (photon, a fresh phone vault filling from history recovery): a key written TWICE inside one group commit left the first leaf live in the map with no index route, and the plow's repoint guard refused to move it — forever, at that block. The live map must agree with the index after every commit, and the plow must run to completion over such a vault.
+#[test]
+fn same_key_twice_in_one_batch_leaves_no_unrouted_live_block() {
+    let dir = TempDir::new().unwrap();
+    let (pa, pb) = paths(&dir, "twice");
+    let mut v = open_vault(&pa, &pb, RING + 512);
+    // A burst shaped like a history restore: many keys, each rewritten within the SAME batch (the row table re-persisted as pages land).
+    for round in 0..6u64 {
+        let keys: Vec<[u8; 32]> = (0..8).map(|i| key(1_000 + round * 8 + i)).collect();
+        let first: Vec<Vec<u8>> = keys.iter().enumerate().map(|(i, _)| val(round * 8 + i as u64)).collect();
+        let second: Vec<Vec<u8>> = keys.iter().enumerate().map(|(i, _)| val(round * 8 + i as u64 + 100)).collect();
+        let mut items: Vec<(&[u8; 32], &[u8])> = Vec::new();
+        for (k, a) in keys.iter().zip(&first) {
+            items.push((k, a.as_slice()));
+        }
+        for (k, b) in keys.iter().zip(&second) {
+            items.push((k, b.as_slice()));
+        }
+        v.put_batch(&items, 2_000 + round as i64).unwrap();
+        let (unrouted, missing) = v.live_map_divergence().unwrap();
+        assert!(unrouted.is_empty(), "round {round}: live map holds blocks the index cannot reach: {unrouted:?}");
+        assert!(missing.is_empty(), "round {round}: index reaches blocks the live map lacks: {missing:?}");
+        for (k, b) in keys.iter().zip(&second) {
+            assert_eq!(v.get(k).unwrap().as_deref(), Some(b.as_slice()), "the second write wins");
+        }
+    }
+    // The plow is a perpetual ring compactor (survivors re-append ahead of the cursor), so drive it across the region occupied NOW and require every window to pass the repoint guard and keep the map honest. On the old order this is where the field failed: "relocation repointed nothing … refusing to orphan a live block".
+    let target = v.tract_blocks_reaped() + 4 * 8 * 6;
+    let mut windows = 0i64;
+    while v.tract_blocks_reaped() < target && windows < 512 {
+        v.reap_one_window(9_000 + windows).unwrap();
+        windows += 1;
+        let (unrouted, missing) = v.live_map_divergence().unwrap();
+        assert!(unrouted.is_empty() && missing.is_empty(), "window {windows}: unrouted {unrouted:?} missing {missing:?}");
+    }
+    assert!(windows > 0, "the plow must have run at least once");
+    // And a reopen — which rebuilds the map from the index — agrees with the map we carried.
+    let carried = v.live_blocks();
+    drop(v);
+    let a = FileDev::open(&pa).unwrap();
+    let b = FileDev::open(&pb).unwrap();
+    let reopened = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 20_000, DeletePolicy::UnlinkOnly).unwrap();
+    assert_eq!(reopened.live_blocks(), carried, "the carried live map must match what a fresh walk finds");
+}
+
+/// The same ordering hazard through apply_batch: a put and a delete of one key in ONE batch. Under UnlinkOnly the deleted leaf's bytes stay intact, so a stale live entry would read as a movable live block.
+#[test]
+fn put_then_delete_in_one_batch_leaves_no_unrouted_live_block() {
+    let dir = TempDir::new().unwrap();
+    let (pa, pb) = paths(&dir, "putdel");
+    let mut v = open_vault(&pa, &pb, RING + 256);
+    let k1 = key(77);
+    let k2 = key(78);
+    let v1 = val(77);
+    let v2 = val(78);
+    let items: Vec<(&[u8; 32], Option<&[u8]>)> = vec![(&k1, Some(v1.as_slice())), (&k2, Some(v2.as_slice())), (&k1, None)];
+    v.apply_batch(&items, 3_000).unwrap();
+    assert_eq!(v.get(&k1).unwrap(), None);
+    assert_eq!(v.get(&k2).unwrap(), Some(v2.clone()));
+    let (unrouted, missing) = v.live_map_divergence().unwrap();
+    assert!(unrouted.is_empty(), "live map holds blocks the index cannot reach: {unrouted:?}");
+    assert!(missing.is_empty(), "index reaches blocks the live map lacks: {missing:?}");
+    let target = v.tract_blocks_reaped() + 16;
+    let mut n = 0i64;
+    while v.tract_blocks_reaped() < target && n < 64 {
+        v.reap_one_window(9_000 + n).unwrap();
+        n += 1;
+        let (unrouted, missing) = v.live_map_divergence().unwrap();
+        assert!(unrouted.is_empty() && missing.is_empty(), "window {n}: unrouted {unrouted:?} missing {missing:?}");
+    }
+}
+

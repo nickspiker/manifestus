@@ -27,14 +27,15 @@ pub struct LiveSet {
 }
 
 impl LiveSet {
+    /// ADDED FIRST, THEN REMOVED — the order is load-bearing (field 2026-09-08, photon: "relocation repointed nothing for block at 2078" ×3 on a fresh phone vault mid history-restore). A block can be added AND retired inside ONE delta: a key written twice in the same batch appends leaf L1, then the rewrite retires L1 and appends L2. Applying `removed` first found L1 absent (a no-op) and `added` then inserted it anyway, leaving L1 live in this map with no index route — bytes intact, "live", unrouted — which the plow moved and the repoint guard refused, forever, wedging every later window at that block. Added-then-removed is exactly right because the tract is append-only within a delta: an lba is added at most once per commit and any removal of it must come after its add, so a block that is both ends removed.
     pub fn apply(&mut self, delta: Delta) {
+        for (lba, hp) in delta.added {
+            self.map.insert(lba, hp);
+        }
         for (lba, hp) in delta.removed {
             if self.map.get(&lba) == Some(&hp) {
                 self.map.remove(&lba);
             }
-        }
-        for (lba, hp) in delta.added {
-            self.map.insert(lba, hp);
         }
     }
 
@@ -909,6 +910,22 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
 
     pub fn live_blocks(&self) -> usize {
         self.live.len()
+    }
+
+    /// TEST AID — the live map against the index, block for block: (in the map but unreachable from the root, reachable but not in the map). Both empty = the two agree, which is the invariant every commit must keep and the plow's classification depends on. Walks the whole index; test scale only.
+    #[doc(hidden)]
+    pub fn live_map_divergence(&mut self) -> Result<(Vec<u64>, Vec<u64>)> {
+        let mut walked: Vec<(u64, [u8; 32])> = Vec::new();
+        {
+            let Self { ring, tract, hamt, .. } = self;
+            hamt.walk_live(ring.mirror(), tract, &mut walked)?;
+        }
+        let index: std::collections::HashMap<u64, [u8; 32]> = walked.into_iter().collect();
+        let mut unrouted: Vec<u64> = self.live.map.iter().filter(|(lba, hp)| index.get(*lba) != Some(*hp)).map(|(lba, _)| *lba).collect();
+        let mut missing: Vec<u64> = index.iter().filter(|(lba, hp)| self.live.map.get(*lba) != Some(*hp)).map(|(lba, _)| *lba).collect();
+        unrouted.sort_unstable();
+        missing.sort_unstable();
+        Ok((unrouted, missing))
     }
 
     pub fn tract_blocks(&self) -> u64 {
