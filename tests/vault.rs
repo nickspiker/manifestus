@@ -281,6 +281,50 @@ fn replication_grows_smaller_loser() {
 }
 
 #[test]
+fn converged_mirrors_replicate_nothing_and_a_same_gen_split_brain_still_reconciles() {
+    let dir = TempDir::new().unwrap();
+    let (pa, pb) = paths(&dir, "conv");
+    {
+        let mut v = open_vault(&pa, &pb, RING + 256);
+        for i in 0..8 {
+            v.put(&key(i), &val(i), 1_000 + i as i64).unwrap();
+        }
+    }
+    // In sync: the fast path answers without touching the live set.
+    let mut a = FileDev::open(&pa).unwrap();
+    let mut b = FileDev::open(&pb).unwrap();
+    let out = verified_replicate(&mut a, &mut b, HOST_RING_LOG2).unwrap();
+    assert_eq!((out.spine_copied, out.tract_copied), (0, 0));
+    drop((a, b));
+    // Split brain: each side commits ONE generation alone, different content — same gen, different roots. The head-block compare must send this down the full walk, and the walk must converge on one side.
+    {
+        let a = FileDev::open(&pa).unwrap();
+        let mirror: Mirror<FileDev, FileDev> = Mirror::from_parts(Some(a), None).unwrap();
+        let mut v = Vault::open(mirror, HOST_RING_LOG2, 2_000, DeletePolicy::UnlinkOnly).unwrap();
+        v.put(&key(100), &val(100), 2_001).unwrap();
+    }
+    {
+        let b = FileDev::open(&pb).unwrap();
+        let mirror: Mirror<FileDev, FileDev> = Mirror::from_parts(Some(b), None).unwrap();
+        let mut v = Vault::open(mirror, HOST_RING_LOG2, 2_000, DeletePolicy::UnlinkOnly).unwrap();
+        v.put(&key(200), &val(200), 2_001).unwrap();
+    }
+    let mut a = FileDev::open(&pa).unwrap();
+    let mut b = FileDev::open(&pb).unwrap();
+    let out = verified_replicate(&mut a, &mut b, HOST_RING_LOG2).unwrap();
+    assert!(out.spine_copied > 0, "a split brain reconciles thru the full walk");
+    let out2 = verified_replicate(&mut a, &mut b, HOST_RING_LOG2).unwrap();
+    assert_eq!((out2.spine_copied, out2.tract_copied), (0, 0));
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 3_000, DeletePolicy::UnlinkOnly).unwrap();
+    for i in 0..8 {
+        assert_eq!(v.get(&key(i)).unwrap(), Some(val(i)));
+    }
+    // Exactly one of the two lone commits survived — the winner's.
+    let survivors = [100, 200].iter().filter(|k| v.get(&key(**k)).unwrap().is_some()).count();
+    assert_eq!(survivors, 1);
+}
+
+#[test]
 fn huge_value_survives_reap_laps() {
     // THE regression test for the v0 furrow-rot bug: a write-once multi-megabyte value must stay readable while churn drives the reap through multiple full migrations of its blocks. Under the old engine this value (a) exceeded the per-value cap and (b) would have rotted when relocation left its leaf pointing at trampled slots.
     let dir = TempDir::new().unwrap();

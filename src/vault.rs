@@ -1012,8 +1012,18 @@ pub fn verified_replicate<A: BlockDev, B: BlockDev>(
     b: &mut B,
     ring_log2: u8,
 ) -> Result<Replicated> {
-    let (_, gen_a, _) = resolve_layout(a, ring_log2)?;
-    let (_, gen_b, _) = resolve_layout(b, ring_log2)?;
+    let (la, gen_a, slot_a) = resolve_layout(a, ring_log2)?;
+    let (lb, gen_b, slot_b) = resolve_layout(b, ring_log2)?;
+
+    // CONVERGED FAST PATH (2026-09-10, photon on Android: the live walk below read every live block of BOTH mirrors at every open — 72 MB a side, five seconds on the screen thread, Android's ANR threshold to the second). Same generation in the same slot of the same residence, byte-identical head block (it carries the Merkle root, so a same-gen split brain reads as different) and equal extents ⇒ the committed state is the same on both sides, and every live block reached both devices before that head was committed (a secondary that failed a data write is dropped for the session and never receives the commit, so its generation lags and the walk runs). Nothing to reconcile.
+    if gen_a.is_some() && gen_a == gen_b && slot_a == slot_b && la.spine_base == lb.spine_base && a.block_count() == b.block_count() {
+        let (mut ha, mut hb) = (ZERO_BLOCK, ZERO_BLOCK);
+        a.read(la.spine_base + slot_a, &mut ha)?;
+        b.read(lb.spine_base + slot_b, &mut hb)?;
+        if ha == hb {
+            return Ok(Replicated::default());
+        }
+    }
 
     if gen_a >= gen_b {
         replicate_into(a, b, ring_log2)
