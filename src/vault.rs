@@ -24,36 +24,54 @@ use hashbrown::HashMap;
 #[derive(Default)]
 pub struct LiveSet {
     map: HashMap<u64, [u8; 32]>,
+    /// Blocks the committed TREE references without a recorded hash: the furrows and extent runs of a Direct/Extent leaf, marked at a TREE-ONLY open (Nick 2026-09-12: "there's zero reason we verify the whole vault — treed open was the initial design"). `is_referenced` is true for them, `is_live` (exact hash) is answered from the block's own seal by the callers that hold the block — the plow reads every block in its window anyway.
+    referenced: std::collections::HashSet<u64>,
 }
 
 impl LiveSet {
     /// ADDED FIRST, THEN REMOVED — the order is load-bearing (field 2026-09-08, photon: "relocation repointed nothing for block at 2078" ×3 on a fresh phone vault mid history-restore). A block can be added AND retired inside ONE delta: a key written twice in the same batch appends leaf L1, then the rewrite retires L1 and appends L2. Applying `removed` first found L1 absent (a no-op) and `added` then inserted it anyway, leaving L1 live in this map with no index route — bytes intact, "live", unrouted — which the plow moved and the repoint guard refused, forever, wedging every later window at that block. Added-then-removed is exactly right because the tract is append-only within a delta: an lba is added at most once per commit and any removal of it must come after its add, so a block that is both ends removed.
     pub fn apply(&mut self, delta: Delta) {
         for (lba, hp) in delta.added {
+            self.referenced.remove(&lba);
             self.map.insert(lba, hp);
         }
         for (lba, hp) in delta.removed {
             if self.map.get(&lba) == Some(&hp) {
                 self.map.remove(&lba);
             }
+            // A tree-only entry has no hash to match: the leaf that referenced it is being removed, so the block goes with it.
+            self.referenced.remove(&lba);
+        }
+    }
+
+    /// Mark a block live by position alone — the tree-only open's form for furrows and extent runs.
+    pub fn mark_referenced(&mut self, lba: u64) {
+        if !self.map.contains_key(&lba) {
+            self.referenced.insert(lba);
         }
     }
 
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.map.len() + self.referenced.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.map.is_empty() && self.referenced.is_empty()
+    }
+
+    /// Every live position, hashed or tree-only.
+    pub fn positions(&self) -> impl Iterator<Item = u64> + '_ {
+        self.map.keys().copied().chain(self.referenced.iter().copied())
     }
 }
 
 impl Liveness for LiveSet {
     fn is_live(&self, lba: u64, hp: &[u8; 32]) -> bool {
-        self.map.get(&lba) == Some(hp)
+        // A tree-only entry answers by position: the caller holds the block and read `hp` off its seal, which is the hash the leaf would have recorded.
+        self.map.get(&lba) == Some(hp) || self.referenced.contains(&lba)
     }
     fn is_referenced(&self, lba: u64) -> bool {
-        self.map.contains_key(&lba)
+        self.map.contains_key(&lba) || self.referenced.contains(&lba)
     }
 }
 
@@ -334,8 +352,10 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         let mut live_blocks = Vec::new();
         let mut stale = Vec::new();
         let mut dangling = Vec::new();
+        // TREE-ONLY OPEN (2026-09-12): the ordinary open reads the INDEX — nodes and leaves — and marks each leaf's furrows and extent runs live by position without reading them. It used to read every data block of every value to take its seal hash (a full read of the vault: 6 s on a phone with a season of kept waves, growing with each one). A repair open still walks everything: that one exists to find what is broken.
+        let mut referenced: Vec<u64> = Vec::new();
         match repair {
-            None => hamt.walk_live_collect(ring.mirror(), &tract, &mut live_blocks, &mut stale)?,
+            None => hamt.walk_tree_collect(ring.mirror(), &tract, &mut live_blocks, &mut referenced, &mut stale)?,
             Some(_) => hamt.walk_live_repair(ring.mirror(), &tract, &mut live_blocks, &mut stale, &mut dangling)?,
         }
         // Pre-fix vaults (and a crash between a delete's zero and its retiring commit) leave stale pointers at zeroed slots. They are time bombs: the reap retires the slot, the plow reuses it, and the pointer flips from "reads as deleted" to Seal-on-open. Unlink them now, in RAM — the next commit persists the pruned index; a session that never commits changes nothing.
@@ -349,6 +369,9 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         let mut live = LiveSet::default();
         for (lba, hp) in live_blocks {
             live.map.insert(lba, hp);
+        }
+        for lba in referenced {
+            live.mark_referenced(lba);
         }
         // The reap is DERIVED, not trusted: the maximal monotone value whose clean region [plow, reap + len) is verifiably live-free right now. Works identically for legacy (pre-reap) vaults, whose mixed layout simply derives near-zero clean space — ordinary cleaning then migrates them, no format break.
         tract.reap = derive_reap(tract.plow, tract.len, &live);
@@ -921,8 +944,9 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             hamt.walk_live(ring.mirror(), tract, &mut walked)?;
         }
         let index: std::collections::HashMap<u64, [u8; 32]> = walked.into_iter().collect();
-        let mut unrouted: Vec<u64> = self.live.map.iter().filter(|(lba, hp)| index.get(*lba) != Some(*hp)).map(|(lba, _)| *lba).collect();
-        let mut missing: Vec<u64> = index.iter().filter(|(lba, hp)| self.live.map.get(*lba) != Some(*hp)).map(|(lba, _)| *lba).collect();
+        // A tree-only entry has no recorded hash: it agrees with the index when the index holds that position at all.
+        let mut unrouted: Vec<u64> = self.live.map.iter().filter(|(lba, hp)| index.get(*lba) != Some(*hp)).map(|(lba, _)| *lba).chain(self.live.referenced.iter().filter(|lba| !index.contains_key(*lba)).copied()).collect();
+        let mut missing: Vec<u64> = index.iter().filter(|(lba, hp)| self.live.map.get(*lba) != Some(*hp) && !self.live.referenced.contains(*lba)).map(|(lba, _)| *lba).collect();
         unrouted.sort_unstable();
         missing.sort_unstable();
         Ok((unrouted, missing))
@@ -961,7 +985,7 @@ fn fence_from(budgets_newest_first: &[u64]) -> Option<u64> {
 fn derive_reap(plow: u64, len: u64, live: &LiveSet) -> u64 {
     let pos = plow % len;
     let mut clean = len;
-    for &lba in live.map.keys() {
+    for lba in live.positions() {
         let d = (lba + len - pos) % len;
         clean = clean.min(d);
     }

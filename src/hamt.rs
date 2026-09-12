@@ -676,6 +676,56 @@ impl Hamt {
         Ok(())
     }
 
+    /// TREE-ONLY walk (2026-09-12): the index's nodes and leaves are read and verified as before (they are the tree); a leaf's furrows and extent runs are reported by POSITION only, unread. Open cost becomes the size of the index, not of the data.
+    pub fn walk_tree_collect<A: BlockDev, B: BlockDev>(
+        &mut self,
+        mirror: &mut Mirror<A, B>,
+        tract: &Tract,
+        out: &mut Vec<(u64, [u8; 32])>,
+        referenced: &mut Vec<u64>,
+        stale: &mut Vec<StalePointer>,
+    ) -> Result<()> {
+        let root = self.root.clone();
+        if let Some(Child::Committed { hash, lba }) = root {
+            self.walk_child_tree(mirror, tract, lba, &hash, [0u8; 32], 0, out, referenced, stale)?;
+        }
+        Ok(())
+    }
+
+    fn walk_child_tree<A: BlockDev, B: BlockDev>(
+        &mut self,
+        mirror: &mut Mirror<A, B>,
+        tract: &Tract,
+        lba: u64,
+        hash: &[u8; 32],
+        route: [u8; 32],
+        depth: u8,
+        out: &mut Vec<(u64, [u8; 32])>,
+        referenced: &mut Vec<u64>,
+        stale: &mut Vec<StalePointer>,
+    ) -> Result<()> {
+        let Some(doc) = read_doc(mirror, tract, lba, hash)? else {
+            stale.push(StalePointer { route, hash: *hash, lba });
+            return Ok(());
+        };
+        out.push((lba, *hash));
+        match doc {
+            TractDoc::Node(node) => {
+                for (slot, c) in node.children.iter().enumerate() {
+                    if let Some(Child::Committed { hash, lba }) = c {
+                        let (h, l) = (*hash, *lba);
+                        let child_route = route_with_chunk(route, depth, slot as u8);
+                        self.walk_child_tree(mirror, tract, l, &h, child_route, depth + 1, out, referenced, stale)?;
+                    }
+                }
+            }
+            TractDoc::Direct { furrows, .. } => referenced.extend(furrows),
+            TractDoc::Extent { size, runs, .. } => referenced.extend(expand_runs(&runs, size)?),
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// REPAIR walk — `walk_live_collect` that survives dangling pointers instead of erroring. A pointer whose target fails the seal, fails decode, or names furrows that no longer verify is recorded in `dangling` (and contributes nothing to `out`); everything sound is collected exactly as `walk_live` would. Used by `Vault::open_repairing`.
     pub fn walk_live_repair<A: BlockDev, B: BlockDev>(
         &mut self,

@@ -690,3 +690,61 @@ fn put_then_delete_in_one_batch_leaves_no_unrouted_live_block() {
     }
 }
 
+
+/// A block device that counts reads, wrapped around a FileDev — the tree-only open's KAT needs to know what was NOT read.
+struct Counted {
+    inner: FileDev,
+    reads: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl BlockDev for Counted {
+    fn block_count(&self) -> u64 {
+        self.inner.block_count()
+    }
+    fn read(&mut self, lba: u64, buf: &mut manifestus::Block) -> manifestus::Result<()> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.read(lba, buf)
+    }
+    fn write(&mut self, lba: u64, buf: &manifestus::Block) -> manifestus::Result<()> {
+        self.inner.write(lba, buf)
+    }
+    fn discard(&mut self, lba: u64, count: u64) -> manifestus::Result<()> {
+        self.inner.discard(lba, count)
+    }
+    fn flush(&mut self) -> manifestus::Result<()> {
+        self.inner.flush()
+    }
+    fn grow(&mut self, new_blocks: u64) -> manifestus::Result<()> {
+        self.inner.grow(new_blocks)
+    }
+}
+
+/// TREE-ONLY OPEN (2026-09-12): an ordinary open reads the index, never the data. A vault holding a few large values reopens with a read count that is a small constant plus the index, not the furrow count; the reopened vault still serves every value, still counts every data block live, and a value's delete still frees its furrows.
+#[test]
+fn open_reads_the_tree_not_the_data() {
+    let dir = TempDir::new().unwrap();
+    let (pa, pb) = paths(&dir, "treed");
+    let big: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
+    let live_after_puts = {
+        let mut v = open_vault(&pa, &pb, RING + 4096);
+        for i in 0..4u64 {
+            v.put(&key(i), &big, 1_001 + i as i64).unwrap();
+        }
+        v.live_blocks()
+    };
+    assert!(live_after_puts > 900, "four ~1 MB values should occupy hundreds of blocks, got {live_after_puts}");
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let a = Counted { inner: FileDev::open(&pa).unwrap(), reads: reads.clone() };
+    let b = Counted { inner: FileDev::open(&pb).unwrap(), reads: reads.clone() };
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 2_000, DeletePolicy::UnlinkOnly).unwrap();
+    let open_reads = reads.load(std::sync::atomic::Ordering::Relaxed);
+    println!("tree-only open: {open_reads} reads for {live_after_puts} live blocks");
+    assert!(open_reads < 200, "a tree-only open must not read the data blocks: {open_reads} reads for {live_after_puts} live blocks");
+    assert_eq!(v.live_blocks(), live_after_puts, "every furrow is still counted live from the tree alone");
+    for i in 0..4u64 {
+        assert_eq!(v.get(&key(i)).unwrap().as_deref(), Some(big.as_slice()), "value {i} reads back whole");
+    }
+    assert!(v.delete(&key(0), 3_000).unwrap());
+    assert!(v.live_blocks() < live_after_puts - 200, "the deleted value's furrows left the live set: {} of {live_after_puts}", v.live_blocks());
+    assert_eq!(v.get(&key(1)).unwrap().as_deref(), Some(big.as_slice()));
+}
