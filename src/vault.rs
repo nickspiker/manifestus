@@ -557,15 +557,44 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             self.put_no_commit(key, value, now)?;
         }
         // Same replay law as put(): commit's TractFull means grow-the-barrier and re-run the whole batch — we still hold every item, and the barrier reset makes the replay start pristine.
-        if let Err(Error::TractFull) = self.commit(now) {
-            self.grow(self.tract.len * 2, now)?;
-            for (key, value) in items {
-                self.put_no_commit(key, value, now)?;
+        // FENCED at the batch commit (field 2026-09-14, Esme's phone: "async message persist failed: rollback fence reached at plow 232230" — STORAGE DEGRADED for five seconds until the next persist happened to reap): the per-item ladder in put_no_commit rescues a fenced PUT, but the batch's final commit had only the TractFull arm, so a commit fenced past its heartbeat ladder surfaced raw. Same exit as put()'s Fenced arm: reload the committed head (the provisional arena is discarded, we still hold every item), rescue, replay, commit.
+        match self.commit(now) {
+            Ok(()) => {}
+            Err(Error::TractFull) => {
+                self.grow(self.tract.len * 2, now)?;
+                for (key, value) in items {
+                    self.put_no_commit(key, value, now)?;
+                }
+                self.commit(now)?;
             }
-            self.commit(now)?;
+            Err(Error::Fenced(_)) => {
+                self.rescue_from_committed_head(now)?;
+                for (key, value) in items {
+                    self.put_no_commit(key, value, now)?;
+                }
+                self.commit(now)?;
+            }
+            Err(e) => return Err(e),
         }
         self.maybe_reap(now)?;
         Ok(())
+    }
+
+    /// The fence deadlock's exit for a BATCH: reload the committed head (discarding the provisional arena — the caller still holds every item and replays), then the same rescue ladder as put()'s Fenced arm, growing once if the rescue itself finds the tract genuinely full.
+    fn rescue_from_committed_head(&mut self, now: i64) -> Result<()> {
+        let (h, l) = {
+            let head = self
+                .ring
+                .head()
+                .ok_or_else(|| Error::Corrupt("rescue on pre-genesis vault".into()))?;
+            (head.hamt_hash, head.hamt_lba)
+        };
+        self.hamt = Hamt::from_root(h, l);
+        match self.rescue(now) {
+            Ok(_) => Ok(()),
+            Err(Error::TractFull) => self.grow(self.tract.len * 2, now),
+            Err(e) => Err(e),
+        }
     }
 
     /// GROUP COMMIT with deletes: apply MANY put-or-delete ops IN ORDER, durable on return, under ONE spine commit (put_batch's law extended to mixed ops — a rarangi transaction's apply phase is [row puts + catalog put + superroot put + WAL retire-delete], and each riding its own commit was the 4-5x amplification behind the field's 40s message sends, 2026-09-02). `Some(value)` = put (identical-overwrite skipped), `None` = delete (absent key skipped). Order is preserved, which is load-bearing for callers whose LAST op is their visibility/cleanup edge (rarangi puts the WAL retire last): a mid-ladder Fenced heartbeat commit can land a PREFIX of the batch early — durability sooner, never out of order — so an op only ever lands after everything before it. NOT atomic under that heartbeat window: a caller needing all-or-nothing must anchor on its own journal (rarangi's WAL put precedes this and replays the full set on crash).
@@ -603,9 +632,20 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         if !dirty {
             return Ok(());
         }
-        // Same replay law as put_batch: commit's TractFull means grow-the-barrier (reloads the committed head, arena pristine) and re-run the whole batch — holds_committed skips whatever a mid-ladder heartbeat already landed, deletes re-run idempotently.
-        if let Err(Error::TractFull) = self.commit(now) {
-            self.grow(self.tract.len * 2, now)?;
+        // Same replay law as put_batch: commit's TractFull means grow-the-barrier (reloads the committed head, arena pristine) and re-run the whole batch — holds_committed skips whatever a mid-ladder commit already landed; a FENCED commit takes the rescue exit and replays the same way.
+        let replay = match self.commit(now) {
+            Ok(()) => false,
+            Err(Error::TractFull) => {
+                self.grow(self.tract.len * 2, now)?;
+                true
+            }
+            Err(Error::Fenced(_)) => {
+                self.rescue_from_committed_head(now)?;
+                true
+            }
+            Err(e) => return Err(e),
+        };
+        if replay {
             for &(key, value) in items {
                 match value {
                     Some(v) => {
