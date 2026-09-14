@@ -55,6 +55,11 @@ impl LiveSet {
         self.map.len() + self.referenced.len()
     }
 
+    /// Blocks the live entries occupy (each map value is a block position; referenced runs count one block each — the tree-only open's coarse view). Display-grade, not accounting-grade.
+    pub fn live_blocks(&self) -> u64 {
+        (self.map.len() + self.referenced.len()) as u64
+    }
+
     pub fn is_empty(&self) -> bool {
         self.map.is_empty() && self.referenced.is_empty()
     }
@@ -85,6 +90,25 @@ pub struct RepairReport {
 /// Proactive reap trigger: dead > 25% of the tract → one window after the commit.
 /// Window size scales with the tract (len/64, floor 16) so huge values fragment into at most ~64 runs crossing a full lap — far under the extent leaf's capacity.
 const REAP_WINDOW_MIN: u64 = 1 << 4;
+
+/// The engine's physique for a stats page: block-denominated, display-grade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VaultStats {
+    /// Spine generation at the committed head — how many commits this vault has lived.
+    pub generation: u64,
+    /// Tract capacity in blocks.
+    pub tract_blocks: u64,
+    /// Absolute append position (monotonic, wraps modulo the tract for the physical block).
+    pub plow: u64,
+    /// Absolute reap position — plow − reap = occupied blocks.
+    pub reap: u64,
+    /// Live logical entries (keys the HAMT answers for).
+    pub live_entries: u64,
+    /// Blocks those entries pin (coarse for tree-only referenced runs).
+    pub live_blocks: u64,
+    /// Bytes per block.
+    pub block_bytes: u64,
+}
 
 pub struct Vault<A: BlockDev, B: BlockDev> {
     ring: Ring<A, B>,
@@ -832,6 +856,20 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
 
     fn reap_window(&self) -> u64 {
         (self.tract.len >> 6).max(REAP_WINDOW_MIN)
+    }
+
+    /// A display-grade snapshot of the engine's physique — the Settings vault page reads this thru kete's librarian (one message, no I/O beyond what RAM already holds).
+    pub fn engine_stats(&self) -> VaultStats {
+        let head = self.ring.head();
+        VaultStats {
+            generation: head.map_or(0, |h| h.gen),
+            tract_blocks: self.tract.len,
+            plow: self.tract.plow,
+            reap: self.tract.reap,
+            live_entries: self.live.len() as u64,
+            live_blocks: self.live.live_blocks(),
+            block_bytes: crate::BLOCK as u64,
+        }
     }
 
     /// EMERGENCY UN-WEDGE — the fence deadlock's exit (field 2026-08-21/23/24: plows 422745, 307312, 1110637 across three vaults). The terminal state: a committed head whose budget cannot stage even one reap window — cleaning needs budget, budget needs cleaning, and the head faithfully restores the wedge at every reopen. Two waivers break the cycle, both safe by the tract's clean-invariant (reap targets only verifiably live-free space, originals stay sealed until their retiring commit):
