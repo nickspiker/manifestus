@@ -25,7 +25,7 @@ use hashbrown::HashMap;
 pub struct LiveSet {
     map: HashMap<u64, [u8; 32]>,
     /// Blocks the committed TREE references without a recorded hash: the furrows and extent runs of a Direct/Extent leaf, marked at a TREE-ONLY open (Nick 2026-09-12: "there's zero reason we verify the whole vault — treed open was the initial design"). `is_referenced` is true for them, `is_live` (exact hash) is answered from the block's own seal by the callers that hold the block — the plow reads every block in its window anyway.
-    referenced: std::collections::HashSet<u64>,
+    referenced: hashbrown::HashSet<u64>,
 }
 
 impl LiveSet {
@@ -1021,7 +1021,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             let Self { ring, tract, hamt, .. } = self;
             hamt.walk_live(ring.mirror(), tract, &mut walked)?;
         }
-        let index: std::collections::HashMap<u64, [u8; 32]> = walked.into_iter().collect();
+        let index: HashMap<u64, [u8; 32]> = walked.into_iter().collect();
         // A tree-only entry has no recorded hash: it agrees with the index when the index holds that position at all.
         let mut unrouted: Vec<u64> = self.live.map.iter().filter(|(lba, hp)| index.get(*lba) != Some(*hp)).map(|(lba, _)| *lba).chain(self.live.referenced.iter().filter(|lba| !index.contains_key(*lba)).copied()).collect();
         let mut missing: Vec<u64> = index.iter().filter(|(lba, hp)| self.live.map.get(*lba) != Some(*hp) && !self.live.referenced.contains(*lba)).map(|(lba, _)| *lba).collect();
