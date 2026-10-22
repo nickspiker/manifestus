@@ -1470,6 +1470,11 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         self.cache_budget = blocks;
     }
 
+    /// Live blocks an embedder's growth should plan for: durable data plus the cache up to its allowance (see [`Self::set_cache_budget`]). Pre-sizing against raw live blocks would grow for cache the reap can always evict.
+    pub fn growth_live(&self) -> u64 {
+        self.planned_live()
+    }
+
     /// Tract blocks the committed cache values occupy.
     pub fn cache_blocks(&self) -> u64 {
         self.cache_live
