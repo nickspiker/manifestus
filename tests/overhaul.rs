@@ -142,6 +142,7 @@ fn follower_survives_kill_nine() {
     drop(open_pair(&pa, &pb));
 
     let mut last_gen = 0u64;
+    let mut lagged = 0;
     for round in 0..6 {
         let mut child = std::process::Command::new(&exe)
             .args(["follower_kill_child_worker", "--exact", "--nocapture", "--test-threads=1"])
@@ -167,6 +168,11 @@ fn follower_survives_kill_nine() {
         };
 
         let healed = verified_replicate(&mut FileDev::open(&pa).unwrap(), &mut FileDev::open(&pb).unwrap(), HOST_RING_LOG2).unwrap();
+        let ga = head_entry(&pa).gen;
+        if ga > gb {
+            assert!(healed.tail_only, "round {round}: a second device that only lagged ({gb} behind {ga}) heals by its tail: {healed:?}");
+            lagged += 1;
+        }
         let mut v = open_pair(&pa, &pb);
         let g = v.generation().unwrap();
         assert!(g >= gb, "round {round}: the primary is never behind the second device ({g} < {gb})");
@@ -182,6 +188,7 @@ fn follower_survives_kill_nine() {
         assert_eq!(vb.generation(), Some(g), "round {round}: replicate brought the second device level ({healed:?})");
     }
     assert!(last_gen > 0, "commits happened");
+    println!("{lagged} of 6 kills left the second device behind");
 }
 
 /// Opening from the live map must know exactly what a walk of the index would: same positions, nothing more, nothing less — for an inline map (small tract) and a paged one (past `INLINE_MAX_BITS`), through churn long enough that the reap laps the tract and crosses the map's own pages.

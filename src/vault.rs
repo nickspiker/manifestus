@@ -1647,6 +1647,8 @@ fn derive_reap(plow: u64, len: u64, live: &LiveSet) -> u64 {
 pub struct Replicated {
     pub spine_copied: u64,
     pub tract_copied: u64,
+    /// The loser only lagged: just the tail between the two heads was copied.
+    pub tail_only: bool,
 }
 
 /// A device's resolved layout: where its spine lives and where its tract begins.
@@ -1725,10 +1727,79 @@ pub fn verified_replicate<A: BlockDev, B: BlockDev>(
     }
 
     if gen_a >= gen_b {
+        if let Some(r) = copy_tail(a, b, ring_log2, &la, gen_a, slot_a, &lb, gen_b, slot_b)? {
+            return Ok(r);
+        }
         replicate_into(a, b, ring_log2)
     } else {
+        if let Some(r) = copy_tail(b, a, ring_log2, &lb, gen_b, slot_b, &la, gen_a, slot_a)? {
+            return Ok(r);
+        }
         replicate_into(b, a, ring_log2)
     }
+}
+
+/// THE TAIL COPY (2026-10-22): a loser that only LAGS — the lazy second copy after a kill, the usual case — differs from the winner by exactly what the winner appended since the loser's head: tract positions between the two plows, and the spine slots of the generations since. Everything is an append, so nothing else moved.
+/// It applies when the two heads share history (the winner's slot for the loser's generation holds the loser's head entry byte for byte), the geometry is the same, and the gap is under a lap; anything else — a split brain, a grow, the migrating layout — returns None and the full replicate runs. Data first, flushed and verified, then the spine slots: the loser is a whole vault at every step.
+#[allow(clippy::too_many_arguments)]
+fn copy_tail<S: BlockDev, D: BlockDev>(
+    src: &mut S,
+    dst: &mut D,
+    ring_log2: u8,
+    ls: &DeviceLayout,
+    gen_s: Option<u64>,
+    slot_s: u64,
+    ld: &DeviceLayout,
+    gen_d: Option<u64>,
+    slot_d: u64,
+) -> Result<Option<Replicated>> {
+    use crate::ring::{classify, Classified};
+    let n = 1u64 << ring_log2;
+    let (Some(gs), Some(gd)) = (gen_s, gen_d) else { return Ok(None) };
+    if ls.has_root || ld.has_root || ls.spine_base != ld.spine_base || gs < gd || gs - gd >= n || src.block_count() != dst.block_count() {
+        return Ok(None);
+    }
+    let read_entry = |dev: &mut dyn FnMut(u64, &mut crate::block::Block) -> Result<()>, slot: u64| -> Result<Option<(crate::block::Block, SpineEntry)>> {
+        let mut buf = ZERO_BLOCK;
+        dev(slot, &mut buf)?;
+        Ok(match classify(&buf, slot, Some(ring_log2)) {
+            Classified::Valid(e) => Some((buf, e)),
+            _ => None,
+        })
+    };
+    let Some((head_s_block, head_s)) = read_entry(&mut |l, b| src.read(ls.spine_base + l, b), slot_s)? else { return Ok(None) };
+    let Some((head_d_block, head_d)) = read_entry(&mut |l, b| dst.read(ld.spine_base + l, b), slot_d)? else { return Ok(None) };
+    // Shared history: the winner still holds the loser's head, unchanged, in its slot.
+    let mut shared = ZERO_BLOCK;
+    src.read(ls.spine_base + (gd & (n - 1)), &mut shared)?;
+    if shared != head_d_block || head_s.tract_blocks != head_d.tract_blocks || head_s.plow < head_d.plow || head_s.plow - head_d.plow >= head_s.tract_blocks {
+        return Ok(None);
+    }
+    let _ = head_s_block;
+    let len = head_s.tract_blocks;
+    let mut out = Replicated { tail_only: true, ..Replicated::default() };
+    // The tract tail, in runs.
+    let positions: Vec<u64> = (head_d.plow..head_s.plow).map(|m| ls.tract_base + m % len).collect();
+    let mut blocks = alloc::vec![ZERO_BLOCK; positions.len()];
+    for (i, &lba) in positions.iter().enumerate() {
+        src.read(lba, &mut blocks[i])?;
+    }
+    let pairs: Vec<(u64, &crate::block::Block)> = positions.iter().copied().zip(blocks.iter()).collect();
+    crate::block::write_pairs(dst, &pairs)?;
+    dst.flush()?;
+    for i in crate::block::mismatches(dst, &pairs)? {
+        write_verified_one(dst, pairs[i].0, pairs[i].1)?;
+    }
+    out.tract_copied = pairs.len() as u64;
+    // Then the generations since, oldest first.
+    for g in gd + 1..=gs {
+        let slot = g & (n - 1);
+        let mut buf = ZERO_BLOCK;
+        src.read(ls.spine_base + slot, &mut buf)?;
+        write_verified_one(dst, ld.spine_base + slot, &buf)?;
+        out.spine_copied += 1;
+    }
+    Ok(Some(out))
 }
 
 /// Highest valid generation in one spine residence (full N-read scan — cheaper and simpler than a solo bisect, and replication is rare).
