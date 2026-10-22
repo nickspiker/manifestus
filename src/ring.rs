@@ -47,6 +47,16 @@ pub struct SpineEntry {
     pub live: u64,
     /// Caller-clock timestamp (eagle oscillations); the engine never interprets it.
     pub eagle_time: i64,
+    /// The run this commit wrote alongside its own entry, under the same single flush (the verified head, 2026-10-22): its first monotone plow position, its length in blocks, and BLAKE3 over its bytes in order. An entry can land while some of its run did not; a head whose run does not hash to this is a torn commit, and the vault opens at the generation before it. None on entries that wrote no run in the same flush (heartbeats, entries from before the field).
+    pub tail: Option<Tail>,
+}
+
+/// See [`SpineEntry::tail`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tail {
+    pub start: u64,
+    pub count: u64,
+    pub hash: [u8; 32],
 }
 
 impl SpineEntry {
@@ -85,6 +95,16 @@ impl SpineEntry {
             Some(r) => {
                 let mut p = pairs;
                 p.push(("reap", VsfType::u(r as usize, false)));
+                p
+            }
+            None => pairs,
+        };
+        let pairs: Vec<(&str, VsfType)> = match self.tail {
+            Some(t) => {
+                let mut p = pairs;
+                p.push(("tails", VsfType::u(t.start as usize, false)));
+                p.push(("tailn", VsfType::u(t.count as usize, false)));
+                p.push(("tailh", VsfType::hp(t.hash.to_vec())));
                 p
             }
             None => pairs,
@@ -139,6 +159,9 @@ impl SpineEntry {
         let mut live = None;
         let mut time = None;
         let mut reap = None;
+        let mut tail_start = None;
+        let mut tail_count = None;
+        let mut tail_hash = None;
 
         // Named pairs until zero padding ('d' = 0x64; padding = 0x00). Unknown names are parsed-and-skipped — kernel-profile fields ride thru.
         while block.get(ptr) == Some(&b'd') {
@@ -157,6 +180,9 @@ impl SpineEntry {
                 ("reap", v) if as_u64(&v).is_some() => reap = as_u64(&v),
                 ("live", v) if as_u64(&v).is_some() => live = as_u64(&v),
                 ("time", VsfType::e(EtType::e6(t))) => time = Some(t),
+                ("tails", v) if as_u64(&v).is_some() => tail_start = as_u64(&v),
+                ("tailn", v) if as_u64(&v).is_some() => tail_count = as_u64(&v),
+                ("tailh", VsfType::hp(h)) => tail_hash = Some(to32(&h)?),
                 _ => {} // forward-compat: unknown field or unexpected type — skip
             }
         }
@@ -172,6 +198,11 @@ impl SpineEntry {
             reap,
             live: live.ok_or_else(|| Error::Corrupt("missing live".into()))?,
             eagle_time: time.ok_or_else(|| Error::Corrupt("missing time".into()))?,
+            tail: match (tail_start, tail_count, tail_hash) {
+                (Some(start), Some(count), Some(hash)) => Some(Tail { start, count, hash }),
+                (None, None, None) => None,
+                _ => return Err(Error::Corrupt("partial tail".into())),
+            },
         };
         if entry.ring_log2 == 0 || entry.ring_log2 > 32 {
             return Err(Error::Corrupt(format!("insane ring exponent {}", entry.ring_log2)));
@@ -344,6 +375,46 @@ impl<A: BlockDev, B: BlockDev> Ring<A, B> {
         self.mirror.write_verified(self.base + slot, &block)?;
         self.head = Some((slot, entry.clone()));
         Ok(())
+    }
+
+    /// Append the next generation TOGETHER with the data run it names, under one flush per device (see [`Mirror::write_commit`]). Same chain law as [`Self::append`]; the entry's [`SpineEntry::tail`] must describe `data`.
+    pub fn append_commit(&mut self, entry: &SpineEntry, data: &[(u64, &Block)]) -> Result<()> {
+        let Some((_, h)) = &self.head else {
+            return Err(Error::Corrupt("append_commit before genesis".into()));
+        };
+        if entry.gen != h.gen + 1 {
+            return Err(Error::Corrupt(format!("append gen {} after head {}", entry.gen, h.gen)));
+        }
+        if entry.prev_hash != h.body_hash() {
+            return Err(Error::Corrupt("prev_hash does not chain to head".into()));
+        }
+        if entry.ring_log2 != self.ring_log2 {
+            return Err(Error::Corrupt("entry geometry does not match ring".into()));
+        }
+        let slot = entry.gen & (self.n() - 1);
+        let block = entry.encode();
+        self.mirror.write_commit(data, (self.base + slot, &block))?;
+        self.head = Some((slot, entry.clone()));
+        Ok(())
+    }
+
+    /// Step the head back one generation: a torn commit's entry is on the device but its run is not. The entry before it must be valid in its slot and chain to it; anything else is a ring the vault cannot vouch for.
+    pub fn rewind_head(&mut self) -> Result<()> {
+        let Some((_, head)) = self.head.clone() else {
+            return Err(Error::Corrupt("rewind on an empty ring".into()));
+        };
+        if head.gen == 0 {
+            return Err(Error::Corrupt("torn genesis: nothing before it".into()));
+        }
+        let gen = head.gen - 1;
+        let slot = gen & (self.n() - 1);
+        match self.gen_at(slot)? {
+            Classified::Valid(e) if e.gen == gen && e.body_hash() == head.prev_hash => {
+                self.head = Some((slot, e));
+                Ok(())
+            }
+            _ => Err(Error::Corrupt(format!("torn head {} and no intact generation {gen} before it", head.gen))),
+        }
     }
 
     /// Move the ring to a fresh residence (migrating profile). The caller has zeroed the region and recorded the move in the root ring; the cached head (an entry, not an address) rides across unchanged — the next append lands at the new base.

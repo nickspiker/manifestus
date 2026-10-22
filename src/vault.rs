@@ -11,7 +11,7 @@ use crate::block::{BlockDev, ZERO_BLOCK};
 use crate::error::{Error, Result};
 use crate::hamt::{DanglingPointer, Delta, Hamt, StalePointer};
 use crate::mirror::Mirror;
-use crate::ring::{any_sealed_block, append_root, read_root, zero_ring, zero_ring_at, Ring, RootEntry, SpineEntry, FENCE_K, ROOT_SLOTS};
+use crate::ring::{any_sealed_block, append_root, read_root, zero_ring, zero_ring_at, Ring, RootEntry, SpineEntry, Tail, FENCE_K, ROOT_SLOTS};
 use crate::tract::{Liveness, Staging, Tract};
 use alloc::{format, vec::Vec};
 use hashbrown::HashMap;
@@ -91,6 +91,9 @@ pub struct RepairReport {
 fn staged() -> Staging {
     Staging::on()
 }
+
+/// The longest run a commit writes under the same flush as its entry (256 KiB): longer runs are flushed ahead of the entry, so the torn-commit check at open never reads more than this.
+const TAIL_MAX_BLOCKS: usize = 1 << 6;
 
 /// Proactive reap trigger: dead > 25% of the tract → one window after the commit.
 /// Window size scales with the tract (len/64, floor 16) so huge values fragment into at most ~64 runs crossing a full lap — far under the extent leaf's capacity.
@@ -204,6 +207,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             reap: Some(0),
             live: 0,
             eagle_time: now,
+            tail: None,
         };
         ring.append(&entry)?;
         let tract = Tract {
@@ -306,6 +310,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             reap: Some(0),
             live: 0,
             eagle_time: now,
+            tail: None,
         };
         ring.append(&entry)?;
         let tract = Tract {
@@ -382,10 +387,25 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     }
 
     fn resume_common_with(mut ring: Ring<A, B>, tract_base: u64, root: Option<RootEntry>, repair: Option<&mut RepairReport>, policy: crate::DeletePolicy) -> Result<Self> {
-        let head = ring
+        let mut head = ring
             .head()
             .ok_or_else(|| Error::Corrupt("bootstrap found entries but head search found none".into()))?
             .clone();
+        // A torn commit: its entry landed, some of its run did not. The generation before it is whole (its own commit finished flushed and verified before this one began, and this one's appends stayed inside the fence), so the vault opens there; the next commit takes the torn entry's slot.
+        while let Some(t) = head.tail {
+            let (a, b) = ring.mirror().devices();
+            let intact = match (a, b) {
+                (Some(a), _) => tail_intact(a, tract_base, head.tract_blocks, &t)?,
+                (None, Some(b)) => tail_intact(b, tract_base, head.tract_blocks, &t)?,
+                (None, None) => true,
+            };
+            if intact {
+                break;
+            }
+            ring.rewind_head()?;
+            ring.mirror().emit(crate::events::StorageEvent::TornCommit { gen: head.gen });
+            head = ring.head().ok_or_else(|| Error::Corrupt("rewind left no head".into()))?.clone();
+        }
         let mut tract = Tract {
             base: tract_base,
             len: head.tract_blocks,
@@ -806,22 +826,22 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 Err(e) => return Err(e),
             }
         };
-        // Data before the entry that names it: everything this commit appended, in one write per device. A failed write leaves the RAM index pointing at bytes no device holds, so it goes back to the committed head with the stage and the delta — the caller's batch still holds its items.
-        if let Err(e) = self.tract.write_staged(self.ring.mirror()) {
-            self.tract.discard_staged();
-            let head = self.ring.head().ok_or_else(|| Error::Corrupt("commit on pre-genesis vault".into()))?;
-            self.hamt = Hamt::from_root(head.hamt_hash, head.hamt_lba);
-            self.pending_reap = None;
-            return Err(e);
-        }
-        {
-            let Self { hamt, live, .. } = self;
-            live.apply(hamt.take_delta());
-        }
-        // The staged reap retires its window only now: the flush above landed in clean space that still excluded the window's originals, and the entry below records the advanced cursor.
-        if let Some(r) = self.pending_reap.take() {
-            self.tract.reap = r;
-        }
+        // Everything this commit appended goes down WITH its entry, under one flush per device, and the entry carries the run's hash (the verified head): an entry that lands without all of its run is a torn commit, which open detects and steps back from.
+        // RAM moves only once that write has landed. A failure sends the index back to the committed head; the reap cursor, the live set and the delta have not changed yet, and the caller's batch still holds its items.
+        let (start, run) = self.tract.take_staged();
+        // A large run goes down first under its own flush and the entry carries no tail: open checks a head's run by reading it, and that read must stay a few blocks however big the last commit was. A large commit's cost is its transfer, not its second flush.
+        let split = run.len() > TAIL_MAX_BLOCKS;
+        let tail = (!run.is_empty() && !split).then(|| {
+            let mut h = blake3::Hasher::new();
+            for b in &run {
+                h.update(b);
+            }
+            Tail { start, count: run.len() as u64, hash: *h.finalize().as_bytes() }
+        });
+        let data: Vec<(u64, &crate::block::Block)> = run.iter().enumerate().map(|(i, b)| (self.tract.device_lba(start + i as u64), b)).collect();
+        // The staged reap retires its window with this entry: the run above landed in clean space that still excluded the window's originals.
+        let reap = self.pending_reap.unwrap_or(self.tract.reap);
+        let (added, removed) = self.hamt.delta_counts();
         let head = self
             .ring
             .head()
@@ -834,11 +854,28 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             hamt_hash: root_hash,
             hamt_lba: root_lba,
             plow: self.tract.plow,
-            reap: Some(self.tract.reap),
-            live: self.live.len() as u64,
+            reap: Some(reap),
+            live: (self.live.len() + added).saturating_sub(removed) as u64,
             eagle_time: now,
+            tail,
         };
-        self.ring.append(&entry)?;
+        let landed = if split {
+            self.ring.mirror().write_verified_batch(&data).and_then(|_| self.ring.append(&entry))
+        } else {
+            self.ring.append_commit(&entry, &data)
+        };
+        if let Err(e) = landed {
+            let head = self.ring.head().ok_or_else(|| Error::Corrupt("commit on pre-genesis vault".into()))?;
+            self.hamt = Hamt::from_root(head.hamt_hash, head.hamt_lba);
+            self.pending_reap = None;
+            return Err(e);
+        }
+        {
+            let Self { hamt, live, .. } = self;
+            live.apply(hamt.take_delta());
+        }
+        self.pending_reap = None;
+        self.tract.reap = reap;
 
         // Fence: the last K generations stay fully restorable.
         let fences = self.ring.recent_fences(FENCE_K)?;
@@ -1070,6 +1107,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             reap: head.reap,
             live: self.live.len() as u64,
             eagle_time: now,
+            tail: None,
         };
         self.ring.append(&entry)?;
         let fences = self.ring.recent_fences(FENCE_K)?;
@@ -1133,6 +1171,19 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     }
 }
 
+#[cfg(feature = "std")]
+impl<A: BlockDev, B: BlockDev + 'static> Vault<A, B> {
+    /// Acknowledge writes on the primary alone and copy them to the second device behind it, in order (see [`Mirror::follow`]): a commit then waits for one device's flushes, not two. Call once the vault is open.
+    pub fn follow(&mut self) {
+        self.ring.mirror().follow();
+    }
+
+    /// Wait until the second device has caught up — for a caller about to read the files directly, or to measure.
+    pub fn sync_follower(&mut self) {
+        self.ring.mirror().sync_follower();
+    }
+}
+
 /// min over the window of each generation's fence budget (reap_i + tract_blocks_i):
 /// appends stay inside space that was already clean at every windowed generation, and clean space contains nothing those generations reference (Vault_CleanInvariant) — so the last K generations are fully restorable. Legacy entries without a reap contribute plow_i (zero budget) and age out over K generations.
 fn fence_from(budgets_newest_first: &[u64]) -> Option<u64> {
@@ -1188,8 +1239,35 @@ fn resolve_layout<D: BlockDev>(dev: &mut D, ring_log2: u8) -> Result<(DeviceLayo
             slot,
         ));
     }
-    let (gen, slot) = best_gen(dev, n, ring_log2, 0)?;
+    let (mut gen, mut slot) = best_gen(dev, n, ring_log2, 0)?;
+    // A torn head on this device is not its generation: the one before it is (see resume).
+    if let Some(g) = gen {
+        let mut buf = ZERO_BLOCK;
+        dev.read(slot, &mut buf)?;
+        if let crate::ring::Classified::Valid(e) = crate::ring::classify(&buf, slot, Some(ring_log2)) {
+            if let Some(t) = e.tail {
+                if !tail_intact(dev, n, e.tract_blocks, &t)? && g > 0 {
+                    gen = Some(g - 1);
+                    slot = (g - 1) & (n - 1);
+                }
+            }
+        }
+    }
     Ok((DeviceLayout { spine_base: 0, tract_base: n, has_root: false }, gen, slot))
+}
+
+/// Whether a commit's run is on `dev` as its entry recorded it: the blocks at the run's positions hash to the entry's tail hash.
+fn tail_intact<D: BlockDev>(dev: &mut D, tract_base: u64, tract_len: u64, t: &Tail) -> Result<bool> {
+    if tract_len == 0 || t.count > tract_len {
+        return Ok(false);
+    }
+    let mut h = blake3::Hasher::new();
+    let mut buf = ZERO_BLOCK;
+    for i in 0..t.count {
+        dev.read(tract_base + (t.start + i) % tract_len, &mut buf)?;
+        h.update(&buf);
+    }
+    Ok(h.finalize().as_bytes() == &t.hash)
 }
 
 /// Mirror resync — NEVER a file copy. Block-level, hash-compare-skip, write-verified, idempotent; I/O proportional to live + diverged data. Decides the winner by the highest valid generation found in either spine (each device resolved thru its OWN root, so a crash mid-migration on one mirror converges correctly), then converges the loser: root slots, spine slots, then the winner's committed live set.

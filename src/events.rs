@@ -21,6 +21,8 @@ pub enum StorageEvent {
     ReapWindow { scanned: u64, live: u64, moved: u64 },
     /// An append was about to overwrite a block the committed index still references — the lap guard refused before a byte was written (the 43-dangling class, caught pre-loss). The clean invariant was already broken upstream when this fires; the refusal preserves the value, this event is the confession.
     LiveLapAverted { lba: u64 },
+    /// The head generation's entry was on the device but its data run was not (a crash inside the commit's single flush): the vault opened at the generation before it. (gen of the torn entry)
+    TornCommit { gen: u64 },
 }
 
 /// The injected sink. Implementations must be cheap and non-blocking from the engine's point of view — buffering and durability are the embedder's problem, not the engine's.

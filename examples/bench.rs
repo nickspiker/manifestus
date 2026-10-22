@@ -24,7 +24,11 @@ fn open(dir: &std::path::Path) -> Vault<FileDev, FileDev> {
     let a = FileDev::create(&dir.join("bench.vsf"), blocks).unwrap();
     let b = FileDev::create(&dir.join("bench.shadow.vsf"), blocks).unwrap();
     manifestus::verified_replicate(&mut FileDev::open(&dir.join("bench.vsf")).unwrap(), &mut FileDev::open(&dir.join("bench.shadow.vsf")).unwrap(), HOST_RING_LOG2).unwrap();
-    Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 1, DeletePolicy::UnlinkOnly).unwrap()
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 1, DeletePolicy::UnlinkOnly).unwrap();
+    if std::env::var_os("BENCH_SYNC").is_none() {
+        v.follow();
+    }
+    v
 }
 
 fn ms(t: Instant) -> f64 {
@@ -70,6 +74,9 @@ fn main() {
     let e = ms(t);
     println!("put small x{small:<5}        {:>9.1} ms  ({:.2} ms each)", e, e / small as f64);
 
+    let t = Instant::now();
+    v.sync_follower();
+    println!("second copy catches up  {:>9.1} ms", ms(t));
     let stats = v.engine_stats();
     println!("tract {} blocks ({} MiB), {} live blocks, gen {}", stats.tract_blocks, stats.tract_blocks * 4 / 1024, stats.live_blocks, stats.generation);
     drop(v);

@@ -24,6 +24,7 @@ fn entry(gen: u64, prev: [u8; 32], r: u8) -> SpineEntry {
         reap: Some(gen * 2),
         live: gen,
         eagle_time: 1_000_000 + gen as i64,
+        tail: None,
     }
 }
 

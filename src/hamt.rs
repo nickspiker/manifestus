@@ -142,6 +142,11 @@ impl Hamt {
         self.is_dirty() || !self.delta.added.is_empty() || !self.delta.removed.is_empty()
     }
 
+    /// (added, removed) counts of the pending delta — the commit's live estimate before the delta is applied.
+    pub fn delta_counts(&self) -> (usize, usize) {
+        (self.delta.added.len(), self.delta.removed.len())
+    }
+
     pub fn take_delta(&mut self) -> Delta {
         core::mem::take(&mut self.delta)
     }

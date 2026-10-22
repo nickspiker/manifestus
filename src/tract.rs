@@ -131,6 +131,16 @@ impl Tract {
         mirror.write_verified_batch(&batch)
     }
 
+    /// Hand the stage to the caller and clear it: (first monotone position, blocks). The commit writes it together with its spine entry.
+    pub fn take_staged(&mut self) -> (u64, Vec<Block>) {
+        (self.staging.start, core::mem::take(&mut self.staging.blocks))
+    }
+
+    /// Device lba of monotone plow position `m`.
+    pub fn device_lba(&self, m: u64) -> u64 {
+        self.base + m % self.len
+    }
+
     /// Drop the stage unwritten — for a barrier that resets the plow (its positions are about to be reused) or a commit that failed (nothing may point at them).
     pub fn discard_staged(&mut self) {
         self.staging.blocks.clear();
