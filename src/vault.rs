@@ -906,7 +906,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 .ok_or_else(|| Error::Corrupt("rescue on pre-genesis vault".into()))?;
             (head.hamt_hash, head.hamt_lba)
         };
-        self.hamt = Hamt::from_root(h, l);
+        self.hamt.reset_to(h, l);
         self.pending_reap = None;
         Ok(())
     }
@@ -920,7 +920,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 .ok_or_else(|| Error::Corrupt("rescue on pre-genesis vault".into()))?;
             (head.hamt_hash, head.hamt_lba)
         };
-        self.hamt = Hamt::from_root(h, l);
+        self.hamt.reset_to(h, l);
         // A staged reap belongs to the arena just discarded: its relocations are gone, so its window must stay occupied.
         self.pending_reap = None;
         match self.rescue(now) {
@@ -1033,7 +1033,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             .head()
             .ok_or_else(|| Error::Corrupt("grow on pre-genesis vault".into()))?
             .clone();
-        self.hamt = Hamt::from_root(head.hamt_hash, head.hamt_lba);
+        self.hamt.reset_to(head.hamt_hash, head.hamt_lba);
         // The plow goes back to the head's: staged appends sit at positions about to be reused, and nothing committed names them.
         self.tract.discard_staged();
         self.tract.plow = head.plow;
@@ -1168,7 +1168,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         };
         if let Err(e) = landed {
             let head = self.ring.head().ok_or_else(|| Error::Corrupt("commit on pre-genesis vault".into()))?;
-            self.hamt = Hamt::from_root(head.hamt_hash, head.hamt_lba);
+            self.hamt.reset_to(head.hamt_hash, head.hamt_lba);
             self.pending_reap = None;
             return Err(e);
         }

@@ -100,6 +100,7 @@ impl Node {
 }
 
 /// Decoded tract block, by schema.
+#[derive(Clone)]
 enum TractDoc {
     Node(Node),
     Lone { key: [u8; 32], value: Vec<u8> },
@@ -110,7 +111,17 @@ enum TractDoc {
     Furrow { key: [u8; 32], index: u64, payload: Vec<u8> },
 }
 
+/// Verified, decoded index blocks by their hash (2026-10-22). A hash names one byte string forever, so an entry can never go stale; it only saves the read, the BLAKE3 and the parse a descent pays for every node it passes. Holds nodes and leaves, never furrows (data). Cleared whole when full — a descent refills the few nodes it needs.
+#[derive(Default)]
+struct DocCache {
+    docs: HashMap<[u8; 32], TractDoc>,
+}
+
+/// Decoded blocks the cache holds before it starts over (~1.5 KiB a node: about 6 MiB).
+const DOC_CACHE_MAX: usize = 1 << 12;
+
 pub struct Hamt {
+    cache: DocCache,
     root: Option<Child>,
     arena: Vec<Node>,
     delta: Delta,
@@ -120,7 +131,7 @@ pub struct Hamt {
 
 impl Hamt {
     pub fn empty() -> Self {
-        Self { root: None, arena: Vec::new(), delta: Delta::default(), repoint_hits: 0 }
+        Self { cache: DocCache::default(), root: None, arena: Vec::new(), delta: Delta::default(), repoint_hits: 0 }
     }
 
     /// Resume from a committed root (spine entry's hamt_root). All-zero hash = empty index (genesis convention).
@@ -130,7 +141,31 @@ impl Hamt {
         } else {
             Some(Child::Committed { hash, lba })
         };
-        Self { root, arena: Vec::new(), delta: Delta::default(), repoint_hits: 0 }
+        Self { cache: DocCache::default(), root, arena: Vec::new(), delta: Delta::default(), repoint_hits: 0 }
+    }
+
+    /// Back to a committed root, dropping the arena and the delta like [`Self::from_root`] — but keeping the cache, which a root change cannot invalidate.
+    pub fn reset_to(&mut self, hash: [u8; 32], lba: u64) {
+        let cache = core::mem::take(&mut self.cache);
+        *self = Self::from_root(hash, lba);
+        self.cache = cache;
+    }
+
+    /// A committed block by its pointer: from the cache, or read, verified against `hash` and remembered. The walks that exist to verify the vault read the device directly instead.
+    fn doc<A: BlockDev, B: BlockDev>(&mut self, mirror: &mut Mirror<A, B>, tract: &Tract, lba: u64, hash: &[u8; 32]) -> Result<Option<TractDoc>> {
+        if let Some(d) = self.cache.docs.get(hash) {
+            return Ok(Some(d.clone()));
+        }
+        let d = read_doc(mirror, tract, lba, hash)?;
+        if let Some(doc) = &d {
+            if !matches!(doc, TractDoc::Furrow { .. }) {
+                if self.cache.docs.len() >= DOC_CACHE_MAX {
+                    self.cache.docs.clear();
+                }
+                self.cache.docs.insert(*hash, doc.clone());
+            }
+        }
+        Ok(d)
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -183,7 +218,7 @@ impl Hamt {
                     }
                 }
                 Child::Committed { hash, lba } => {
-                    let doc = match read_doc(mirror, tract, lba, &hash)? {
+                    let doc = match self.doc(mirror, tract, lba, &hash)? {
                         None => return Ok(None), // zeroed: fast-deleted target
                         Some(d) => d,
                     };
@@ -306,7 +341,7 @@ impl Hamt {
                 Ok(Child::Dirty(idx))
             }
             Some(Child::Committed { hash, lba }) => {
-                let Some(doc) = read_doc(mirror, tract, lba, &hash)? else {
+                let Some(doc) = self.doc(mirror, tract, lba, &hash)? else {
                     // Stale pointer at a fast-deleted (zeroed) leaf: the new leaf simply replaces it — resurrection after delete.
                     return Ok(leaf);
                 };
@@ -432,7 +467,7 @@ impl Hamt {
                 Ok(Some(Child::Dirty(idx)))
             }
             Some(Child::Committed { hash, lba }) => {
-                let Some(doc) = read_doc(mirror, tract, lba, &hash)? else {
+                let Some(doc) = self.doc(mirror, tract, lba, &hash)? else {
                     // A different stale target on the path (someone else's tombstone) — not ours to touch here.
                     return Ok(Some(Child::Committed { hash, lba }));
                 };
@@ -474,7 +509,7 @@ impl Hamt {
                     }
                 },
                 Child::Committed { hash, lba } => {
-                    let Some(doc) = read_doc(mirror, tract, lba, &hash)? else { return Ok(None) };
+                    let Some(doc) = self.doc(mirror, tract, lba, &hash)? else { return Ok(None) };
                     match doc {
                         TractDoc::Node(node) => match &node.children[chunk(key, depth) as usize] {
                             None => return Ok(None),
@@ -504,7 +539,7 @@ impl Hamt {
         hash: &[u8; 32],
     ) -> Result<()> {
         self.delta.removed.push((lba, *hash));
-        match read_doc(mirror, tract, lba, hash)? {
+        match self.doc(mirror, tract, lba, hash)? {
             Some(TractDoc::Direct { furrows, .. }) => {
                 let mut buf = ZERO_BLOCK;
                 for f in furrows {
@@ -919,7 +954,7 @@ impl Hamt {
             let Some((leaf_lba, leaf_hash)) = self.find_leaf(mirror, tract, &key)? else {
                 continue; // owner deleted — orphan furrows, garbage
             };
-            match read_doc(mirror, tract, leaf_lba, &leaf_hash)? {
+            match self.doc(mirror, tract, leaf_lba, &leaf_hash)? {
                 Some(TractDoc::Extent { key: k, size, runs }) if k == key => {
                     group.sort_by_key(|&(_, idx)| idx);
                     let mut payload = Vec::with_capacity(group.len());
@@ -1082,7 +1117,7 @@ impl Hamt {
                 if target_depth != u8::MAX && depth > target_depth + 1 {
                     return Ok(Some(Child::Committed { hash, lba })); // overshoot: not on this path — real depths are ≤ 51 so the +1 cannot overflow, and the MAX sentinel never overshoots
                 }
-                let Some(doc) = read_doc(mirror, tract, lba, &hash)? else {
+                let Some(doc) = self.doc(mirror, tract, lba, &hash)? else {
                     return Ok(Some(Child::Committed { hash, lba }));
                 };
                 match doc {
