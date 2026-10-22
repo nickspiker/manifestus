@@ -246,3 +246,45 @@ fn inline_map_matches_walk_through_laps() {
 fn paged_map_matches_walk_through_laps() {
     map_matches_walk(manifestus::livemap::INLINE_MAX_BITS + 8192, 60_000, 2);
 }
+
+/// A furrow's seal and owner check cannot tell an older copy of the same key's furrow from the current one; the leaf's whole-value hash can. Swap the old furrow 0 into the new one's place: the read refuses instead of serving a spliced value.
+#[test]
+fn stale_furrow_is_caught_by_the_value_hash() {
+    use manifestus::{inspect::{decode_tract, TractBlock}, BlockDev};
+    let dir = TempDir::new().unwrap();
+    let (pa, pb) = paths(&dir, "stale");
+    FileDev::create(&pa, RING + 1024).unwrap();
+    FileDev::create(&pb, RING + 1024).unwrap();
+    let k = key(7);
+    {
+        let mut v = open_pair(&pa, &pb);
+        v.put(&k, &vec![1u8; 50_000], 10).unwrap();
+        v.put(&k, &vec![2u8; 50_000], 11).unwrap();
+        // One more commit, so the value under test is not in the head's own run (the torn-head check would step back over it first).
+        v.put(&key(8), b"later", 12).unwrap();
+        assert_eq!(v.get(&k).unwrap(), Some(vec![2u8; 50_000]));
+    }
+    // Both copies of furrow 0 of key 7: the first written is the stale one.
+    let mut found: Vec<u64> = Vec::new();
+    let mut d = FileDev::open(&pa).unwrap();
+    let mut buf = ZERO_BLOCK;
+    for lba in RING..RING + 1024 {
+        d.read(lba, &mut buf).unwrap();
+        if let Ok((_, TractBlock::Furrow { key: fk, index: 0, .. })) = decode_tract(&buf) {
+            if fk == k {
+                found.push(lba);
+            }
+        }
+    }
+    assert_eq!(found.len(), 2, "the old and the new furrow 0");
+    let (old, new) = (found[0], found[1]);
+    d.read(old, &mut buf).unwrap();
+    for p in [&pa, &pb] {
+        let mut d = FileDev::open(p).unwrap();
+        d.write(new, &buf).unwrap();
+        d.flush().unwrap();
+    }
+    let mut v = open_pair(&pa, &pb);
+    let got = v.get(&k);
+    assert!(matches!(got, Err(manifestus::Error::Seal)), "a spliced value must not be served: {:?}", got.as_ref().map(|o| o.as_ref().map(|b| (b.len(), b[0], b[b.len() - 1]))));
+}

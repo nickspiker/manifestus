@@ -105,7 +105,7 @@ enum TractDoc {
     Node(Node),
     Lone { key: [u8; 32], value: Vec<u8> },
     /// Extent leaf: the value's furrows as (start, count) runs — any size, one block.
-    Extent { key: [u8; 32], size: u64, runs: Vec<(u64, u64)> },
+    Extent { key: [u8; 32], size: u64, runs: Vec<(u64, u64)>, vh: Option<[u8; 32]> },
     /// Legacy per-lba leaf. Read-only; rewritten as Extent by the reap.
     Direct { key: [u8; 32], size: u64, furrows: Vec<u64> },
     Furrow { key: [u8; 32], index: u64, payload: Vec<u8> },
@@ -241,12 +241,17 @@ impl Hamt {
                             }
                             return Ok(Some(read_furrows(mirror, tract, key, size, &furrows)?));
                         }
-                        TractDoc::Extent { key: k, size, runs } => {
+                        TractDoc::Extent { key: k, size, runs, vh } => {
                             if &k != key {
                                 return Ok(None);
                             }
                             let positions = expand_runs(&runs, size)?;
-                            return Ok(Some(read_furrows(mirror, tract, key, size, &positions)?));
+                            let value = read_furrows(mirror, tract, key, size, &positions)?;
+                            // The whole value against the hash its leaf recorded: a furrow's own seal and owner key cannot tell a stale copy of the same key's furrow from the current one; this can.
+                            if vh.is_some_and(|h| *blake3::hash(&value).as_bytes() != h) {
+                                return Err(Error::Seal);
+                            }
+                            return Ok(Some(value));
                         }
                         TractDoc::Furrow { .. } => {
                             return Err(Error::Corrupt("furrow reached via index walk".into()));
@@ -307,7 +312,7 @@ impl Hamt {
                 self.delta.added.push((*lba, sealed_hp(b).unwrap()));
             }
             let runs = compress_runs(&placed);
-            let leaf = encode_extent(key, value.len() as u64, &runs)?;
+            let leaf = encode_extent(key, value.len() as u64, &runs, Some(*blake3::hash(value).as_bytes()))?;
             let lba = tract.append(mirror, live, core::slice::from_ref(&leaf))?[0];
             let hash = sealed_hp(&leaf).unwrap();
             self.delta.added.push((lba, hash));
@@ -842,7 +847,7 @@ impl Hamt {
             TractDoc::Direct { key, furrows, .. } => {
                 self.repair_check_furrows(mirror, tract, lba, hash, route, &key, &furrows, out, dangling)?;
             }
-            TractDoc::Extent { key, size, runs } => match expand_runs(&runs, size) {
+            TractDoc::Extent { key, size, runs, .. } => match expand_runs(&runs, size) {
                 Ok(positions) => {
                     self.repair_check_furrows(mirror, tract, lba, hash, route, &key, &positions, out, dangling)?;
                 }
@@ -955,7 +960,7 @@ impl Hamt {
                 continue; // owner deleted — orphan furrows, garbage
             };
             match self.doc(mirror, tract, leaf_lba, &leaf_hash)? {
-                Some(TractDoc::Extent { key: k, size, runs }) if k == key => {
+                Some(TractDoc::Extent { key: k, size, runs, vh }) if k == key => {
                     group.sort_by_key(|&(_, idx)| idx);
                     let mut payload = Vec::with_capacity(group.len());
                     for &(pos, _) in &group {
@@ -975,7 +980,7 @@ impl Hamt {
                         positions[i] = newpos;
                     }
                     let new_runs = compress_runs(&positions);
-                    let new_leaf = encode_extent(&key, size, &new_runs)?;
+                    let new_leaf = encode_extent(&key, size, &new_runs, vh)?;
                     let nl = tract.append(mirror, oracle, core::slice::from_ref(&new_leaf))?[0];
                     let nh = sealed_hp(&new_leaf).unwrap();
                     self.replace_leaf(mirror, tract, &key, (leaf_hash, leaf_lba), (nh, nl))?;
@@ -1218,9 +1223,9 @@ pub fn lone_capacity() -> usize {
     BLOCK - body_start() - (1 << 7)
 }
 
-/// Run slots one extent leaf can hold: each run is two EWE fields (start, count), conservatively ≤ 32 bytes, against a 96-byte envelope margin. Fresh values use 1-2 runs regardless of size; only reap-window boundary crossings add fragments, and consecutive windows re-coalesce them — the bound is never approached in practice.
+/// Run slots one extent leaf can hold: each run is two EWE fields (start, count), conservatively ≤ 32 bytes, against a 160-byte envelope margin (key, size and the value hash). Fresh values use 1-2 runs regardless of size; only reap-window boundary crossings add fragments, and consecutive windows re-coalesce them — the bound is never approached in practice.
 pub fn max_runs() -> usize {
-    (BLOCK - body_start() - 96) / 32
+    (BLOCK - body_start() - 160) / 32
 }
 
 /// Max furrow payload per block.
@@ -1236,7 +1241,8 @@ fn encode_lone(key: &[u8; 32], value: &[u8]) -> Block {
     buf
 }
 
-fn encode_extent(key: &[u8; 32], size: u64, runs: &[(u64, u64)]) -> Result<Block> {
+/// `vh`: BLAKE3 of the whole value — written by every put since 2026-10-22, carried by the reap's rewrites, absent on older leaves (which read as before).
+fn encode_extent(key: &[u8; 32], size: u64, runs: &[(u64, u64)], vh: Option<[u8; 32]>) -> Result<Block> {
     if runs.len() > max_runs() {
         return Err(Error::Corrupt(format!(
             "extent leaf overflow: {} runs > {} — value pathologically fragmented",
@@ -1247,6 +1253,9 @@ fn encode_extent(key: &[u8; 32], size: u64, runs: &[(u64, u64)]) -> Result<Block
     let (mut buf, mut cursor) = begin_block(SCHEMA_EXTENT);
     put_field(&mut buf, &mut cursor, "key", VsfType::hp(key.to_vec()));
     put_field(&mut buf, &mut cursor, "size", VsfType::u(size as usize, false));
+    if let Some(h) = vh {
+        put_field(&mut buf, &mut cursor, "vh", VsfType::hp(h.to_vec()));
+    }
     for (s, c) in runs {
         put_field(&mut buf, &mut cursor, "s", VsfType::u(*s as usize, false));
         put_field(&mut buf, &mut cursor, "c", VsfType::u(*c as usize, false));
@@ -1381,6 +1390,7 @@ fn decode_doc(block: &Block) -> Result<TractDoc> {
     let mut furrows: Vec<u64> = Vec::new();
     let mut run_starts: Vec<u64> = Vec::new();
     let mut run_counts: Vec<u64> = Vec::new();
+    let mut vh: Option<[u8; 32]> = None;
 
     while block.get(ptr) == Some(&b'd') {
         let VsfType::d(name) = parse(block, &mut ptr).map_err(|e| Error::Corrupt(format!("{e:?}")))? else {
@@ -1394,6 +1404,7 @@ fn decode_doc(block: &Block) -> Result<TractDoc> {
             ("i", ref u) if as_u64(u).is_some() => index = as_u64(u),
             ("depth", ref u) if as_u64(u).is_some() => depth = as_u64(u),
             ("route", VsfType::hp(h)) => route = Some(h.try_into().map_err(|_| Error::Corrupt("route len".into()))?),
+            ("vh", VsfType::hp(h)) => vh = Some(h.try_into().map_err(|_| Error::Corrupt("vh len".into()))?),
             ("map", ref u) if as_u64(u).is_some() => map = as_u64(u),
             ("ch", VsfType::hp(h)) => hashes.push(h.try_into().map_err(|_| Error::Corrupt("ch len".into()))?),
             ("at", ref u) if as_u64(u).is_some() => lbas.push(as_u64(u).unwrap()),
@@ -1417,6 +1428,7 @@ fn decode_doc(block: &Block) -> Result<TractDoc> {
                 key: key.ok_or_else(|| Error::Corrupt("extent: missing key".into()))?,
                 size: size.ok_or_else(|| Error::Corrupt("extent: missing size".into()))?,
                 runs: run_starts.into_iter().zip(run_counts).collect(),
+                vh,
             })
         }
         SCHEMA_DIRECT => Ok(TractDoc::Direct {
