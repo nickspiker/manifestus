@@ -1422,13 +1422,12 @@ fn read_furrows<A: BlockDev, B: BlockDev>(
     furrows: &[u64],
 ) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(size as usize);
-    for (i, lba) in furrows.iter().enumerate() {
-        let mut buf = ZERO_BLOCK;
-        tract.read(mirror, *lba, &mut buf)?;
-        if sealed_hp(&buf).is_none() {
+    let blocks = tract.read_positions(mirror, furrows)?;
+    for (i, buf) in blocks.iter().enumerate() {
+        if sealed_hp(buf).is_none() {
             return Err(Error::Corrupt(format!("furrow {i} unsealed")));
         }
-        match decode_doc(&buf)? {
+        match decode_doc(buf)? {
             TractDoc::Furrow { key: k, index, payload } => {
                 if &k != key || index as usize != i {
                     return Err(Error::Corrupt(format!("furrow {i} mismatched owner/index")));

@@ -28,6 +28,8 @@ pub struct FileDev {
     blocks: u64,
     direct: bool,
     scratch: Box<AlignedBlock>,
+    /// The aligned bounce buffer for runs (O_DIRECT wants aligned memory): grown to the largest run seen, kept.
+    run: Vec<AlignedBlock>,
 }
 
 impl FileDev {
@@ -68,6 +70,7 @@ impl FileDev {
             blocks: len / BLOCK as u64,
             direct,
             scratch: Box::new(AlignedBlock([0u8; BLOCK])),
+            run: Vec::new(),
         })
     }
 
@@ -123,6 +126,41 @@ impl BlockDev for FileDev {
             write_block_at(&self.file, &self.scratch.0, off)?;
         } else {
             write_block_at(&self.file, buf, off)?;
+        }
+        Ok(())
+    }
+
+    /// One positioned write for the whole run, through the aligned bounce buffer.
+    fn write_run(&mut self, lba: u64, blocks: &[&Block]) -> Result<()> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        self.bounds(lba + blocks.len() as u64 - 1)?;
+        let n = blocks.len();
+        if self.run.len() < n {
+            self.run.resize_with(n, || AlignedBlock([0u8; BLOCK]));
+        }
+        for (dst, src) in self.run.iter_mut().zip(blocks) {
+            dst.0.copy_from_slice(*src);
+        }
+        let bytes = unsafe { core::slice::from_raw_parts(self.run.as_ptr() as *const u8, n * BLOCK) };
+        write_block_at(&self.file, bytes, lba * BLOCK as u64)
+    }
+
+    /// One positioned read for the whole run.
+    fn read_run(&mut self, lba: u64, out: &mut [Block]) -> Result<()> {
+        if out.is_empty() {
+            return Ok(());
+        }
+        self.bounds(lba + out.len() as u64 - 1)?;
+        let n = out.len();
+        if self.run.len() < n {
+            self.run.resize_with(n, || AlignedBlock([0u8; BLOCK]));
+        }
+        let bytes = unsafe { core::slice::from_raw_parts_mut(self.run.as_mut_ptr() as *mut u8, n * BLOCK) };
+        read_block_at(&self.file, bytes, lba * BLOCK as u64)?;
+        for (dst, src) in out.iter_mut().zip(&self.run) {
+            dst.copy_from_slice(&src.0);
         }
         Ok(())
     }

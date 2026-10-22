@@ -227,6 +227,30 @@ impl Tract {
         mirror.write_verified(self.base + lba, &crate::block::ZERO_BLOCK)
     }
 
+    /// Read the blocks at tract positions `positions`, in order: consecutive positions on the device move in one transfer, staged ones come from the stage. A value's furrows are one run, two at a ring wrap.
+    pub fn read_positions<A: BlockDev, B: BlockDev>(&self, mirror: &mut Mirror<A, B>, positions: &[u64]) -> Result<Vec<Block>> {
+        let mut out = alloc::vec![crate::block::ZERO_BLOCK; positions.len()];
+        let mut i = 0;
+        while i < positions.len() {
+            let p = positions[i];
+            if p >= self.len {
+                return Err(Error::Bounds(p));
+            }
+            if let Some(s) = self.staged_at(p) {
+                out[i].copy_from_slice(&self.staging.blocks[s]);
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < positions.len() && positions[j] == positions[j - 1] + 1 && positions[j] < self.len && self.staged_at(positions[j]).is_none() {
+                j += 1;
+            }
+            mirror.read_run(self.base + p, &mut out[i..j])?;
+            i = j;
+        }
+        Ok(out)
+    }
+
     /// Plain read of a tract block (callers verify content at their own layer).
     pub fn read<A: BlockDev, B: BlockDev>(
         &self,

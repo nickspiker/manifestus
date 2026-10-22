@@ -24,15 +24,11 @@ const PAR_BATCH_THRESHOLD: usize = 4;
 #[cfg(feature = "std")]
 fn write_each<D: BlockDev>(dev: &mut D, blocks: &[(u64, &Block)]) -> Result<()> {
     let mut scratch = ZERO_BLOCK;
-    for &(lba, buf) in blocks {
-        dev.write(lba, buf)?;
-    }
+    crate::block::write_pairs(dev, blocks)?;
     dev.flush()?;
-    for &(lba, buf) in blocks {
-        dev.read(lba, &mut scratch)?;
-        if &scratch != buf {
-            write_one(dev, lba, buf, &mut scratch)?;
-        }
+    for i in crate::block::mismatches(dev, blocks)? {
+        let (lba, buf) = blocks[i];
+        write_one(dev, lba, buf, &mut scratch)?;
     }
     Ok(())
 }
@@ -254,6 +250,17 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
         Err(Error::Corrupt("mirror has no devices".into()))
     }
 
+    /// Read consecutive blocks from the first healthy device, in one transfer where the device can.
+    pub fn read_run(&mut self, lba: u64, out: &mut [Block]) -> Result<()> {
+        if let Some(a) = self.a.as_mut() {
+            return a.read_run(lba, out);
+        }
+        if let Some(b) = self.b.as_mut() {
+            return b.read_run(lba, out);
+        }
+        Err(Error::Corrupt("mirror has no devices".into()))
+    }
+
     pub fn flush(&mut self) -> Result<()> {
         if let Some(a) = self.a.as_mut() {
             a.flush()?;
@@ -314,17 +321,17 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
 /// One device's share of [`Mirror::write_commit`]: run, entry, one flush, then read everything back; a block that reads back wrong gets the single-block rewrite discipline.
 #[cfg(feature = "std")]
 fn commit_one<D: BlockDev>(dev: &mut D, data: &[(u64, &Block)], spine: (u64, &Block)) -> Result<()> {
-    for &(lba, buf) in data {
-        dev.write(lba, buf)?;
-    }
+    crate::block::write_pairs(dev, data)?;
     dev.write(spine.0, spine.1)?;
     dev.flush()?;
     let mut scratch = ZERO_BLOCK;
-    for &(lba, buf) in data.iter().chain(core::iter::once(&spine)) {
-        dev.read(lba, &mut scratch)?;
-        if &scratch != buf {
-            write_one(dev, lba, buf, &mut scratch)?;
-        }
+    for i in crate::block::mismatches(dev, data)? {
+        let (lba, buf) = data[i];
+        write_one(dev, lba, buf, &mut scratch)?;
+    }
+    dev.read(spine.0, &mut scratch)?;
+    if &scratch != spine.1 {
+        write_one(dev, spine.0, spine.1, &mut scratch)?;
     }
     Ok(())
 }
@@ -485,7 +492,12 @@ pub(crate) mod follow {
                 continue;
             }
             let r = match job {
-                Job::Data(blocks) => blocks.iter().try_for_each(|(lba, b)| dev.write(*lba, b)).map(|_| unflushed.extend(blocks)),
+                Job::Data(blocks) => {
+                    let pairs: Vec<(u64, &Block)> = blocks.iter().map(|(l, b)| (*l, b)).collect();
+                    let r = crate::block::write_pairs(&mut dev, &pairs);
+                    drop(pairs);
+                    r.map(|_| unflushed.extend(blocks))
+                }
                 Job::Ordered(lba, block) => settle(&mut dev, &mut unflushed, &mut scratch).and_then(|_| write_one(&mut dev, lba, &block, &mut scratch)),
                 Job::Grow(n) => dev.grow(n),
                 Job::Sync(ack) => {
@@ -510,12 +522,13 @@ pub(crate) mod follow {
             return Ok(());
         }
         dev.flush()?;
-        for (lba, b) in unflushed.drain(..) {
-            dev.read(lba, scratch)?;
-            if *scratch != b {
-                write_one(dev, lba, &b, scratch)?;
-            }
+        let pairs: Vec<(u64, &Block)> = unflushed.iter().map(|(l, b)| (*l, b)).collect();
+        for i in crate::block::mismatches(dev, &pairs)? {
+            let (lba, b) = pairs[i];
+            write_one(dev, lba, b, scratch)?;
         }
+        drop(pairs);
+        unflushed.clear();
         Ok(())
     }
 }

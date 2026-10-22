@@ -229,9 +229,9 @@ fn migrating_survives_kill_nine_with_exact_committed_prefix() {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        // Pseudo-random kill delay 32..160ms from the eagle clock's low oscillation bits.
-        let jitter = eagle_time_oscillations() as u64 % (1 << 7);
-        std::thread::sleep(Duration::from_millis((1 << 5) + jitter));
+        // Pseudo-random kill delay 64..320ms from the eagle clock's low oscillation bits. The window must hold a child's start plus 16 commits for a migration to happen at all: 32..160ms did on fast-fsync Linux and almost never on a Mac (F_FULLFSYNC), where this test failed on every run.
+        let jitter = eagle_time_oscillations() as u64 % (1 << 8);
+        std::thread::sleep(Duration::from_millis((1 << 6) + jitter));
         child.kill().unwrap();
         child.wait().unwrap();
 

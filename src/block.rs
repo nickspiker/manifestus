@@ -20,6 +20,22 @@ pub trait BlockDev: Send {
 
     fn write(&mut self, lba: u64, buf: &Block) -> Result<()>;
 
+    /// Write consecutive blocks starting at `lba`. A device that can move a run in one transfer overrides this (FileDev: one pwrite); the default is one write per block.
+    fn write_run(&mut self, lba: u64, blocks: &[&Block]) -> Result<()> {
+        for (i, b) in blocks.iter().enumerate() {
+            self.write(lba + i as u64, b)?;
+        }
+        Ok(())
+    }
+
+    /// Read consecutive blocks starting at `lba` into `out`. Default: one read per block.
+    fn read_run(&mut self, lba: u64, out: &mut [Block]) -> Result<()> {
+        for (i, b) in out.iter_mut().enumerate() {
+            self.read(lba + i as u64, b)?;
+        }
+        Ok(())
+    }
+
     /// TRIM hint. No-op on host (filesystem's problem); kernel profile forwards to UFS/SD on tract wrap boundaries per RING.md.
     fn discard(&mut self, _lba: u64, _count: u64) -> Result<()> {
         Ok(())
@@ -36,6 +52,42 @@ pub trait BlockDev: Send {
     }
 }
 
+/// Split (lba, block) pairs into runs of consecutive lbas, in order: (first lba, index range into `blocks`). The commit, the follower and the read-backs move each run in one transfer.
+pub fn runs_of(blocks: &[(u64, &Block)]) -> alloc::vec::Vec<(u64, core::ops::Range<usize>)> {
+    let mut out: alloc::vec::Vec<(u64, core::ops::Range<usize>)> = alloc::vec::Vec::new();
+    for (i, &(lba, _)) in blocks.iter().enumerate() {
+        match out.last_mut() {
+            Some((start, r)) if *start + (r.end - r.start) as u64 == lba => r.end = i + 1,
+            _ => out.push((lba, i..i + 1)),
+        }
+    }
+    out
+}
+
+/// Write every pair, a run per transfer.
+pub fn write_pairs<D: BlockDev + ?Sized>(dev: &mut D, blocks: &[(u64, &Block)]) -> Result<()> {
+    for (lba, r) in runs_of(blocks) {
+        let run: alloc::vec::Vec<&Block> = blocks[r].iter().map(|&(_, b)| b).collect();
+        dev.write_run(lba, &run)?;
+    }
+    Ok(())
+}
+
+/// Read every pair's lba back, a run per transfer, and return the indices whose bytes differ from what was written.
+pub fn mismatches<D: BlockDev + ?Sized>(dev: &mut D, blocks: &[(u64, &Block)]) -> Result<alloc::vec::Vec<usize>> {
+    let mut bad = alloc::vec::Vec::new();
+    for (lba, r) in runs_of(blocks) {
+        let mut got = alloc::vec![ZERO_BLOCK; r.end - r.start];
+        dev.read_run(lba, &mut got)?;
+        for (j, g) in got.iter().enumerate() {
+            if g != blocks[r.start + j].1 {
+                bad.push(r.start + j);
+            }
+        }
+    }
+    Ok(bad)
+}
+
 /// Forwarding impl so borrowed devices compose (verified_replicate wraps `&mut A` / `&mut B` in temporary solo Mirrors).
 impl<D: BlockDev + ?Sized> BlockDev for &mut D {
     fn block_count(&self) -> u64 {
@@ -46,6 +98,12 @@ impl<D: BlockDev + ?Sized> BlockDev for &mut D {
     }
     fn write(&mut self, lba: u64, buf: &Block) -> Result<()> {
         (**self).write(lba, buf)
+    }
+    fn write_run(&mut self, lba: u64, blocks: &[&Block]) -> Result<()> {
+        (**self).write_run(lba, blocks)
+    }
+    fn read_run(&mut self, lba: u64, out: &mut [Block]) -> Result<()> {
+        (**self).read_run(lba, out)
     }
     fn discard(&mut self, lba: u64, count: u64) -> Result<()> {
         (**self).discard(lba, count)
