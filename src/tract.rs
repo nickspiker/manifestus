@@ -255,6 +255,21 @@ impl Tract {
         Ok(out)
     }
 
+    /// The second device's copy of tract position `lba` (see [`Mirror::read_alt`]). False when there is none to ask, or the position is staged (it is on no device yet).
+    pub fn read_alt<A: BlockDev, B: BlockDev>(&self, mirror: &mut Mirror<A, B>, lba: u64, buf: &mut Block) -> Result<bool> {
+        if lba >= self.len || self.staged_at(lba).is_some() {
+            return Ok(false);
+        }
+        mirror.read_alt(self.base + lba, buf)
+    }
+
+    /// Rewrite the primary's copy of tract position `lba` with bytes the second device proved good.
+    pub fn repair<A: BlockDev, B: BlockDev>(&self, mirror: &mut Mirror<A, B>, lba: u64, buf: &Block) -> Result<()> {
+        mirror.repair_primary(self.base + lba, buf)?;
+        mirror.emit(crate::events::StorageEvent::ReadRepaired { lba });
+        Ok(())
+    }
+
     /// Plain read of a tract block (callers verify content at their own layer).
     pub fn read<A: BlockDev, B: BlockDev>(
         &self,

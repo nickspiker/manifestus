@@ -246,12 +246,8 @@ impl Hamt {
                                 return Ok(None);
                             }
                             let positions = expand_runs(&runs, size)?;
-                            let value = read_furrows(mirror, tract, key, size, &positions)?;
                             // The whole value against the hash its leaf recorded: a furrow's own seal and owner key cannot tell a stale copy of the same key's furrow from the current one; this can.
-                            if vh.is_some_and(|h| *blake3::hash(&value).as_bytes() != h) {
-                                return Err(Error::Seal);
-                            }
-                            return Ok(Some(value));
+                            return Ok(Some(read_value(mirror, tract, key, size, &positions, vh)?));
                         }
                         TractDoc::Furrow { .. } => {
                             return Err(Error::Corrupt("furrow reached via index walk".into()));
@@ -1361,11 +1357,22 @@ fn read_doc<A: BlockDev, B: BlockDev>(
     if buf == ZERO_BLOCK {
         return Ok(None);
     }
-    let Some(hash) = sealed_hp(&buf) else {
-        return Err(Error::Corrupt(format!("unsealed block at tract lba {lba}")));
+    let bad = match sealed_hp(&buf) {
+        None => Some(Error::Corrupt(format!("unsealed block at tract lba {lba}"))),
+        Some(h) if &h != expected => Some(Error::Seal),
+        Some(_) => None,
     };
-    if &hash != expected {
-        return Err(Error::Seal);
+    if let Some(e) = bad {
+        // The primary's copy is wrong: the second device may hold the right one. Only bytes that hash to what the parent recorded are served, and they heal the primary on the way.
+        let mut alt = ZERO_BLOCK;
+        if tract.read_alt(mirror, lba, &mut alt)? && sealed_hp(&alt).as_ref() == Some(expected) {
+            // Rewrite the primary only when its own copy fails its seal — rot or a tear, damage beyond doubt. A primary holding a DIFFERENT sealed block may be a live block at a reused position behind a stale pointer, and overwriting it from an older second copy would destroy it.
+            if sealed_hp(&buf).is_none() {
+                tract.repair(mirror, lba, &alt)?;
+            }
+            return decode_doc(&alt).map(Some);
+        }
+        return Err(e);
     }
     decode_doc(&buf).map(Some)
 }
@@ -1466,6 +1473,46 @@ fn decode_doc(block: &Block) -> Result<TractDoc> {
     }
 }
 
+/// A value's furrows, assembled and checked (and against `vh` when the leaf recorded it). A value that fails on the primary is read again from the second device; if that copy passes, it is served and every furrow that differed is rewritten on the primary.
+fn read_value<A: BlockDev, B: BlockDev>(
+    mirror: &mut Mirror<A, B>,
+    tract: &Tract,
+    key: &[u8; 32],
+    size: u64,
+    furrows: &[u64],
+    vh: Option<[u8; 32]>,
+) -> Result<Vec<u8>> {
+    let blocks = tract.read_positions(mirror, furrows)?;
+    let first = assemble(&blocks, key, size).and_then(|v| match vh {
+        Some(h) if *blake3::hash(&v).as_bytes() != h => Err(Error::Seal),
+        _ => Ok(v),
+    });
+    let e = match first {
+        Ok(v) => return Ok(v),
+        Err(e @ (Error::Seal | Error::Corrupt(_))) => e,
+        Err(e) => return Err(e),
+    };
+    let mut alt = Vec::with_capacity(furrows.len());
+    for &pos in furrows {
+        let mut b = ZERO_BLOCK;
+        if !tract.read_alt(mirror, pos, &mut b)? {
+            return Err(e);
+        }
+        alt.push(b);
+    }
+    let Ok(value) = assemble(&alt, key, size) else { return Err(e) };
+    if vh.is_some_and(|h| *blake3::hash(&value).as_bytes() != h) {
+        return Err(e);
+    }
+    // Same rule as read_doc: only a primary furrow that fails its own seal is rewritten.
+    for ((&pos, good), bad) in furrows.iter().zip(&alt).zip(&blocks) {
+        if good != bad && sealed_hp(bad).is_none() {
+            tract.repair(mirror, pos, good)?;
+        }
+    }
+    Ok(value)
+}
+
 fn read_furrows<A: BlockDev, B: BlockDev>(
     mirror: &mut Mirror<A, B>,
     tract: &Tract,
@@ -1473,8 +1520,12 @@ fn read_furrows<A: BlockDev, B: BlockDev>(
     size: u64,
     furrows: &[u64],
 ) -> Result<Vec<u8>> {
+    read_value(mirror, tract, key, size, furrows, None)
+}
+
+/// Furrow blocks → the value: each sealed, owned by `key`, in index order, adding up to `size`.
+fn assemble(blocks: &[Block], key: &[u8; 32], size: u64) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(size as usize);
-    let blocks = tract.read_positions(mirror, furrows)?;
     for (i, buf) in blocks.iter().enumerate() {
         if sealed_hp(buf).is_none() {
             return Err(Error::Corrupt(format!("furrow {i} unsealed")));

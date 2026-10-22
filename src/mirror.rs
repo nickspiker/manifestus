@@ -250,6 +250,57 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
         Err(Error::Corrupt("mirror has no devices".into()))
     }
 
+    /// Read `lba` from the SECOND device — the fallback when the primary's copy failed its hash. A follower answers through its queue, after every write queued before it. False when there is no second device.
+    pub fn read_alt(&mut self, lba: u64, buf: &mut Block) -> Result<bool> {
+        #[cfg(feature = "std")]
+        if self.following() {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            self.send(follow::Job::Read(lba, tx));
+            return match rx.recv() {
+                Ok(Some(b)) => {
+                    *buf = *b;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            };
+        }
+        if self.a.is_none() {
+            return Ok(false);
+        }
+        match self.b.as_mut() {
+            Some(b) => b.read(lba, buf).map(|_| true),
+            None => Ok(false),
+        }
+    }
+
+    /// Rewrite the primary's block at `lba` with known-good bytes (a read repair or the scrub). Verified like any write; a primary that cannot take it fails the call.
+    pub fn repair_primary(&mut self, lba: u64, buf: &Block) -> Result<()> {
+        match self.a.as_mut() {
+            Some(a) => write_one(a, lba, buf, &mut self.scratch),
+            None => Ok(()),
+        }
+    }
+
+    /// Rewrite the second device's block at `lba` with known-good bytes (the scrub): through the follower's queue when following.
+    pub fn repair_secondary(&mut self, lba: u64, buf: &Block) -> Result<()> {
+        #[cfg(feature = "std")]
+        if self.following() {
+            self.send(follow::Job::Ordered(lba, Box::new(*buf)));
+            return Ok(());
+        }
+        if self.a.is_none() {
+            return Ok(());
+        }
+        if let Some(b) = self.b.as_mut() {
+            if write_one(b, lba, buf, &mut self.scratch).is_err() {
+                self.b = None;
+                self.degraded = true;
+                self.events.emit(StorageEvent::MirrorDegraded);
+            }
+        }
+        Ok(())
+    }
+
     /// Read consecutive blocks from the first healthy device, in one transfer where the device can.
     pub fn read_run(&mut self, lba: u64, out: &mut [Block]) -> Result<()> {
         if let Some(a) = self.a.as_mut() {
@@ -424,6 +475,8 @@ pub(crate) mod follow {
         /// A single block whose order matters (spine entries, ring and root zeroing, an erase): everything before it is flushed and verified first, then it is written, flushed and verified.
         Ordered(u64, Box<Block>),
         Grow(u64),
+        /// Read one block and answer (None when the device failed it).
+        Read(u64, SyncSender<Option<Box<Block>>>),
         /// Flush what is outstanding and answer.
         Sync(SyncSender<()>),
     }
@@ -485,9 +538,15 @@ pub(crate) mod follow {
         let mut ok = true;
         for job in rx {
             if !ok {
-                // Dropped: keep draining so the writer never blocks on a dead queue; answer syncs.
-                if let Job::Sync(ack) = job {
-                    let _ = ack.send(());
+                // Dropped: keep draining so the writer never blocks on a dead queue; answer syncs and reads.
+                match job {
+                    Job::Sync(ack) => {
+                        let _ = ack.send(());
+                    }
+                    Job::Read(_, reply) => {
+                        let _ = reply.send(None);
+                    }
+                    _ => {}
                 }
                 continue;
             }
@@ -500,6 +559,12 @@ pub(crate) mod follow {
                 }
                 Job::Ordered(lba, block) => settle(&mut dev, &mut unflushed, &mut scratch).and_then(|_| write_one(&mut dev, lba, &block, &mut scratch)),
                 Job::Grow(n) => dev.grow(n),
+                Job::Read(lba, reply) => {
+                    let mut b = Box::new(ZERO_BLOCK);
+                    let r = dev.read(lba, &mut b);
+                    let _ = reply.send(r.is_ok().then_some(b));
+                    Ok(())
+                }
                 Job::Sync(ack) => {
                     let r = settle(&mut dev, &mut unflushed, &mut scratch);
                     let _ = ack.send(());

@@ -288,3 +288,77 @@ fn stale_furrow_is_caught_by_the_value_hash() {
     let got = v.get(&k);
     assert!(matches!(got, Err(manifestus::Error::Seal)), "a spliced value must not be served: {:?}", got.as_ref().map(|o| o.as_ref().map(|b| (b.len(), b[0], b[b.len() - 1]))));
 }
+
+/// Rot on either device heals: a read of a value whose furrow rotted on the primary is served from the second device and rewrites the primary; the idle scrub finds rot on the second device that no read would, and rewrites it from the primary. Afterwards each device alone holds every value.
+#[test]
+fn rot_heals_by_read_and_by_scrub() {
+    use manifestus::{inspect::{decode_tract, TractBlock}, sealed_hp, BlockDev};
+    let dir = TempDir::new().unwrap();
+    let (pa, pb) = paths(&dir, "rot");
+    FileDev::create(&pa, RING + 2048).unwrap();
+    FileDev::create(&pb, RING + 2048).unwrap();
+    let vals: Vec<Vec<u8>> = (0..6u64).map(|i| vec![i as u8 + 1; 40_000]).collect();
+    {
+        let mut v = open_pair(&pa, &pb);
+        for (i, val) in vals.iter().enumerate() {
+            v.put(&key(i as u64), val, 10 + i as i64).unwrap();
+        }
+        v.put(&key(99), b"head", 50).unwrap();
+    }
+    // Furrow 3 of key 0 rots on the primary; furrow 5 of key 1 rots on the second device. One flipped byte each: the seal fails.
+    let furrow_at = |p: &std::path::Path, k: u64, idx: u64| -> u64 {
+        let mut d = FileDev::open(p).unwrap();
+        let mut buf = ZERO_BLOCK;
+        for lba in RING..RING + 2048 {
+            d.read(lba, &mut buf).unwrap();
+            if let Ok((_, TractBlock::Furrow { key: fk, index, .. })) = decode_tract(&buf) {
+                if fk == key(k) && index == idx {
+                    return lba;
+                }
+            }
+        }
+        panic!("furrow not found");
+    };
+    let rot = |p: &std::path::Path, lba: u64| {
+        let mut d = FileDev::open(p).unwrap();
+        let mut buf = ZERO_BLOCK;
+        d.read(lba, &mut buf).unwrap();
+        buf[2000] ^= 0xFF;
+        d.write(lba, &buf).unwrap();
+        d.flush().unwrap();
+    };
+    let sealed = |p: &std::path::Path, lba: u64| {
+        let mut d = FileDev::open(p).unwrap();
+        let mut buf = ZERO_BLOCK;
+        d.read(lba, &mut buf).unwrap();
+        sealed_hp(&buf).is_some()
+    };
+    let on_a = furrow_at(&pa, 0, 3);
+    let on_b = furrow_at(&pb, 1, 5);
+    rot(&pa, on_a);
+    rot(&pb, on_b);
+
+    let mut v = open_pair(&pa, &pb);
+    assert_eq!(v.get(&key(0)).unwrap(), Some(vals[0].clone()), "served from the second device");
+    let mut total = manifestus::Scrubbed::default();
+    loop {
+        let s = v.scrub_step(64).unwrap();
+        total.checked += s.checked;
+        total.repaired += s.repaired;
+        total.lost += s.lost;
+        if s.lap_done {
+            break;
+        }
+    }
+    assert_eq!(total.lost, 0, "nothing was bad on both devices");
+    assert!(total.repaired >= 1, "the scrub healed the second device's rot: {total:?}");
+    drop(v);
+    assert!(sealed(&pa, on_a), "the read rewrote the primary's rotten furrow");
+    assert!(sealed(&pb, on_b), "the scrub rewrote the second device's rotten furrow");
+    for p in [&pa, &pb] {
+        let mut v = open_solo(p);
+        for (i, val) in vals.iter().enumerate() {
+            assert_eq!(v.get(&key(i as u64)).unwrap().as_ref(), Some(val), "{p:?}: value {i} whole on its own");
+        }
+    }
+}

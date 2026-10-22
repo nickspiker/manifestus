@@ -301,6 +301,21 @@ pub struct Vault<A: BlockDev, B: BlockDev> {
     map_off: bool,
     /// Whether this handle's open read the live map (rather than walking the index).
     from_map: bool,
+    /// Where the idle scrub resumes: the next tract position it checks.
+    scrub_at: u64,
+}
+
+/// What one [`Vault::scrub_step`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Scrubbed {
+    /// Live positions checked on both devices.
+    pub checked: u64,
+    /// Blocks rewritten from the other device.
+    pub repaired: u64,
+    /// Blocks bad on both devices — nothing to heal them from.
+    pub lost: u64,
+    /// The step reached the end of the tract; the next starts over.
+    pub lap_done: bool,
 }
 
 /// Where the committed live map's blocks are (see [`crate::livemap`]).
@@ -470,6 +485,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             lmap: MapLayout::whole(),
             map_off: false,
             from_map: false,
+            scrub_at: 0,
         })
     }
 
@@ -577,6 +593,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             lmap: MapLayout::whole(),
             map_off: false,
             from_map: false,
+            scrub_at: 0,
         })
     }
 
@@ -685,7 +702,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                     tract.reap = derive_reap(tract.plow, tract.len, &live);
                     let fences = ring.recent_fences(FENCE_K)?;
                     tract.fence_limit = fence_from(&fences);
-                    let mut v = Self { ring, tract, hamt, live, root, policy, pending_reap: None, lmap, map_off: false, from_map: true };
+                    let mut v = Self { ring, tract, hamt, live, root, policy, pending_reap: None, lmap, map_off: false, from_map: true, scrub_at: 0 };
                     v.live.dirty.clear();
                     v.probe_wedge(head.eagle_time + 1, true);
                     return Ok(v);
@@ -734,6 +751,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             lmap: MapLayout::whole(),
             map_off: false,
             from_map: false,
+            scrub_at: 0,
         };
         // REPAIR COMMIT FIRST (field 2026-08-25, the boot that re-pruned the same 84 danglings forever): every rescue's opening move is rolling the index back to the COMMITTED head (the survivor law), so prunes still in RAM evaporate the moment the wedge probe below fires — and a broken vault is USUALLY wedge-shaped, which is why the repair open kept "succeeding" while the disk never changed. Commit the pruned index NOW so the pruned head is the one every later rollback restores. A refused commit (a broken vault is usually FULL-shaped too) gets one grow — and because grow is a barrier that reloads the committed (unpruned) head, the recorded routes are re-pruned before the retry. If even that fails, skip the probe: the prunes then survive in RAM until the session's first successful commit lands them.
         let mut probe_allowed = true;
@@ -1520,6 +1538,52 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         unrouted.sort_unstable();
         missing.sort_unstable();
         Ok((unrouted, missing))
+    }
+
+    /// THE IDLE SCRUB (2026-10-22): check up to `budget` live blocks on BOTH devices, resuming where the last step stopped, and heal whichever side is bad from the side that is good — a block failing its own seal is the bad one; when both are sealed but differ, the primary wins (it is the copy commits are acknowledged on). Reads heal the primary as they go; this is what finds a quietly rotting second copy before it is needed, and the primary's cold blocks nothing reads.
+    /// An embedder runs it at its idle edge, a step at a time. Without a second device it only reports.
+    pub fn scrub_step(&mut self, budget: u64) -> Result<Scrubbed> {
+        #[cfg(feature = "std")]
+        self.ring.mirror().sync_follower();
+        let mut out = Scrubbed::default();
+        let len = self.tract.len;
+        let mut pos = self.scrub_at;
+        while out.checked < budget {
+            if pos >= len {
+                out.lap_done = true;
+                pos = 0;
+                break;
+            }
+            if !self.live.is_referenced(pos) {
+                pos += 1;
+                continue;
+            }
+            let (mut a, mut b) = (ZERO_BLOCK, ZERO_BLOCK);
+            self.tract.read(self.ring.mirror(), pos, &mut a)?;
+            let has_b = self.tract.read_alt(self.ring.mirror(), pos, &mut b)?;
+            out.checked += 1;
+            if has_b && a != b {
+                let a_ok = crate::tract::sealed_hp(&a).is_some();
+                let b_ok = crate::tract::sealed_hp(&b).is_some();
+                let lba = self.tract.base + pos;
+                if a_ok {
+                    self.ring.mirror().repair_secondary(lba, &a)?;
+                    self.ring.mirror().emit(crate::events::StorageEvent::ScrubRepaired { lba: pos, primary: false });
+                    out.repaired += 1;
+                } else if b_ok {
+                    self.ring.mirror().repair_primary(lba, &b)?;
+                    self.ring.mirror().emit(crate::events::StorageEvent::ScrubRepaired { lba: pos, primary: true });
+                    out.repaired += 1;
+                } else {
+                    out.lost += 1;
+                }
+            } else if crate::tract::sealed_hp(&a).is_none() {
+                out.lost += 1;
+            }
+            pos += 1;
+        }
+        self.scrub_at = pos;
+        Ok(out)
     }
 
     /// TEST AID — whether this handle opened from the live map rather than by walking the index.

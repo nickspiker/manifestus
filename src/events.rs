@@ -25,6 +25,10 @@ pub enum StorageEvent {
     TornCommit { gen: u64 },
     /// The head named a live map that did not load (damaged, or for another tract length); the vault opened by walking the index instead and will write the map whole at its next commit.
     LiveMapFallback,
+    /// A block failed its hash on the primary, the second device held it whole, and the primary was rewritten from it. (lba)
+    ReadRepaired { lba: u64 },
+    /// The idle scrub found a block bad on one device and rewrote it from the other. (lba, whether the primary was the bad side)
+    ScrubRepaired { lba: u64, primary: bool },
 }
 
 /// The injected sink. Implementations must be cheap and non-blocking from the engine's point of view — buffering and durability are the embedder's problem, not the engine's.
