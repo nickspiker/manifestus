@@ -1802,8 +1802,21 @@ fn copy_tail<S: BlockDev, D: BlockDev>(
     Ok(Some(out))
 }
 
-/// Highest valid generation in one spine residence (full N-read scan — cheaper and simpler than a solo bisect, and replication is rare).
+/// Highest valid generation in one spine residence: the ring's own head search (a bisect, ~9 reads, branching both ways around a corrupt slot) on this device alone. Replicate runs at every open, where the full 256-slot scan of both devices was its largest cost.
 fn best_gen<D: BlockDev>(dev: &mut D, n: u64, ring_log2: u8, base: u64) -> Result<(Option<u64>, u64)> {
+    if dev.block_count() >= base + n {
+        let solo: Mirror<&mut D, &mut D> = Mirror::from_parts(Some(dev), None)?;
+        let ring = Ring::open_at(solo, ring_log2, base)?;
+        return Ok(match ring.head() {
+            Some(e) => (Some(e.gen), e.gen & (n - 1)),
+            None => (None, 0),
+        });
+    }
+    best_gen_scan(dev, n, ring_log2, base)
+}
+
+/// The full scan — for a device too short to hold a whole ring.
+fn best_gen_scan<D: BlockDev>(dev: &mut D, n: u64, ring_log2: u8, base: u64) -> Result<(Option<u64>, u64)> {
     use crate::ring::{classify, Classified};
     let mut best: Option<u64> = None;
     let mut slot_of_best = 0u64;
