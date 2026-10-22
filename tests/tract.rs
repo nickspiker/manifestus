@@ -29,7 +29,7 @@ fn mk(dir: &TempDir, name: &str, blocks: u64) -> Mirror<FileDev, FileDev> {
 }
 
 fn tract(len: u64) -> Tract {
-    Tract { base: 0, len, plow: 0, reap: 0, fence_limit: None }
+    Tract::new(0, len, 0, 0, None)
 }
 
 #[test]

@@ -63,6 +63,20 @@ pub struct Reloc {
     pub to: u64,
 }
 
+/// Appends held in RAM until the commit that references them (group commit, 2026-10-22): their positions are taken at append time — fence, lap guard and placement exactly as before — but the bytes reach the devices in one contiguous write per device at [`Tract::write_staged`], just before the spine entry. A put used to cost a flush pair per leaf, per furrow run and per index node; a commit now costs one data write and one spine write per device, whatever it holds.
+/// Staged blocks are provisional like any uncommitted append: a crash loses them, and the committed head never referenced them. Reads of a staged position are served from here, so the batch sees its own work.
+#[derive(Default)]
+pub struct Staging {
+    /// Off (the default) writes every append through at once — the behaviour bare tracts in tests and tools rely on. The vault turns it on.
+    pub enabled: bool,
+    /// Monotone plow position of the first staged block; the rest follow contiguously.
+    start: u64,
+    blocks: Vec<Block>,
+}
+
+/// Staged bytes past this are written out early (data only — no spine entry references them yet, so the early write is as safe as the late one). 16 MiB keeps a large batch's RAM bounded.
+const STAGE_MAX_BLOCKS: usize = 1 << 12;
+
 /// Two-cursor state for one tract. Pure state — the mirror is borrowed per operation so the spine ring (which owns the mirror's lower blocks) and the tract can interleave.
 pub struct Tract {
     /// Device lba where the tract begins (= N on host; G#C0000 on ferros).
@@ -75,9 +89,58 @@ pub struct Tract {
     pub reap: u64,
     /// Absolute append budget (monotone domain). Recomputed by the vault from the last k spine entries: min(reap_i + len_i). None = unfenced (genesis era, fewer than k commits).
     pub fence_limit: Option<u64>,
+    /// Appends awaiting the commit's single write (see [`Staging`]).
+    pub staging: Staging,
+}
+
+impl Staging {
+    /// Staging on: the vault's form.
+    pub fn on() -> Self {
+        Self { enabled: true, ..Self::default() }
+    }
 }
 
 impl Tract {
+    /// A tract with staging off: appends write through, as a bare tract always has.
+    pub fn new(base: u64, len: u64, plow: u64, reap: u64, fence_limit: Option<u64>) -> Self {
+        Self { base, len, plow, reap, fence_limit, staging: Staging::default() }
+    }
+
+    /// The staged block at tract position `pos`, if one is staged there. Staged blocks are plow-contiguous and never span more than a lap (an append past the clean space is refused), so at most one matches.
+    fn staged_at(&self, pos: u64) -> Option<usize> {
+        let n = self.staging.blocks.len() as u64;
+        if n == 0 {
+            return None;
+        }
+        let off = (pos + self.len - self.staging.start % self.len) % self.len;
+        (off < n).then_some(off as usize)
+    }
+
+    /// Write every staged block to the devices — one contiguous run per device (two at a ring wrap), read back and verified — and clear the stage. The vault calls this between the index flush and the spine entry: data before the commit that names it.
+    pub fn write_staged<A: BlockDev, B: BlockDev>(&mut self, mirror: &mut Mirror<A, B>) -> Result<()> {
+        if self.staging.blocks.is_empty() {
+            return Ok(());
+        }
+        let start = self.staging.start;
+        let blocks = core::mem::take(&mut self.staging.blocks);
+        let batch: Vec<(u64, &Block)> = blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (self.base + (start + i as u64) % self.len, b))
+            .collect();
+        mirror.write_verified_batch(&batch)
+    }
+
+    /// Drop the stage unwritten — for a barrier that resets the plow (its positions are about to be reused) or a commit that failed (nothing may point at them).
+    pub fn discard_staged(&mut self) {
+        self.staging.blocks.clear();
+    }
+
+    /// Blocks staged and not yet written.
+    pub fn staged_blocks(&self) -> usize {
+        self.staging.blocks.len()
+    }
+
     pub fn position(&self) -> u64 {
         self.plow % self.len
     }
@@ -116,14 +179,25 @@ impl Tract {
                 return Err(Error::TractFull);
             }
         }
-        let batch: Vec<(u64, &Block)> = blocks
-            .iter()
-            .enumerate()
-            .map(|(i, b)| (self.base + (self.plow + i as u64) % self.len, b))
-            .collect();
-        mirror.write_verified_batch(&batch)?;
+        if self.staging.enabled {
+            if self.staging.blocks.is_empty() {
+                self.staging.start = self.plow;
+            }
+            debug_assert_eq!(self.staging.start + self.staging.blocks.len() as u64, self.plow, "staged appends are plow-contiguous");
+            self.staging.blocks.extend_from_slice(blocks);
+        } else {
+            let batch: Vec<(u64, &Block)> = blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (self.base + (self.plow + i as u64) % self.len, b))
+                .collect();
+            mirror.write_verified_batch(&batch)?;
+        }
         let placed = (0..n).map(|i| (self.plow + i) % self.len).collect();
         self.plow += n;
+        if self.staging.blocks.len() >= STAGE_MAX_BLOCKS {
+            self.write_staged(mirror)?;
+        }
         Ok(placed)
     }
 
@@ -135,6 +209,10 @@ impl Tract {
     ) -> Result<()> {
         if lba >= self.len {
             return Err(Error::Bounds(lba));
+        }
+        if let Some(i) = self.staged_at(lba) {
+            self.staging.blocks[i] = crate::block::ZERO_BLOCK;
+            return Ok(());
         }
         mirror.write_verified(self.base + lba, &crate::block::ZERO_BLOCK)
     }
@@ -148,6 +226,10 @@ impl Tract {
     ) -> Result<()> {
         if lba >= self.len {
             return Err(Error::Bounds(lba));
+        }
+        if let Some(i) = self.staged_at(lba) {
+            buf.copy_from_slice(&self.staging.blocks[i]);
+            return Ok(());
         }
         mirror.read(self.base + lba, buf)
     }

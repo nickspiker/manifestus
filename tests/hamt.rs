@@ -40,7 +40,7 @@ fn mk(dir: &TempDir, name: &str, blocks: u64) -> (Mirror<FileDev, FileDev>, Trac
     let b = FileDev::create(&dir.path().join(format!("{name}-b.bin")), blocks).unwrap();
     (
         Mirror::new(a, b),
-        Tract { base: 0, len: blocks, plow: 0, reap: 0, fence_limit: None },
+        Tract::new(0, blocks, 0, 0, None),
     )
 }
 

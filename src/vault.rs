@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::hamt::{DanglingPointer, Delta, Hamt, StalePointer};
 use crate::mirror::Mirror;
 use crate::ring::{any_sealed_block, append_root, read_root, zero_ring, zero_ring_at, Ring, RootEntry, SpineEntry, FENCE_K, ROOT_SLOTS};
-use crate::tract::{Liveness, Tract};
+use crate::tract::{Liveness, Staging, Tract};
 use alloc::{format, vec::Vec};
 use hashbrown::HashMap;
 
@@ -85,6 +85,11 @@ impl Liveness for LiveSet {
 pub struct RepairReport {
     pub stale: Vec<StalePointer>,
     pub dangling: Vec<DanglingPointer>,
+}
+
+/// The vault's tracts stage their appends for the commit's single write (see [`Staging`]).
+fn staged() -> Staging {
+    Staging::on()
 }
 
 /// Proactive reap trigger: dead > 25% of the tract → one window after the commit.
@@ -207,6 +212,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             plow: 0,
             reap: 0,
             fence_limit: None,
+            staging: staged(),
         };
         Ok(Self {
             ring,
@@ -308,6 +314,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             plow: 0,
             reap: 0,
             fence_limit: None,
+            staging: staged(),
         };
         Ok(Self {
             ring,
@@ -385,6 +392,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             plow: head.plow,
             reap: 0, // derived below, once the live set is known
             fence_limit: None,
+            staging: staged(),
         };
         // Host-only truncation guard: the device must hold the committed geometry. The fs is a witness, never the authority.
         let need = tract_base + head.tract_blocks;
@@ -727,6 +735,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             .ok_or_else(|| Error::Corrupt("grow on pre-genesis vault".into()))?
             .clone();
         self.hamt = Hamt::from_root(head.hamt_hash, head.hamt_lba);
+        // The plow goes back to the head's: staged appends sit at positions about to be reused, and nothing committed names them.
+        self.tract.discard_staged();
         self.tract.plow = head.plow;
         self.pending_reap = None;
         // TREE-ONLY rewalk, the open's own (2026-09-12): nodes and leaves read and verified, furrows and extent runs marked live by position unread.
@@ -763,6 +773,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             return Ok(());
         }
         let need = self.tract.base + new_tract_blocks;
+        // The repaired index rides across this grow, so whatever it staged must reach the devices at the positions it was given — before the realign moves the plow.
+        self.tract.write_staged(self.ring.mirror())?;
         self.ring.mirror().grow(need)?;
         // The realign below re-derives the reap from scratch; a staged window's cursor would overwrite it at the commit.
         self.pending_reap = None;
@@ -785,11 +797,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 hamt.flush(ring.mirror(), tract, live)
             };
             match r {
-                Ok(x) => {
-                    let Self { hamt, live, .. } = self;
-                    live.apply(hamt.take_delta());
-                    break x;
-                }
+                Ok(x) => break x,
                 Err(Error::Fenced(_)) if attempts <= FENCE_K + 2 => {
                     attempts += 1;
                     self.append_heartbeat(now)?;
@@ -798,6 +806,18 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 Err(e) => return Err(e),
             }
         };
+        // Data before the entry that names it: everything this commit appended, in one write per device. A failed write leaves the RAM index pointing at bytes no device holds, so it goes back to the committed head with the stage and the delta — the caller's batch still holds its items.
+        if let Err(e) = self.tract.write_staged(self.ring.mirror()) {
+            self.tract.discard_staged();
+            let head = self.ring.head().ok_or_else(|| Error::Corrupt("commit on pre-genesis vault".into()))?;
+            self.hamt = Hamt::from_root(head.hamt_hash, head.hamt_lba);
+            self.pending_reap = None;
+            return Err(e);
+        }
+        {
+            let Self { hamt, live, .. } = self;
+            live.apply(hamt.take_delta());
+        }
         // The staged reap retires its window only now: the flush above landed in clean space that still excluded the window's originals, and the entry below records the advanced cursor.
         if let Some(r) = self.pending_reap.take() {
             self.tract.reap = r;
@@ -1264,13 +1284,7 @@ fn replicate_into<S: BlockDev, D: BlockDev>(
         let Some(head) = ring.head().cloned() else {
             return Ok(out);
         };
-        let tract = Tract {
-            base: layout.tract_base,
-            len: head.tract_blocks,
-            plow: head.plow,
-            reap: head.reap.unwrap_or(head.plow),
-            fence_limit: None,
-        };
+        let tract = Tract::new(layout.tract_base, head.tract_blocks, head.plow, head.reap.unwrap_or(head.plow), None);
         let mut hamt = Hamt::from_root(head.hamt_hash, head.hamt_lba);
         let mut live = Vec::new();
         hamt.walk_live(ring.mirror(), &tract, &mut live)?;
