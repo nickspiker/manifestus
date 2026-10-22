@@ -91,6 +91,22 @@ pub struct RepairReport {
 /// Window size scales with the tract (len/64, floor 16) so huge values fragment into at most ~64 runs crossing a full lap — far under the extent leaf's capacity.
 const REAP_WINDOW_MIN: u64 = 1 << 4;
 
+/// The idle-edge reclaim's window ceiling (1 MiB of blocks): small enough that an op arriving mid-step barely waits, large enough that a lap is a few hundred steps.
+const RECLAIM_WINDOW_MAX: u64 = 1 << 8;
+
+/// What one [`Vault::reclaim_ahead`] step found or did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reclaim {
+    /// Clean space is at target and dead space under the inline trigger: nothing to do.
+    Comfortable,
+    /// One window reaped and committed; call again while still idle.
+    Reaped,
+    /// Short of clean space with more than three quarters live — reaping cannot pay its way, growth is the honest fix, and the choice is the embedder's.
+    LiveHeavy,
+    /// Short, but no window can stage right now (clean or fence too tight); the next commit changes that.
+    Stuck,
+}
+
 /// The engine's physique for a stats page: block-denominated, display-grade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VaultStats {
@@ -119,6 +135,9 @@ pub struct Vault<A: BlockDev, B: BlockDev> {
     root: Option<RootEntry>,
     /// What delete physically does (see [`crate::DeletePolicy`]) — a required open parameter, stored for the life of the handle.
     policy: crate::DeletePolicy,
+    /// A reaped window awaiting its retiring commit: the cursor value the reap reached, held back from `tract.reap` until that commit's flush has landed.
+    /// The window's originals are what the COMMITTED head still references, so counting them as clean before the retiring entry exists let the flush plow straight into them whenever the fence was waived (rescue) — the lap guard caught it, which is the confession Emma's phone logged as "LIVE-LAP AVERTED at lba 19" inside a 3.3 s commit, and the TractFull it raised sent the put into a full grow barrier (fuzz repro 2026-10-21).
+    pending_reap: Option<u64>,
 }
 
 impl<A: BlockDev, B: BlockDev> Vault<A, B> {
@@ -196,6 +215,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             live: LiveSet::default(),
             root: None,
             policy,
+            pending_reap: None,
         })
     }
 
@@ -296,6 +316,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             live: LiveSet::default(),
             root: Some(root),
             policy,
+            pending_reap: None,
         })
     }
 
@@ -411,6 +432,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             live,
             root,
             policy,
+            pending_reap: None,
         };
         // REPAIR COMMIT FIRST (field 2026-08-25, the boot that re-pruned the same 84 danglings forever): every rescue's opening move is rolling the index back to the COMMITTED head (the survivor law), so prunes still in RAM evaporate the moment the wedge probe below fires — and a broken vault is USUALLY wedge-shaped, which is why the repair open kept "succeeding" while the disk never changed. Commit the pruned index NOW so the pruned head is the one every later rollback restores. A refused commit (a broken vault is usually FULL-shaped too) gets one grow — and because grow is a barrier that reloads the committed (unpruned) head, the recorded routes are re-pruned before the retry. If even that fails, skip the probe: the prunes then survive in RAM until the session's first successful commit lands them.
         let mut probe_allowed = true;
@@ -484,18 +506,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     }
 
     pub fn put(&mut self, key: &[u8; 32], value: &[u8], now: i64) -> Result<()> {
-        if self.holds_committed(key, value)? {
-            return Ok(());
-        }
-        self.put_no_commit(key, value, now)?;
-        // A commit whose FLUSH finds no room surfaces TractFull raw (grow inside commit would discard the very state being flushed). We still hold the item, so the verdict is ours: grow — a barrier that reloads the committed head — and replay from pristine.
-        if let Err(Error::TractFull) = self.commit(now) {
-            self.grow(self.tract.len * 2, now)?;
-            self.put_no_commit(key, value, now)?;
-            self.commit(now)?;
-        }
-        self.maybe_reap(now)?;
-        Ok(())
+        // A one-entry batch: the identical-overwrite skip, the ladder, and the grow-and-replay law (a commit whose FLUSH finds no room surfaces TractFull raw; we still hold the item, so the barrier grows and the item replays from pristine) all live in apply_batch.
+        self.apply_batch(&[(key, Some(value))], now)
     }
 
     /// The put ladder WITHOUT the final commit — the entry sits provisional in the arena until the next [`commit`](Self::commit) (which [`put`](Self::put) and [`put_batch`](Self::put_batch) supply). A Fenced retry still commits mid-ladder (that IS how the fence rises), so a tight window degrades toward commit-per-write, never past it.
@@ -513,17 +525,11 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 Ok(()) => return Ok(()),                Err(Error::Fenced(_)) => {
                     // Slides old entries out of the K-window → fence rises. A commit that is ITSELF fenced past the heartbeat ladder is the terminal deadlock — the rescue is the exit, but ONLY against a pristine index: the field's 214 lost blocks (2026-08-24) were relocations whose repoint descents hunted pointers thru THIS put's own half-mutated arena and missed silently. Roll the in-flight put back to the committed root (its provisional appends become orphans a later window reaps), rescue clean, and let the loop retry the put from scratch.
                     if let Err(Error::Fenced(_)) = self.commit(now) {
-                        let (h, l) = {
-                            let head = self.ring.head().ok_or_else(|| {
-                                Error::Corrupt("rescue on pre-genesis vault".into())
-                            })?;
-                            (head.hamt_hash, head.hamt_lba)
-                        };
-                        self.hamt = Hamt::from_root(h, l);
+                        self.rollback_to_head(now, true)?;
                         match self.rescue(now) {
                             Ok(_) => {}
                             Err(Error::TractFull) if !grew => {
-                                self.grow(self.tract.len * 2, now)?;
+                                self.grow_in_ladder(now)?;
                                 grew = true;
                             }
                             Err(e) => return Err(e),
@@ -533,17 +539,11 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 Err(Error::TractFull) => {
                     // The ordinary reap first; when IT can't move (fence-clamped or airlocked), the same rescue ladder as the Fenced arm — physical fullness and fence exhaustion are one disease at the terminal stage, and this arm returning bare TractFull was the last way churn could still die (the new-law test caught it).
                     if !self.reap_one_window(now)? {
-                        let (h, l) = {
-                            let head = self.ring.head().ok_or_else(|| {
-                                Error::Corrupt("rescue on pre-genesis vault".into())
-                            })?;
-                            (head.hamt_hash, head.hamt_lba)
-                        };
-                        self.hamt = Hamt::from_root(h, l);
+                        self.rollback_to_head(now, false)?;
                         match self.rescue(now) {
                             Ok(_) => {}
                             Err(Error::TractFull) if !grew => {
-                                self.grow(self.tract.len * 2, now)?;
+                                self.grow_in_ladder(now)?;
                                 grew = true;
                             }
                             Err(e) => return Err(e),
@@ -556,51 +556,51 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         if grew {
             return Err(Error::TractFull);
         }
-        self.grow(self.tract.len * 2, now)?;
+        self.grow_in_ladder(now)?;
         grew = true;
         }
     }
 
     /// GROUP COMMIT: insert/overwrite MANY entries, durable on return, under ONE spine commit instead of one per write. The commit's flush is the dominant per-op cost in the field (~900ms per put on a busy BTRFS desktop, SIZE-INDEPENDENT — 53 bytes cost the same as 22KB, 2026-08-21), and callers arrive in bursts (kete's librarian drains a queue): N puts under one commit turn N flushes into one. Failure is all-or-nothing from the caller's view — no batch entry is spine-referenced until the single commit lands (a mid-batch Fenced heartbeat-commit can land earlier entries early, which is harmless: durability sooner, never later).
     pub fn put_batch(&mut self, items: &[(&[u8; 32], &[u8])], now: i64) -> Result<()> {
-        if items.is_empty() {
-            return Ok(());
+        // apply_batch IS this with every op a put: one item pass, one ladder, one replay law.
+        // The old upfront identical-overwrite filter checked every entry against the committed index before any landed, so a key written twice whose LATER value matched the committed one dropped that write and left the earlier value in place.
+        let ops: Vec<(&[u8; 32], Option<&[u8]>)> = items.iter().map(|&(key, value)| (key, Some(value))).collect();
+        self.apply_batch(&ops, now)
+    }
+
+    /// The put ladder's own grow — a barrier that reloads the committed head and discards the arena, so it may run only while the arena holds nothing but this put's failed attempts.
+    /// With earlier batch entries still uncommitted it surfaces TractFull instead: the batch callers grow and replay every entry they hold, where this grow would have dropped them while the batch reported success.
+    fn grow_in_ladder(&mut self, now: i64) -> Result<()> {
+        if self.hamt.has_uncommitted() {
+            return Err(Error::TractFull);
         }
-        // The identical-overwrite skip, batch form: an all-skipped batch commits nothing at all.
-        let mut fresh: Vec<(&[u8; 32], &[u8])> = Vec::with_capacity(items.len());
-        for &(key, value) in items {
-            if !self.holds_committed(key, value)? {
-                fresh.push((key, value));
+        self.grow(self.tract.len * 2, now)
+    }
+
+    /// Roll the in-flight index back to the committed head so the rescue works against a pristine index — but NEVER over uncommitted batch work.
+    /// Earlier entries of the same batch live only in the arena: discarding them here while apply_batch went on to report success was silent loss (fuzz repro 2026-10-21: an entry the batch acknowledged read back absent).
+    /// Land them first; when that commit cannot land (or `commit_failed` says one just didn't), surface TractFull, whose caller law (put_batch/apply_batch replay, kete's apply_growing) is grow-and-replay with every item still in hand.
+    fn rollback_to_head(&mut self, now: i64, commit_failed: bool) -> Result<()> {
+        if self.hamt.has_uncommitted() {
+            if commit_failed {
+                return Err(Error::TractFull);
+            }
+            match self.commit(now) {
+                Ok(()) => {}
+                Err(Error::TractFull) | Err(Error::Fenced(_)) => return Err(Error::TractFull),
+                Err(e) => return Err(e),
             }
         }
-        if fresh.is_empty() {
-            return Ok(());
-        }
-        let items = &fresh[..];
-        for (key, value) in items {
-            self.put_no_commit(key, value, now)?;
-        }
-        // Same replay law as put(): commit's TractFull means grow-the-barrier and re-run the whole batch — we still hold every item, and the barrier reset makes the replay start pristine.
-        // FENCED at the batch commit (field 2026-09-14, Esme's phone: "async message persist failed: rollback fence reached at plow 232230" — STORAGE DEGRADED for five seconds until the next persist happened to reap): the per-item ladder in put_no_commit rescues a fenced PUT, but the batch's final commit had only the TractFull arm, so a commit fenced past its heartbeat ladder surfaced raw. Same exit as put()'s Fenced arm: reload the committed head (the provisional arena is discarded, we still hold every item), rescue, replay, commit.
-        match self.commit(now) {
-            Ok(()) => {}
-            Err(Error::TractFull) => {
-                self.grow(self.tract.len * 2, now)?;
-                for (key, value) in items {
-                    self.put_no_commit(key, value, now)?;
-                }
-                self.commit(now)?;
-            }
-            Err(Error::Fenced(_)) => {
-                self.rescue_from_committed_head(now)?;
-                for (key, value) in items {
-                    self.put_no_commit(key, value, now)?;
-                }
-                self.commit(now)?;
-            }
-            Err(e) => return Err(e),
-        }
-        self.maybe_reap(now)?;
+        let (h, l) = {
+            let head = self
+                .ring
+                .head()
+                .ok_or_else(|| Error::Corrupt("rescue on pre-genesis vault".into()))?;
+            (head.hamt_hash, head.hamt_lba)
+        };
+        self.hamt = Hamt::from_root(h, l);
+        self.pending_reap = None;
         Ok(())
     }
 
@@ -614,6 +614,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             (head.hamt_hash, head.hamt_lba)
         };
         self.hamt = Hamt::from_root(h, l);
+        // A staged reap belongs to the arena just discarded: its relocations are gone, so its window must stay occupied.
+        self.pending_reap = None;
         match self.rescue(now) {
             Ok(_) => Ok(()),
             Err(Error::TractFull) => self.grow(self.tract.len * 2, now),
@@ -626,6 +628,43 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         if items.is_empty() {
             return Ok(());
         }
+        // An entry's ladder that cannot land without discarding earlier entries says TractFull: grow (the barrier drops the arena) and replay the whole batch — the same law as the commit arm below.
+        let dirty = match self.apply_items(items, now) {
+            Ok(d) => d,
+            Err(Error::TractFull) => {
+                self.grow(self.tract.len * 2, now)?;
+                self.apply_items(items, now)?;
+                true
+            }
+            Err(e) => return Err(e),
+        };
+        if !dirty {
+            return Ok(());
+        }
+        // The replay law: commit's TractFull means grow-the-barrier (reloads the committed head, arena pristine) and re-run the whole batch — holds_committed skips whatever a mid-ladder commit already landed; a FENCED commit takes the rescue exit and replays the same way.
+        let replay = match self.commit(now) {
+            Ok(()) => false,
+            Err(Error::TractFull) => {
+                self.grow(self.tract.len * 2, now)?;
+                true
+            }
+            Err(Error::Fenced(_)) => {
+                self.rescue_from_committed_head(now)?;
+                true
+            }
+            Err(e) => return Err(e),
+        };
+        if replay {
+            self.apply_items(items, now)?;
+            self.commit(now)?;
+        }
+        self.maybe_reap(now)?;
+        Ok(())
+    }
+
+    /// apply_batch's item pass, provisional (no final commit): every op in order, puts skipped when already committed, deletes skipped when absent — so a replay after a barrier re-lands exactly what the barrier dropped.
+    /// Returns whether anything changed.
+    fn apply_items(&mut self, items: &[(&[u8; 32], Option<&[u8]>)], now: i64) -> Result<bool> {
         let mut dirty = false;
         for &(key, value) in items {
             match value {
@@ -653,40 +692,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 }
             }
         }
-        if !dirty {
-            return Ok(());
-        }
-        // Same replay law as put_batch: commit's TractFull means grow-the-barrier (reloads the committed head, arena pristine) and re-run the whole batch — holds_committed skips whatever a mid-ladder commit already landed; a FENCED commit takes the rescue exit and replays the same way.
-        let replay = match self.commit(now) {
-            Ok(()) => false,
-            Err(Error::TractFull) => {
-                self.grow(self.tract.len * 2, now)?;
-                true
-            }
-            Err(Error::Fenced(_)) => {
-                self.rescue_from_committed_head(now)?;
-                true
-            }
-            Err(e) => return Err(e),
-        };
-        if replay {
-            for &(key, value) in items {
-                match value {
-                    Some(v) => {
-                        if !self.holds_committed(key, v)? {
-                            self.put_no_commit(key, v, now)?;
-                        }
-                    }
-                    None => {
-                        let Self { ring, tract, hamt, policy, .. } = self;
-                        hamt.delete(ring.mirror(), tract, key, *policy)?;
-                    }
-                }
-            }
-            self.commit(now)?;
-        }
-        self.maybe_reap(now)?;
-        Ok(())
+        Ok(dirty)
     }
 
     /// Delete, durable on return. Returns false if the key was absent.
@@ -722,14 +728,22 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             .clone();
         self.hamt = Hamt::from_root(head.hamt_hash, head.hamt_lba);
         self.tract.plow = head.plow;
+        self.pending_reap = None;
+        // TREE-ONLY rewalk, the open's own (2026-09-12): nodes and leaves read and verified, furrows and extent runs marked live by position unread.
+        // The full walk read and hashed every data block of the vault — most likely the bulk of the field's 3.3 s and 5.7 s single-chunk commits on a phone holding hundreds of MB of attachments (2026-10-21), a grow the put ladder ran inside the caller's commit.
         let mut live_blocks = Vec::new();
+        let mut referenced = Vec::new();
+        let mut stale = Vec::new();
         {
             let Self { ring, tract, hamt, .. } = self;
-            hamt.walk_live(ring.mirror(), tract, &mut live_blocks)?;
+            hamt.walk_tree_collect(ring.mirror(), tract, &mut live_blocks, &mut referenced, &mut stale)?;
         }
         self.live = LiveSet::default();
         for (lba, hp) in live_blocks {
             self.live.map.insert(lba, hp);
+        }
+        for lba in referenced {
+            self.live.mark_referenced(lba);
         }
 
         // Re-align the cursors so the CLEAN region is exactly the appended zeros and the OCCUPIED region is exactly the old tract: plow' ≡ old_len (appends start at the first new block), reap' = plow' − old_len (≡ 0 — the whole old region awaits the reap, which migrates its live blocks and retires its dead ones window by window).
@@ -750,6 +764,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         }
         let need = self.tract.base + new_tract_blocks;
         self.ring.mirror().grow(need)?;
+        // The realign below re-derives the reap from scratch; a staged window's cursor would overwrite it at the commit.
+        self.pending_reap = None;
         let plow = self.tract.plow;
         let delta = (old_len + new_tract_blocks - plow % new_tract_blocks) % new_tract_blocks;
         self.tract.plow = plow + delta;
@@ -782,6 +798,10 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 Err(e) => return Err(e),
             }
         };
+        // The staged reap retires its window only now: the flush above landed in clean space that still excluded the window's originals, and the entry below records the advanced cursor.
+        if let Some(r) = self.pending_reap.take() {
+            self.tract.reap = r;
+        }
         let head = self
             .ring
             .head()
@@ -898,7 +918,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             let mut surv = 0u64;
             for i in 0..max_w {
                 let pos = (self.tract.reap + i) % self.tract.len;
-                surv += self.live.map.contains_key(&pos) as u64;
+                // Any referenced position is a survivor, hashed or tree-only: counting the map alone sized windows full of a tree-only open's furrows as pure-dead, whose relocations then ran out of room mid-window.
+                surv += self.live.is_referenced(pos) as u64;
                 // The reserve is charged only when something actually stages: a pure-dead window appends NOTHING, so even clean-of-zero reaps it whole — without this guard the field vault (91% dead, clean 3) was refused at its very first block and ground forward in 4-block bites (2026-08-24).
                 if surv > 0 && surv + RESERVE > clean {
                     break;
@@ -921,10 +942,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 continue;
             }
             self.tract.fence_limit = None;
-            {
-                let Self { ring, tract, hamt, live, .. } = self;
-                hamt.reap_window(ring.mirror(), tract, live, w)?;
-            }
+            self.reap_staged(w)?;
             self.commit(now)?;
             windows += 1;
         }
@@ -933,8 +951,43 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         Ok(windows)
     }
 
+    /// RECLAIM AHEAD — the reap an embedder runs at its own idle edge, so callers' commits stop paying for it.
+    /// The inline ladders (put's TractFull arm, maybe_reap after each commit) reclaim INSIDE whichever caller's commit meets the shortage: field 2026-10-21, a phone taking in 256 KiB attachment chunks saw single-chunk commits of 3.3 s and 5.7 s while the ladder reaped, rescued and grew under them.
+    /// One bounded window per call (at most RECLAIM_WINDOW_MAX blocks, and at most half the clean space so the retiring flush always has room), so an op arriving mid-step waits for one small window; the embedder calls again only while it stays idle.
+    /// Wants clean space of at least an eighth of the tract, and dead space under the quarter that maybe_reap acts on inline.
+    pub fn reclaim_ahead(&mut self, now: i64) -> Result<Reclaim> {
+        let len = self.tract.len;
+        let clean = self.tract.clean_blocks();
+        let occupied = self.tract.plow - self.tract.reap;
+        let dead = occupied.saturating_sub(self.live.len() as u64);
+        let target = len >> 3;
+        let short = clean < target;
+        if !short && dead << 2 <= len {
+            return Ok(Reclaim::Comfortable);
+        }
+        // Short with more than three quarters live: reaping cannot pay its way — each relocated survivor rewrites its index path, so a live-dense window makes about as much new garbage as it frees (fuzz 2026-10-21: two thousand windows at 78% live never restored the eighth).
+        // The working set has outgrown the tract; growth is the honest fix.
+        if short && (self.live.len() as u64) * 4 > len * 3 {
+            return Ok(Reclaim::LiveHeavy);
+        }
+        let cap = RECLAIM_WINDOW_MAX.min(clean >> 1);
+        if cap == 0 {
+            return Ok(Reclaim::Stuck);
+        }
+        Ok(if self.reap_one_window_capped(now, cap)? { Reclaim::Reaped } else { Reclaim::Stuck })
+    }
+
     /// Clean one window at the reap and commit the retiring generation. Returns false when no progress is possible right now (nothing occupied, or not even a one-block window can stage its survivors — the caller's ladder commits/grows and comes back).
     pub fn reap_one_window(&mut self, now: i64) -> Result<bool> {
+        self.reap_one_window_capped(now, u64::MAX)
+    }
+
+    /// [`reap_one_window`](Self::reap_one_window) with the window held to at most `cap` blocks — the idle-edge reclaim's bounded step.
+    fn reap_one_window_capped(&mut self, now: i64, cap: u64) -> Result<bool> {
+        // One staged window at a time: a window whose retiring commit failed is still in the arena, and re-scanning it before it lands would relocate its survivors twice.
+        if self.pending_reap.is_some() {
+            self.commit(now)?;
+        }
         let occupied = self.tract.plow - self.tract.reap;
         if occupied == 0 {
             return Ok(false);
@@ -943,6 +996,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         const RESERVE: u64 = 4;
         let mut w = self
             .reap_window()
+            .min(cap)
             .min(occupied)
             .min(self.tract.clean_blocks().saturating_sub(RESERVE));
         if w == 0 {
@@ -961,11 +1015,21 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 return Ok(false);
             }
         }
+        self.reap_staged(w)?;
+        self.commit(now).map(|_| true)
+    }
+
+    /// Run one reap window and STAGE its retirement: survivors are copied and repointed in the arena, but the reap cursor moves only inside the retiring commit (see `pending_reap`).
+    /// Until then the window's originals are what the committed head references, so they must not count as clean space for the commit's own flush.
+    fn reap_staged(&mut self, w: u64) -> Result<()> {
+        let start = self.tract.reap;
         {
             let Self { ring, tract, hamt, live, .. } = self;
             hamt.reap_window(ring.mirror(), tract, live, w)?;
         }
-        self.commit(now).map(|_| true)
+        self.pending_reap = Some(self.tract.reap);
+        self.tract.reap = start;
+        Ok(())
     }
 
     /// A generation that changes nothing    /// A generation that changes nothing    /// A generation that changes nothing: the head's root, geometry, and plow under a new generation number. Exists to slide OLDER entries out of the fence window when the tract is too tight to flush — budget rises to one lap past the last real commit, never further. Recording the tract's in-flight plow here would be a lie: the head's root still references originals the in-flight passes swept past, and a fence raised past them lets the retrying flush tramp blocks the committed index needs (Seal on resume). A tract still wedged at the head's own lap is genuinely full — grow or refuse.

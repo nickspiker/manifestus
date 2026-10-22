@@ -137,6 +137,11 @@ impl Hamt {
         matches!(self.root, Some(Child::Dirty(_)))
     }
 
+    /// Whether this index holds work no committed generation has: a dirty path, or recorded liveness changes (a delete that emptied the trie leaves no dirty root, but its removals still sit in the delta).
+    pub fn has_uncommitted(&self) -> bool {
+        self.is_dirty() || !self.delta.added.is_empty() || !self.delta.removed.is_empty()
+    }
+
     pub fn take_delta(&mut self) -> Delta {
         core::mem::take(&mut self.delta)
     }
@@ -877,12 +882,15 @@ impl Hamt {
         let mut leaves: Vec<(u64, [u8; 32])> = Vec::new();
         let mut nodes: Vec<(u64, [u8; 32])> = Vec::new();
         let mut furrow_owners: HashMap<[u8; 32], Vec<(u64, u64)>> = HashMap::new();
+        // Blocks this epoch already retired (an overwrite or delete earlier in the same uncommitted batch): the committed live set still answers live for them until the commit lands, but they are garbage now.
+        // Step 3 re-checks the delta per block; furrows had no such check, so an old value's furrow found its key's NEW extent and was spliced into it at its index — the new value's own furrow left live but unrouted.
+        let retired: hashbrown::HashSet<(u64, [u8; 32])> = self.delta.removed.iter().copied().collect();
         let mut buf = ZERO_BLOCK;
         for m in start..start + w {
             let pos = m % tract.len;
             tract.read(mirror, pos, &mut buf)?;
             let Some(hp) = sealed_hp(&buf) else { continue };
-            if !oracle.is_live(pos, &hp) {
+            if !oracle.is_live(pos, &hp) || retired.contains(&(pos, hp)) {
                 continue;
             }
             match decode_doc(&buf)? {

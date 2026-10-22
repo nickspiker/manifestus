@@ -748,3 +748,176 @@ fn open_reads_the_tree_not_the_data() {
     assert!(v.live_blocks() < live_after_puts - 200, "the deleted value's furrows left the live set: {} of {live_after_puts}", v.live_blocks());
     assert_eq!(v.get(&key(1)).unwrap().as_deref(), Some(big.as_slice()));
 }
+
+/// Counts the lap guard's confessions — the test-side twin of kete's LogSink line "LIVE-LAP AVERTED".
+struct LapCount(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl manifestus::EventSink for LapCount {
+    fn emit(&mut self, event: manifestus::StorageEvent) {
+        if let manifestus::StorageEvent::LiveLapAverted { .. } = event {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// kete's apply_growing, the caller law under test: one ordered batch, doubling thru TractFull.
+fn apply_growing(v: &mut Vault<FileDev, FileDev>, items: &[([u8; 32], Option<Vec<u8>>)], now: i64) {
+    let refs: Vec<(&[u8; 32], Option<&[u8]>)> = items.iter().map(|(k, x)| (k, x.as_deref())).collect();
+    for _ in 0..40 {
+        match v.apply_batch(&refs, now) {
+            Err(manifestus::Error::TractFull) => {
+                let t = v.tract_blocks() * 2;
+                v.grow(t, now).unwrap();
+            }
+            r => return r.unwrap(),
+        }
+    }
+    panic!("growth never stuck");
+}
+
+/// FIELD 2026-10-21 (Emma's new phone, attachment intake): "LIVE-LAP AVERTED at lba 19" inside a 3.3 s single-chunk commit.
+/// Kete-shaped intake — 256 KiB chunks among overwritten table values, small rows and deletes, batches of 1 to 50 — on a 16 MB tract that starts too small, so every ladder runs: reap, rescue, airlock, grow.
+/// Two engine defects reproduced here (deterministic, pre-fix: an acknowledged entry read back absent at step 19, the lap guard fired at step 21):
+/// 1. The reap advanced its cursor before the retiring commit landed, so that commit's own flush saw the window's originals as clean; with the fence waived (rescue) only the lap guard stood between it and blocks the committed head still referenced.
+/// 2. The put ladder rolled the arena back to the committed head (rescue) or grew (a barrier) while earlier entries of the same batch existed only in that arena — dropped, and the batch still reported success.
+#[test]
+fn kete_shaped_intake_never_laps_and_loses_nothing() {
+    let dir = TempDir::new().unwrap();
+    let (pa, pb) = paths(&dir, "intake");
+    let laps = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let a = FileDev::create(&pa, RING + 4096).unwrap();
+    let b = FileDev::create(&pb, RING + 4096).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b).with_events(Box::new(LapCount(laps.clone()))), HOST_RING_LOG2, 1, DeletePolicy::UnlinkOnly).unwrap();
+    let mut x = 0x9E37_79B9_7F4A_7C15u64 | 1;
+    let mut rnd = move |n: u64| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x % n
+    };
+    let bytes = |tag: u64, len: usize| -> Vec<u8> {
+        let mut s = tag | 1;
+        let mut out = Vec::with_capacity(len + 8);
+        while out.len() < len {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    };
+    let ns = |ns: u64, i: u64| -> [u8; 32] { *blake3::hash(&[ns.to_le_bytes(), i.to_le_bytes()].concat()).as_bytes() };
+    let mut model: std::collections::HashMap<[u8; 32], Vec<u8>> = std::collections::HashMap::new();
+    let mut chunks = 0u64;
+    for step in 0..30u64 {
+        let shape = rnd(10);
+        let count = if shape < 4 { 1 } else { 1 + rnd(50) };
+        let mut batch: Vec<([u8; 32], Option<Vec<u8>>)> = Vec::new();
+        for _ in 0..count {
+            let r = rnd(100);
+            if r < 30 && shape < 6 {
+                chunks += 1;
+                batch.push((ns(1, chunks), Some(bytes(chunks * 7919 + 1, 262_184))));
+            } else if r < 55 {
+                let k = ns(2, rnd(12));
+                let len = 3_000 + rnd(40_000) as usize;
+                batch.push((k, Some(bytes(rnd(u64::MAX), len))));
+            } else if r < 90 {
+                let k = ns(3, rnd(200));
+                let len = 40 + rnd(1_500) as usize;
+                batch.push((k, Some(bytes(rnd(u64::MAX), len))));
+            } else if r < 95 && chunks > 0 {
+                batch.push((ns(1, 1 + rnd(chunks)), None));
+            } else {
+                let k = if rnd(2) == 0 { ns(2, rnd(12)) } else { ns(3, rnd(200)) };
+                batch.push((k, None));
+            }
+        }
+        apply_growing(&mut v, &batch, 10 + step as i64);
+        for (k, x) in &batch {
+            match x {
+                Some(x) => {
+                    model.insert(*k, x.clone());
+                }
+                None => {
+                    model.remove(k);
+                }
+            }
+        }
+        assert_eq!(laps.load(std::sync::atomic::Ordering::SeqCst), 0, "step {step}: an append targeted a block the committed index references");
+        for (k, x) in &model {
+            assert_eq!(v.get(k).unwrap().as_deref(), Some(x.as_slice()), "step {step}: an acknowledged value must read back");
+        }
+    }
+    let (unrouted, missing) = v.live_map_divergence().unwrap();
+    assert!(unrouted.is_empty() && missing.is_empty(), "unrouted {unrouted:?} missing {missing:?}");
+}
+
+/// An overwrite and a reap in ONE uncommitted epoch: the old value's furrows are still live in the committed set when the put ladder's reap window reaches them, and the reap used to look up their key, find the NEW extent, and splice the old furrows into it at their indexes — the overwrite silently undone (pre-fix: the key read back the OLD bytes).
+#[test]
+fn overwrite_then_reap_in_one_batch_keeps_the_new_value() {
+    let dir = TempDir::new().unwrap();
+    let (pa, pb) = paths(&dir, "splice");
+    let mut v = open_vault(&pa, &pb, RING + 128);
+    let k = key(1);
+    let old = vec![0xAAu8; 20_000];
+    v.put(&k, &old, 2).unwrap();
+    for i in 0..25u64 {
+        v.put(&key(100 + i), &vec![i as u8; 5_000], 3 + i as i64).unwrap();
+    }
+    let new = vec![0xBBu8; 20_000];
+    let y = vec![0xCCu8; 80_000];
+    let k2 = key(2);
+    v.apply_batch(&[(&k, Some(&new[..])), (&k2, Some(&y[..]))], 500).unwrap();
+    assert_eq!(v.get(&k).unwrap().as_deref(), Some(&new[..]), "the overwrite must stand");
+    assert_eq!(v.get(&k2).unwrap().as_deref(), Some(&y[..]));
+    let (unrouted, missing) = v.live_map_divergence().unwrap();
+    assert!(unrouted.is_empty() && missing.is_empty(), "unrouted {unrouted:?} missing {missing:?}");
+}
+
+/// RECLAIM AHEAD: the reap an embedder runs at its idle edge.
+/// Churn leaves the tract short of clean space with plenty of dead; stepping reclaim_ahead until it is comfortable restores an eighth of clean space, and the next put that fits lands in exactly one generation — no ladder inside the caller's commit.
+#[test]
+fn reclaim_ahead_restores_headroom_before_the_next_commit() {
+    let dir = TempDir::new().unwrap();
+    let (pa, pb) = paths(&dir, "ahead");
+    let mut v = open_vault(&pa, &pb, RING + 1024);
+    let mut now = 1_000i64;
+    // Two thirds live (inline maybe_reap keeps dead under a quarter, so only a live-dense tract can run short), then churn a few of those keys: every overwrite leaves its old extent dead.
+    let mut n = 0u64;
+    while (v.live_blocks() as u64) * 3 < v.tract_blocks() * 2 {
+        v.put(&key(n), &vec![n as u8; 30_000], now + n as i64).unwrap();
+        n += 1;
+    }
+    now += n as i64;
+    let clean = |v: &Vault<FileDev, FileDev>| {
+        let st = v.engine_stats();
+        st.tract_blocks - (st.plow - st.reap)
+    };
+    let mut churn = 0;
+    while clean(&v) >= v.tract_blocks() / 8 {
+        now += 1;
+        churn += 1;
+        assert!(churn < 4_096, "churn must run the tract short");
+        v.put(&key(churn % 4), &vec![churn as u8; 30_000], now).unwrap();
+    }
+    let mut steps = 0;
+    loop {
+        now += 1;
+        match v.reclaim_ahead(now).unwrap() {
+            manifestus::Reclaim::Reaped => steps += 1,
+            manifestus::Reclaim::Comfortable => break,
+            other => panic!("a dead-heavy tract must reap its way to comfort, got {other:?} after {steps} steps"),
+        }
+        assert!(steps < 512, "reclaim must converge");
+    }
+    assert!(steps > 0, "a short tract must have reaped");
+    assert!(clean(&v) >= v.tract_blocks() / 8, "an eighth of the tract is clean again");
+    let g = v.generation().unwrap();
+    v.put(&key(10_000), &vec![7u8; 30_000], now + 1).unwrap();
+    assert_eq!(v.generation().unwrap(), g + 1, "a put that fits commits once — no reap, rescue or grow inside it");
+    for i in 4..n {
+        assert_eq!(v.get(&key(i)).unwrap(), Some(vec![i as u8; 30_000]), "untouched value {i} survives the reclaim");
+    }
+}
