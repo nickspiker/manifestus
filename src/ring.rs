@@ -506,10 +506,9 @@ pub fn zero_ring_at<A: BlockDev, B: BlockDev>(
     ring_log2: u8,
     base: u64,
 ) -> Result<()> {
-    for slot in 0..(1u64 << ring_log2) {
-        mirror.write_verified(base + slot, &ZERO_BLOCK)?;
-    }
-    Ok(())
+    // One verified batch, one flush per device: the slots are all zeros and nothing references them yet, so per-slot ordering buys nothing (genesis spent 2.3 s here on a Mac, a flush pair per slot).
+    let batch: alloc::vec::Vec<(u64, &crate::block::Block)> = (0..(1u64 << ring_log2)).map(|slot| (base + slot, &ZERO_BLOCK)).collect();
+    mirror.write_verified_batch(&batch)
 }
 
 // ============================================================================ root ring (migrating profile) ==========================================
