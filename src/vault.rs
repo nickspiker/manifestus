@@ -80,7 +80,7 @@ impl LiveSet {
     fn preview(&self, delta: &Delta, len: u64, all: bool) -> alloc::collections::BTreeMap<usize, Vec<u64>> {
         let words = crate::livemap::PAGE_WORDS;
         let mut out: alloc::collections::BTreeMap<usize, Vec<u64>> = alloc::collections::BTreeMap::new();
-        let mut page = |p: usize, out: &mut alloc::collections::BTreeMap<usize, Vec<u64>>| -> () {
+        let page = |p: usize, out: &mut alloc::collections::BTreeMap<usize, Vec<u64>>| {
             out.entry(p).or_insert_with(|| {
                 let lo = p * words;
                 let mut v = alloc::vec![0u64; words];
@@ -682,7 +682,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 break;
             }
             ring.rewind_head()?;
-            ring.mirror().emit(crate::events::StorageEvent::TornCommit { gen: head.gen });
+            ring.mirror().emit(crate::events::StorageEvent::TornCommit { generation: head.gen });
             head = ring.head().ok_or_else(|| Error::Corrupt("rewind left no head".into()))?.clone();
         }
         let mut tract = Tract {
@@ -1259,7 +1259,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         }
         let page_ptrs: Vec<crate::livemap::Ptr> = layout.pages.iter().map(|p| p.ok_or_else(|| Error::Corrupt("live map page never written".into()))).collect::<Result<_>>()?;
         let dirty_pages: hashbrown::HashSet<usize> = pages.keys().copied().collect();
-        let mut append_one = |v: &mut Self, block: crate::block::Block| -> Result<crate::livemap::Ptr> {
+        let append_one = |v: &mut Self, block: crate::block::Block| -> Result<crate::livemap::Ptr> {
             let Self { ring, tract, live, .. } = v;
             let pos = tract.append(ring.mirror(), live, core::slice::from_ref(&block))?[0];
             Ok((crate::tract::sealed_hp(&block).unwrap(), pos))

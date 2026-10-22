@@ -21,8 +21,8 @@ pub enum StorageEvent {
     ReapWindow { scanned: u64, live: u64, moved: u64 },
     /// An append was about to overwrite a block the committed index still references — the lap guard refused before a byte was written (the 43-dangling class, caught pre-loss). The clean invariant was already broken upstream when this fires; the refusal preserves the value, this event is the confession.
     LiveLapAverted { lba: u64 },
-    /// The head generation's entry was on the device but its data run was not (a crash inside the commit's single flush): the vault opened at the generation before it. (gen of the torn entry)
-    TornCommit { gen: u64 },
+    /// The head generation's entry was on the device but its data run was not (a crash inside the commit's single flush): the vault opened at the generation before it. (the torn entry's generation)
+    TornCommit { generation: u64 },
     /// The head named a live map that did not load (damaged, or for another tract length); the vault opened by walking the index instead and will write the map whole at its next commit.
     LiveMapFallback,
     /// A block failed its hash on the primary, the second device held it whole, and the primary was rewritten from it. (lba)
