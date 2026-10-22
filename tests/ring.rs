@@ -26,6 +26,7 @@ fn entry(gen: u64, prev: [u8; 32], r: u8) -> SpineEntry {
         eagle_time: 1_000_000 + gen as i64,
         tail: None,
         livemap: None,
+        cache_live: 0,
     }
 }
 

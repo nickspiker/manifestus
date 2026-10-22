@@ -303,6 +303,12 @@ pub struct Vault<A: BlockDev, B: BlockDev> {
     from_map: bool,
     /// Where the idle scrub resumes: the next tract position it checks.
     scrub_at: u64,
+    /// Tract blocks the committed CACHE values occupy (carried in the spine entry).
+    cache_live: u64,
+    /// The cache's allowance in blocks: growth plans for durable data plus this much cache, and idle reclaim evicts down to it. 0 = no allowance (cache lives in whatever the durable data leaves free).
+    cache_budget: u64,
+    /// Puts arrive as cache values while set (put_cached / put_batch_cached).
+    cache_mode: bool,
 }
 
 /// What one [`Vault::scrub_step`] did.
@@ -464,6 +470,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             eagle_time: now,
             tail: None,
             livemap: None,
+            cache_live: 0,
         };
         ring.append(&entry)?;
         let tract = Tract {
@@ -486,6 +493,9 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             map_off: false,
             from_map: false,
             scrub_at: 0,
+            cache_live: 0,
+            cache_budget: 0,
+            cache_mode: false,
         })
     }
 
@@ -572,6 +582,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             eagle_time: now,
             tail: None,
             livemap: None,
+            cache_live: 0,
         };
         ring.append(&entry)?;
         let tract = Tract {
@@ -594,6 +605,9 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             map_off: false,
             from_map: false,
             scrub_at: 0,
+            cache_live: 0,
+            cache_budget: 0,
+            cache_mode: false,
         })
     }
 
@@ -702,7 +716,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                     tract.reap = derive_reap(tract.plow, tract.len, &live);
                     let fences = ring.recent_fences(FENCE_K)?;
                     tract.fence_limit = fence_from(&fences);
-                    let mut v = Self { ring, tract, hamt, live, root, policy, pending_reap: None, lmap, map_off: false, from_map: true, scrub_at: 0 };
+                    let mut v = Self { ring, tract, hamt, live, root, policy, pending_reap: None, lmap, map_off: false, from_map: true, scrub_at: 0, cache_live: head.cache_live, cache_budget: 0, cache_mode: false };
                     v.live.dirty.clear();
                     v.probe_wedge(head.eagle_time + 1, true);
                     return Ok(v);
@@ -752,6 +766,9 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             map_off: false,
             from_map: false,
             scrub_at: 0,
+            cache_live: head.cache_live,
+            cache_budget: 0,
+            cache_mode: false,
         };
         // REPAIR COMMIT FIRST (field 2026-08-25, the boot that re-pruned the same 84 danglings forever): every rescue's opening move is rolling the index back to the COMMITTED head (the survivor law), so prunes still in RAM evaporate the moment the wedge probe below fires — and a broken vault is USUALLY wedge-shaped, which is why the repair open kept "succeeding" while the disk never changed. Commit the pruned index NOW so the pruned head is the one every later rollback restores. A refused commit (a broken vault is usually FULL-shaped too) gets one grow — and because grow is a barrier that reloads the committed (unpruned) head, the recorded routes are re-pruned before the retry. If even that fails, skip the probe: the prunes then survive in RAM until the session's first successful commit lands them.
         let mut probe_allowed = true;
@@ -843,8 +860,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         // Bound: cleaning advances the reap every iteration, so a full lap of windows plus the fence ladder is guaranteed to terminate.
         for _ in 0..(FENCE_K + 3 + (self.tract.len / self.reap_window()) + 8) {
             let attempt = {
-                let Self { ring, tract, hamt, live, .. } = self;
-                hamt.put(ring.mirror(), tract, live, key, value)
+                let Self { ring, tract, hamt, live, cache_mode, .. } = self;
+                hamt.put_classed(ring.mirror(), tract, live, key, value, *cache_mode)
             };
             match attempt {
                 Ok(()) => return Ok(()),                Err(Error::Fenced(_)) => {
@@ -1161,6 +1178,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         // The staged reap retires its window with this entry: the run above landed in clean space that still excluded the window's originals.
         let reap = self.pending_reap.unwrap_or(self.tract.reap);
         let (added, removed) = self.hamt.delta_counts();
+        let cache_after = (self.cache_live + self.hamt.delta().cache_added).saturating_sub(self.hamt.delta().cache_removed);
         let head = self
             .ring
             .head()
@@ -1178,6 +1196,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             eagle_time: now,
             tail,
             livemap: map_root,
+            cache_live: cache_after,
         };
         let landed = if split {
             self.ring.mirror().write_verified_batch(&data).and_then(|_| self.ring.append(&entry))
@@ -1196,6 +1215,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         }
         self.live.dirty.clear();
         self.live.own = map_own;
+        self.cache_live = cache_after;
         self.lmap = map_layout;
         self.map_off = false;
         self.pending_reap = None;
@@ -1308,7 +1328,9 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     fn maybe_reap(&mut self, now: i64) -> Result<()> {
         let used = (self.tract.plow - self.tract.reap).min(self.tract.len);
         let dead = used.saturating_sub(self.live.len() as u64);
-        if dead << 2 > self.tract.len {
+        // Cache is reclaimable like dead space: with any held, keep an eighth of the tract clean, so the plow stays ahead of the cache by evicting a window per commit instead of running the tract dry and growing out of the rescue.
+        let cache_short = self.cache_live > 0 && self.tract.clean_blocks() < self.tract.len >> 3;
+        if dead << 2 > self.tract.len || cache_short {
             self.reap_one_window(now)?;
         }
         Ok(())
@@ -1372,7 +1394,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                     return Err(Error::TractFull);
                 }
                 // Size the key to the disease (field 2026-09-03, Leviathan: 7.5 HOURS of failing writes). A dead-heavy wedge needs only staging room — the modest 4-window grow. But a LIVE-heavy tract (>50% live) has genuinely outgrown itself, and the modest grow is a token: its fresh lap is consumed at once and the vault re-enters the wedge, looping grow→wedge→grow for hours while every put fails. Every other grow site doubles; when the working set is the problem, double here too — disk is cheap, hours of refused writes are not.
-                let target = if self.live.len() as u64 * 2 > self.tract.len {
+                let target = if self.planned_live() * 2 > self.tract.len {
                     self.tract.len * 2
                 } else {
                     self.tract.len + self.reap_window() * 4
@@ -1402,12 +1424,15 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         let dead = occupied.saturating_sub(self.live.len() as u64);
         let target = len >> 3;
         let short = clean < target;
-        if !short && dead << 2 <= len {
+        // A cache over its allowance is reaped down to it at idle, comfortable or not: the reap evicts cache as it passes.
+        let over_budget = self.cache_live > self.cache_budget;
+        if !short && dead << 2 <= len && !over_budget {
             return Ok(Reclaim::Comfortable);
         }
         // Short with more than three quarters live: reaping cannot pay its way — each relocated survivor rewrites its index path, so a live-dense window makes about as much new garbage as it frees (fuzz 2026-10-21: two thousand windows at 78% live never restored the eighth).
         // The working set has outgrown the tract; growth is the honest fix.
-        if short && (self.live.len() as u64) * 4 > len * 3 {
+        // What growth answers to: durable data plus the cache's allowance — never the cache itself, which a reap can always evict.
+        if short && self.planned_live() * 4 > len * 3 {
             return Ok(Reclaim::LiveHeavy);
         }
         let cap = RECLAIM_WINDOW_MAX.min(clean >> 1);
@@ -1418,6 +1443,38 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     }
 
     /// Clean one window at the reap and commit the retiring generation. Returns false when no progress is possible right now (nothing occupied, or not even a one-block window can stage its survivors — the caller's ladder commits/grows and comes back).
+    /// Live blocks growth must plan for: everything durable, plus the cache up to its allowance.
+    fn planned_live(&self) -> u64 {
+        let durable = (self.live.len() as u64).saturating_sub(self.cache_live);
+        durable + self.cache_live.min(self.cache_budget)
+    }
+
+    /// Insert/overwrite a CACHE value — one the embedder can fetch again (a public map cell). It reads like any other; the reap evicts it where it would move a durable value, so it never makes the vault grow past its allowance (see [`Self::set_cache_budget`]). Durable on return like [`Self::put`].
+    pub fn put_cached(&mut self, key: &[u8; 32], value: &[u8], now: i64) -> Result<()> {
+        self.cache_mode = true;
+        let r = self.apply_batch(&[(key, Some(value))], now);
+        self.cache_mode = false;
+        r
+    }
+
+    /// [`Self::put_batch`] for cache values, under one commit.
+    pub fn put_batch_cached(&mut self, items: &[(&[u8; 32], &[u8])], now: i64) -> Result<()> {
+        self.cache_mode = true;
+        let r = self.put_batch(items, now);
+        self.cache_mode = false;
+        r
+    }
+
+    /// The cache's allowance in blocks. Growth plans for durable data plus this much cache; idle reclaim evicts a cache over it.
+    pub fn set_cache_budget(&mut self, blocks: u64) {
+        self.cache_budget = blocks;
+    }
+
+    /// Tract blocks the committed cache values occupy.
+    pub fn cache_blocks(&self) -> u64 {
+        self.cache_live
+    }
+
     pub fn reap_one_window(&mut self, now: i64) -> Result<bool> {
         self.reap_one_window_capped(now, u64::MAX)
     }
@@ -1497,6 +1554,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             eagle_time: now,
             tail: None,
             livemap: head.livemap.clone(),
+            cache_live: head.cache_live,
         };
         self.ring.append(&entry)?;
         let fences = self.ring.recent_fences(FENCE_K)?;

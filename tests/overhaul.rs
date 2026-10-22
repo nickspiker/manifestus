@@ -369,3 +369,65 @@ fn rot_heals_by_read_and_by_scrub() {
         }
     }
 }
+
+/// The cache class: cells streamed through a vault several times its size never grow it — the reap evicts the oldest cache where it would have moved durable data — while every durable value survives and the newest cache reads back. The count rides the spine across a reopen, the live map still matches a walk, and idle reclaim evicts a cache down to its allowance.
+#[test]
+fn cache_values_evict_instead_of_growing() {
+    let dir = TempDir::new().unwrap();
+    let (pa, pb) = paths(&dir, "cache");
+    let tract = 4096u64;
+    FileDev::create(&pa, RING + tract).unwrap();
+    FileDev::create(&pb, RING + tract).unwrap();
+    let durable: Vec<Vec<u8>> = (0..20u64).map(|i| vec![i as u8; 20_000]).collect();
+    let cell = |i: u64| -> Vec<u8> {
+        let mut v = vec![(i % 251) as u8; 30_000];
+        v[..8].copy_from_slice(&i.to_le_bytes());
+        v
+    };
+    let cells = 5 * tract * 4096 / 30_000;
+    let mut now = 10i64;
+    {
+        let mut v = open_pair(&pa, &pb);
+        for (i, d) in durable.iter().enumerate() {
+            now += 1;
+            v.put(&key(i as u64), d, now).unwrap();
+        }
+        for i in 0..cells {
+            now += 1;
+            v.put_cached(&key(1_000_000 + i), &cell(i), now).unwrap();
+        }
+        assert_eq!(v.tract_blocks(), tract, "a cache five times the tract never grew it");
+        for (i, d) in durable.iter().enumerate() {
+            assert_eq!(v.get(&key(i as u64)).unwrap().as_ref(), Some(d), "durable value {i}");
+        }
+        assert_eq!(v.get(&key(1_000_000)).unwrap(), None, "the oldest cache was evicted");
+        for i in cells - 10..cells {
+            assert_eq!(v.get(&key(1_000_000 + i)).unwrap(), Some(cell(i)), "recent cache cell {i}");
+        }
+        assert!(v.cache_blocks() > 0 && v.cache_blocks() < tract, "cache count {} within the tract", v.cache_blocks());
+        let (unrouted, missing) = v.live_map_divergence().unwrap();
+        assert!(unrouted.is_empty() && missing.is_empty(), "evictions kept the map exact: {unrouted:?} {missing:?}");
+    }
+    let mut v = open_pair(&pa, &pb);
+    let held = v.cache_blocks();
+    assert!(held > 0, "the cache count rode the spine");
+    // An allowance well under what the cache holds: idle reclaim evicts down to it.
+    let budget = held / 4;
+    v.set_cache_budget(budget);
+    let mut steps = 0;
+    loop {
+        now += 1;
+        match v.reclaim_ahead(now).unwrap() {
+            manifestus::Reclaim::Comfortable => break,
+            manifestus::Reclaim::Reaped => steps += 1,
+            other => panic!("reclaim toward the cache allowance: {other:?} after {steps} steps, cache {} of {budget}", v.cache_blocks()),
+        }
+        assert!(steps < 10_000, "reclaim must converge");
+    }
+    assert!(v.cache_blocks() <= budget, "cache {} within its allowance {budget}", v.cache_blocks());
+    for (i, d) in durable.iter().enumerate() {
+        assert_eq!(v.get(&key(i as u64)).unwrap().as_ref(), Some(d), "durable value {i} after the reclaim");
+    }
+    let (unrouted, missing) = v.live_map_divergence().unwrap();
+    assert!(unrouted.is_empty() && missing.is_empty(), "map exact after the reclaim");
+}

@@ -51,6 +51,8 @@ pub struct SpineEntry {
     pub tail: Option<Tail>,
     /// The live map at this generation (see [`crate::livemap`]). None on entries from before the map, and on a grow's entry; such a head opens by walking the index, and the next commit writes the map.
     pub livemap: Option<MapRef>,
+    /// Tract blocks CACHE values occupy at this generation (0 before the class existed).
+    pub cache_live: u64,
 }
 
 /// Where a generation's live map is.
@@ -119,6 +121,13 @@ impl SpineEntry {
                 p
             }
             None => pairs,
+        };
+        let pairs: Vec<(&str, VsfType)> = if self.cache_live > 0 {
+            let mut p = pairs;
+            p.push(("cachelive", VsfType::u(self.cache_live as usize, false)));
+            p
+        } else {
+            pairs
         };
         let pairs: Vec<(&str, VsfType)> = match &self.livemap {
             Some(MapRef::Root(h, at)) => {
@@ -190,6 +199,7 @@ impl SpineEntry {
         let mut lmap = None;
         let mut lmapat = None;
         let mut lbits = None;
+        let mut cache_live = 0u64;
 
         // Named pairs until zero padding ('d' = 0x64; padding = 0x00). Unknown names are parsed-and-skipped — kernel-profile fields ride thru.
         while block.get(ptr) == Some(&b'd') {
@@ -214,6 +224,7 @@ impl SpineEntry {
                 ("lmap", VsfType::hp(h)) => lmap = Some(to32(&h)?),
                 ("lmapat", v) if as_u64(&v).is_some() => lmapat = as_u64(&v),
                 ("lbits", VsfType::v(_, b)) => lbits = Some(b),
+                ("cachelive", v) if as_u64(&v).is_some() => cache_live = as_u64(&v).unwrap(),
                 _ => {} // forward-compat: unknown field or unexpected type — skip
             }
         }
@@ -240,6 +251,7 @@ impl SpineEntry {
                 (None, None, None) => None,
                 _ => return Err(Error::Corrupt("ambiguous livemap".into())),
             },
+            cache_live,
         };
         if entry.ring_log2 == 0 || entry.ring_log2 > 32 {
             return Err(Error::Corrupt(format!("insane ring exponent {}", entry.ring_log2)));
