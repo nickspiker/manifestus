@@ -15,6 +15,7 @@ pub mod hamt;
 #[cfg(all(feature = "std", any(unix, windows)))]
 pub mod host;
 pub mod inspect;
+pub mod livemap;
 pub mod mirror;
 pub mod ring;
 pub mod tract;
@@ -42,5 +43,5 @@ pub enum DeletePolicy {
     ZeroIsErase,
 }
 
-pub use ring::{Tail, any_sealed_block, append_root, block_is_sealed, classify, read_root, zero_ring, zero_ring_at, Classified, Ring, RootEntry, SpineEntry, FENCE_K, HOST_RING_LOG2, ROOT_SLOTS};
+pub use ring::{MapRef, Tail, any_sealed_block, append_root, block_is_sealed, classify, read_root, zero_ring, zero_ring_at, Classified, Ring, RootEntry, SpineEntry, FENCE_K, HOST_RING_LOG2, ROOT_SLOTS};
 pub use error::{Error, Result};

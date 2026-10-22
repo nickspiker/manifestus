@@ -142,6 +142,11 @@ impl Hamt {
         self.is_dirty() || !self.delta.added.is_empty() || !self.delta.removed.is_empty()
     }
 
+    /// The pending delta, unapplied — what the commit previews into live map pages.
+    pub fn delta(&self) -> &Delta {
+        &self.delta
+    }
+
     /// (added, removed) counts of the pending delta — the commit's live estimate before the delta is applied.
     pub fn delta_counts(&self) -> (usize, usize) {
         (self.delta.added.len(), self.delta.removed.len())
@@ -895,7 +900,7 @@ impl Hamt {
             let pos = m % tract.len;
             tract.read(mirror, pos, &mut buf)?;
             let Some(hp) = sealed_hp(&buf) else { continue };
-            if !oracle.is_live(pos, &hp) || retired.contains(&(pos, hp)) {
+            if oracle.is_foreign(pos) || !oracle.is_live(pos, &hp) || retired.contains(&(pos, hp)) {
                 continue;
             }
             match decode_doc(&buf)? {

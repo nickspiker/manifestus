@@ -908,7 +908,7 @@ fn reclaim_ahead_restores_headroom_before_the_next_commit() {
         match v.reclaim_ahead(now).unwrap() {
             manifestus::Reclaim::Reaped => steps += 1,
             manifestus::Reclaim::Comfortable => break,
-            other => panic!("a dead-heavy tract must reap its way to comfort, got {other:?} after {steps} steps"),
+            other => panic!("a dead-heavy tract must reap its way to comfort, got {other:?} after {steps} steps: {:?}", v.engine_stats()),
         }
         assert!(steps < 512, "reclaim must converge");
     }

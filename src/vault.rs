@@ -11,72 +11,218 @@ use crate::block::{BlockDev, ZERO_BLOCK};
 use crate::error::{Error, Result};
 use crate::hamt::{DanglingPointer, Delta, Hamt, StalePointer};
 use crate::mirror::Mirror;
-use crate::ring::{any_sealed_block, append_root, read_root, zero_ring, zero_ring_at, Ring, RootEntry, SpineEntry, Tail, FENCE_K, ROOT_SLOTS};
+use crate::ring::{any_sealed_block, append_root, read_root, zero_ring, zero_ring_at, MapRef, Ring, RootEntry, SpineEntry, Tail, FENCE_K, ROOT_SLOTS};
 use crate::tract::{Liveness, Staging, Tract};
 use alloc::{format, vec::Vec};
 use hashbrown::HashMap;
 
-/// The vault's knowledge of what is referenced: tract lba → sealing hash. Rebuilt from the committed HAMT at open; maintained by deltas afterward. This IS the reap's liveness oracle.
+/// The vault's knowledge of what is referenced — the reap's liveness oracle and the append lap guard's.
 ///
-/// HashMap PROOF (AGENT.md consent: Nick, 2026-06-12): `is_live` is called once per scanned position in every reap window, and the map holds one entry per live tract block. A linear scan would make one window O(scanned × live); O(1) point lookup matches the access pattern exactly.
-///
-/// TODO(scale): this map (RAM ∝ live blocks) and the open-time walk_live that rebuilds it are the two caches standing between the on-disk format (petabyte-ready: EWE fields, constant-fragment extents, size-independent spine) and a petabyte-practical implementation. Both are retirable: blocks self-address, so `is_live` can be answered by walking the index for the block's own key (O(log) reads, zero RAM) and resume can skip the walk entirely. Not pressing at photon/cairn scale — do this with the kernel-profile port.
+/// A BITMAP (2026-10-22), one bit per tract position, set where the committed index references a block: nodes, leaves, furrows. It replaced a map of lba → hash, rebuilt at every open by walking every node and leaf; the bits are persisted as the live map (see [`crate::livemap`]) and an open reads a few pages of them instead. Position alone is the whole answer: a committed block's position is referenced at most once (appends never land on a referenced position — the lap guard), which the tree-only open already relied on for furrows.
+/// `own` holds the positions of the committed live map's own pages and tables: live, never recorded in the bits (a map recording its own pages would never settle).
 #[derive(Default)]
 pub struct LiveSet {
-    map: HashMap<u64, [u8; 32]>,
-    /// Blocks the committed TREE references without a recorded hash: the furrows and extent runs of a Direct/Extent leaf, marked at a TREE-ONLY open (Nick 2026-09-12: "there's zero reason we verify the whole vault — treed open was the initial design"). `is_referenced` is true for them, `is_live` (exact hash) is answered from the block's own seal by the callers that hold the block — the plow reads every block in its window anyway.
-    referenced: hashbrown::HashSet<u64>,
+    bits: Vec<u64>,
+    count: u64,
+    own: hashbrown::HashSet<u64>,
+    /// Pages whose bits changed since the live map was last written.
+    dirty: hashbrown::HashSet<usize>,
 }
 
 impl LiveSet {
-    /// ADDED FIRST, THEN REMOVED — the order is load-bearing (field 2026-09-08, photon: "relocation repointed nothing for block at 2078" ×3 on a fresh phone vault mid history-restore). A block can be added AND retired inside ONE delta: a key written twice in the same batch appends leaf L1, then the rewrite retires L1 and appends L2. Applying `removed` first found L1 absent (a no-op) and `added` then inserted it anyway, leaving L1 live in this map with no index route — bytes intact, "live", unrouted — which the plow moved and the repoint guard refused, forever, wedging every later window at that block. Added-then-removed is exactly right because the tract is append-only within a delta: an lba is added at most once per commit and any removal of it must come after its add, so a block that is both ends removed.
-    pub fn apply(&mut self, delta: Delta) {
-        for (lba, hp) in delta.added {
-            self.referenced.remove(&lba);
-            self.map.insert(lba, hp);
+    /// An empty set for a tract of `len` positions.
+    pub fn with_len(len: u64) -> Self {
+        Self { bits: alloc::vec![0; len.div_ceil(64) as usize], ..Self::default() }
+    }
+
+    fn ensure(&mut self, pos: u64) {
+        let w = (pos / 64) as usize;
+        if w >= self.bits.len() {
+            self.bits.resize(w + 1, 0);
         }
-        for (lba, hp) in delta.removed {
-            if self.map.get(&lba) == Some(&hp) {
-                self.map.remove(&lba);
+    }
+
+    pub fn get(&self, pos: u64) -> bool {
+        self.bits.get((pos / 64) as usize).is_some_and(|w| w >> (pos % 64) & 1 == 1)
+    }
+
+    fn set(&mut self, pos: u64) {
+        self.ensure(pos);
+        let w = &mut self.bits[(pos / 64) as usize];
+        if *w >> (pos % 64) & 1 == 0 {
+            *w |= 1 << (pos % 64);
+            self.count += 1;
+            self.dirty.insert((pos / crate::livemap::PAGE_BITS) as usize);
+        }
+    }
+
+    fn clear(&mut self, pos: u64) {
+        if let Some(w) = self.bits.get_mut((pos / 64) as usize) {
+            if *w >> (pos % 64) & 1 == 1 {
+                *w &= !(1 << (pos % 64));
+                self.count -= 1;
+                self.dirty.insert((pos / crate::livemap::PAGE_BITS) as usize);
             }
-            // A tree-only entry has no hash to match: the leaf that referenced it is being removed, so the block goes with it.
-            self.referenced.remove(&lba);
         }
     }
 
-    /// Mark a block live by position alone — the tree-only open's form for furrows and extent runs.
+    /// ADDED FIRST, THEN REMOVED — the order is load-bearing (field 2026-09-08, photon: "relocation repointed nothing for block at 2078" ×3 on a fresh phone vault mid history-restore). A block can be added AND retired inside ONE delta: a key written twice in the same batch appends leaf L1, then the rewrite retires L1 and appends L2. The tract is append-only within a delta: an lba is added at most once per commit and any removal of it comes after its add, so a block that is both ends removed.
+    pub fn apply(&mut self, delta: Delta) {
+        for (lba, _) in delta.added {
+            self.set(lba);
+        }
+        for (lba, _) in delta.removed {
+            self.clear(lba);
+        }
+    }
+
+    /// The page words `delta` would leave in each page it touches — what the commit writes before the delta itself is applied (RAM moves only once the commit lands). Pages already dirty are included as they stand.
+    fn preview(&self, delta: &Delta, len: u64, all: bool) -> alloc::collections::BTreeMap<usize, Vec<u64>> {
+        let words = crate::livemap::PAGE_WORDS;
+        let mut out: alloc::collections::BTreeMap<usize, Vec<u64>> = alloc::collections::BTreeMap::new();
+        let mut page = |p: usize, out: &mut alloc::collections::BTreeMap<usize, Vec<u64>>| -> () {
+            out.entry(p).or_insert_with(|| {
+                let lo = p * words;
+                let mut v = alloc::vec![0u64; words];
+                for (i, w) in v.iter_mut().enumerate() {
+                    *w = self.bits.get(lo + i).copied().unwrap_or(0);
+                }
+                v
+            });
+        };
+        for &p in &self.dirty {
+            page(p, &mut out);
+        }
+        if all {
+            for p in 0..crate::livemap::pages_for(len) {
+                page(p, &mut out);
+            }
+        }
+        let set = |out: &mut alloc::collections::BTreeMap<usize, Vec<u64>>, pos: u64, on: bool| {
+            let p = (pos / crate::livemap::PAGE_BITS) as usize;
+            let i = ((pos % crate::livemap::PAGE_BITS) / 64) as usize;
+            let w = &mut out.get_mut(&p).unwrap()[i];
+            if on {
+                *w |= 1 << (pos % 64);
+            } else {
+                *w &= !(1 << (pos % 64));
+            }
+        };
+        for &(lba, _) in &delta.added {
+            page((lba / crate::livemap::PAGE_BITS) as usize, &mut out);
+            set(&mut out, lba, true);
+        }
+        for &(lba, _) in &delta.removed {
+            page((lba / crate::livemap::PAGE_BITS) as usize, &mut out);
+            set(&mut out, lba, false);
+        }
+        out.retain(|&p, _| p < crate::livemap::pages_for(len));
+        out
+    }
+
+    /// The whole bitmap `delta` would leave, as bytes (bit i = byte i/8, bit i%8) — the inline map of a small tract.
+    fn inline_after(&self, delta: &Delta, len: u64) -> Vec<u8> {
+        let mut words: Vec<u64> = (0..len.div_ceil(64) as usize).map(|i| self.bits.get(i).copied().unwrap_or(0)).collect();
+        for &(lba, _) in &delta.added {
+            if let Some(w) = words.get_mut((lba / 64) as usize) {
+                *w |= 1 << (lba % 64);
+            }
+        }
+        for &(lba, _) in &delta.removed {
+            if let Some(w) = words.get_mut((lba / 64) as usize) {
+                *w &= !(1 << (lba % 64));
+            }
+        }
+        let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        bytes.truncate(len.div_ceil(8) as usize);
+        bytes
+    }
+
+    /// A set from an inline map.
+    fn from_inline(bytes: &[u8], len: u64) -> Result<Self> {
+        if bytes.len() as u64 != len.div_ceil(8) {
+            return Err(Error::Corrupt("inline live map length".into()));
+        }
+        let mut live = Self::with_len(len);
+        for (i, chunk) in bytes.chunks(8).enumerate() {
+            let mut w = [0u8; 8];
+            w[..chunk.len()].copy_from_slice(chunk);
+            live.bits[i] = u64::from_le_bytes(w);
+        }
+        live.count = live.bits.iter().map(|w| w.count_ones() as u64).sum();
+        Ok(live)
+    }
+
+    /// Mark a block live by position (open's walk; the reap's furrows).
     pub fn mark_referenced(&mut self, lba: u64) {
-        if !self.map.contains_key(&lba) {
-            self.referenced.insert(lba);
-        }
+        self.set(lba);
     }
 
+    /// Live positions: the bits plus the live map's own blocks.
     pub fn len(&self) -> usize {
-        self.map.len() + self.referenced.len()
+        self.count as usize + self.own.len()
     }
 
-    /// Blocks the live entries occupy (each map value is a block position; referenced runs count one block each — the tree-only open's coarse view). Display-grade, not accounting-grade.
+    /// Blocks the live entries occupy. Display-grade, not accounting-grade.
     pub fn live_blocks(&self) -> u64 {
-        (self.map.len() + self.referenced.len()) as u64
+        self.len() as u64
     }
 
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty() && self.referenced.is_empty()
+        self.len() == 0
     }
 
-    /// Every live position, hashed or tree-only.
+    /// Every live position, bits and own.
     pub fn positions(&self) -> impl Iterator<Item = u64> + '_ {
-        self.map.keys().copied().chain(self.referenced.iter().copied())
+        self.bits
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &w)| (0..64u64).filter(move |b| w >> b & 1 == 1).map(move |b| i as u64 * 64 + b))
+            .chain(self.own.iter().copied())
+    }
+
+    /// Positions the bits hold (the index's blocks), without the map's own.
+    pub fn indexed(&self) -> impl Iterator<Item = u64> + '_ {
+        self.bits.iter().enumerate().flat_map(|(i, &w)| (0..64u64).filter(move |b| w >> b & 1 == 1).map(move |b| i as u64 * 64 + b))
+    }
+
+    /// Distance from tract position `from` to the nearest live position at or after it, wrapping; `len` when nothing is live.
+    fn clean_run_from(&self, from: u64, len: u64) -> u64 {
+        let mut best = len;
+        for &o in &self.own {
+            best = best.min((o + len - from) % len);
+        }
+        // Word scan from `from` to the end, then from 0 back to `from`.
+        let scan = |lo: u64, hi: u64| -> Option<u64> {
+            let mut p = lo;
+            while p < hi {
+                let w = self.bits.get((p / 64) as usize).copied().unwrap_or(0) >> (p % 64);
+                if w != 0 {
+                    let q = p + w.trailing_zeros() as u64;
+                    return (q < hi).then_some(q);
+                }
+                p = (p / 64 + 1) * 64;
+            }
+            None
+        };
+        if let Some(q) = scan(from, len) {
+            best = best.min(q - from);
+        } else if let Some(q) = scan(0, from) {
+            best = best.min(q + len - from);
+        }
+        best
     }
 }
 
 impl Liveness for LiveSet {
-    fn is_live(&self, lba: u64, hp: &[u8; 32]) -> bool {
-        // A tree-only entry answers by position: the caller holds the block and read `hp` off its seal, which is the hash the leaf would have recorded.
-        self.map.get(&lba) == Some(hp) || self.referenced.contains(&lba)
+    fn is_live(&self, lba: u64, _hp: &[u8; 32]) -> bool {
+        self.get(lba) || self.own.contains(&lba)
     }
     fn is_referenced(&self, lba: u64) -> bool {
-        self.map.contains_key(&lba) || self.referenced.contains(&lba)
+        self.get(lba) || self.own.contains(&lba)
+    }
+    fn is_foreign(&self, lba: u64) -> bool {
+        self.own.contains(&lba)
     }
 }
 
@@ -94,6 +240,9 @@ fn staged() -> Staging {
 
 /// The longest run a commit writes under the same flush as its entry (256 KiB): longer runs are flushed ahead of the entry, so the torn-commit check at open never reads more than this.
 const TAIL_MAX_BLOCKS: usize = 1 << 6;
+
+/// Clean blocks a reap holds back for its retiring commit's own appends: the index path the relocations rewrote, and the live map's page and table.
+const COMMIT_RESERVE: u64 = 8;
 
 /// Proactive reap trigger: dead > 25% of the tract → one window after the commit.
 /// Window size scales with the tract (len/64, floor 16) so huge values fragment into at most ~64 runs crossing a full lap — far under the extent leaf's capacity.
@@ -146,6 +295,97 @@ pub struct Vault<A: BlockDev, B: BlockDev> {
     /// A reaped window awaiting its retiring commit: the cursor value the reap reached, held back from `tract.reap` until that commit's flush has landed.
     /// The window's originals are what the COMMITTED head still references, so counting them as clean before the retiring entry exists let the flush plow straight into them whenever the fence was waived (rescue) — the lap guard caught it, which is the confession Emma's phone logged as "LIVE-LAP AVERTED at lba 19" inside a 3.3 s commit, and the TractFull it raised sent the put into a full grow barrier (fuzz repro 2026-10-21).
     pending_reap: Option<u64>,
+    /// Where the committed live map's blocks are, and whether the next commit must write it whole.
+    lmap: MapLayout,
+    /// The next commit writes no live map: grow's, the spine-only move no fence may refuse — appending a whole map into the fresh space would be fenced by the generations before it. Its entry names no map; the commit after it writes one whole.
+    map_off: bool,
+    /// Whether this handle's open read the live map (rather than walking the index).
+    from_map: bool,
+}
+
+/// Where the committed live map's blocks are (see [`crate::livemap`]).
+#[derive(Default, Clone)]
+struct MapLayout {
+    root: Option<crate::livemap::Ptr>,
+    /// Page pointers by page index.
+    pages: Vec<Option<crate::livemap::Ptr>>,
+    /// Level-1 tables, when the map has two levels (more than one table's worth of pages).
+    tables: Vec<crate::livemap::Ptr>,
+    /// Write every page and table at the next commit: no map yet (an older vault, a repair), a grow, or a reap window crossed the map's own blocks.
+    rewrite: bool,
+}
+
+impl MapLayout {
+    fn whole() -> Self {
+        Self { rewrite: true, ..Self::default() }
+    }
+}
+
+/// Read a block and check it against the hash its parent recorded.
+fn read_sealed<A: BlockDev, B: BlockDev>(mirror: &mut Mirror<A, B>, tract: &Tract, ptr: crate::livemap::Ptr) -> Result<crate::block::Block> {
+    let mut buf = ZERO_BLOCK;
+    tract.read(mirror, ptr.1, &mut buf)?;
+    if crate::tract::sealed_hp(&buf) != Some(ptr.0) {
+        return Err(Error::Seal);
+    }
+    Ok(buf)
+}
+
+/// Load the committed live map named by `root`: the tables, then every page in one run of reads, each checked against its parent's hash. The map's own block positions come back in the set's `own`.
+fn load_livemap<A: BlockDev, B: BlockDev>(mirror: &mut Mirror<A, B>, tract: &Tract, root: crate::livemap::Ptr) -> Result<(LiveSet, MapLayout)> {
+    use crate::livemap::{decode, pages_for, Doc, PAGE_WORDS};
+    let Doc::Table { level, len, children } = decode(&read_sealed(mirror, tract, root)?)? else {
+        return Err(Error::Corrupt("live map root is not a table".into()));
+    };
+    if len != tract.len {
+        return Err(Error::Corrupt(format!("live map for a tract of {len}, tract is {}", tract.len)));
+    }
+    let mut layout = MapLayout { root: Some(root), ..MapLayout::default() };
+    let mut page_ptrs = Vec::new();
+    match level {
+        1 => page_ptrs = children,
+        2 => {
+            for t in children {
+                let Doc::Table { level: 1, children, .. } = decode(&read_sealed(mirror, tract, t)?)? else {
+                    return Err(Error::Corrupt("live map sub-table is not level 1".into()));
+                };
+                layout.tables.push(t);
+                page_ptrs.extend(children);
+            }
+        }
+        _ => return Err(Error::Corrupt("live map table level".into())),
+    }
+    if page_ptrs.len() != pages_for(len) {
+        return Err(Error::Corrupt("live map page count".into()));
+    }
+    let positions: Vec<u64> = page_ptrs.iter().map(|p| p.1).collect();
+    let blocks = tract.read_positions(mirror, &positions)?;
+    let mut live = LiveSet::with_len(len);
+    for (i, (b, ptr)) in blocks.iter().zip(&page_ptrs).enumerate() {
+        if crate::tract::sealed_hp(b) != Some(ptr.0) {
+            return Err(Error::Seal);
+        }
+        let Doc::Page { index, words } = decode(b)? else {
+            return Err(Error::Corrupt("live map page".into()));
+        };
+        if index as usize != i || words.len() != PAGE_WORDS {
+            return Err(Error::Corrupt("live map page index".into()));
+        }
+        let lo = i * PAGE_WORDS;
+        for (j, w) in words.into_iter().enumerate() {
+            if lo + j < live.bits.len() {
+                live.bits[lo + j] = w;
+            } else if w != 0 {
+                return Err(Error::Corrupt("live map bit past the tract".into()));
+            }
+        }
+    }
+    live.count = live.bits.iter().map(|w| w.count_ones() as u64).sum();
+    live.own.insert(root.1);
+    live.own.extend(layout.tables.iter().map(|t| t.1));
+    live.own.extend(positions);
+    layout.pages = page_ptrs.into_iter().map(Some).collect();
+    Ok((live, layout))
 }
 
 impl<A: BlockDev, B: BlockDev> Vault<A, B> {
@@ -208,6 +448,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             live: 0,
             eagle_time: now,
             tail: None,
+            livemap: None,
         };
         ring.append(&entry)?;
         let tract = Tract {
@@ -226,6 +467,9 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             root: None,
             policy,
             pending_reap: None,
+            lmap: MapLayout::whole(),
+            map_off: false,
+            from_map: false,
         })
     }
 
@@ -311,6 +555,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             live: 0,
             eagle_time: now,
             tail: None,
+            livemap: None,
         };
         ring.append(&entry)?;
         let tract = Tract {
@@ -329,6 +574,9 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             root: Some(root),
             policy,
             pending_reap: None,
+            lmap: MapLayout::whole(),
+            map_off: false,
+            from_map: false,
         })
     }
 
@@ -422,6 +670,28 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             )));
         }
         let mut hamt = Hamt::from_root(head.hamt_hash, head.hamt_lba);
+        // THE LIVE MAP (2026-10-22): a head that names one opens by reading it — a few blocks — and never walks the index. A missing or unreadable map (an older vault, damage) falls back to the walk below, and the next commit writes the map whole.
+        if repair.is_none() {
+            let loaded = match &head.livemap {
+                Some(MapRef::Inline(bytes)) => LiveSet::from_inline(bytes, tract.len).ok().map(|l| (l, MapLayout::whole())),
+                Some(MapRef::Root(h, at)) => load_livemap(ring.mirror(), &tract, (*h, *at)).ok(),
+                None => None,
+            };
+            if loaded.is_none() && head.livemap.is_some() {
+                ring.mirror().emit(crate::events::StorageEvent::LiveMapFallback);
+            }
+            {
+                if let Some((live, lmap)) = loaded {
+                    tract.reap = derive_reap(tract.plow, tract.len, &live);
+                    let fences = ring.recent_fences(FENCE_K)?;
+                    tract.fence_limit = fence_from(&fences);
+                    let mut v = Self { ring, tract, hamt, live, root, policy, pending_reap: None, lmap, map_off: false, from_map: true };
+                    v.live.dirty.clear();
+                    v.probe_wedge(head.eagle_time + 1, true);
+                    return Ok(v);
+                }
+            }
+        }
         let mut live_blocks = Vec::new();
         let mut stale = Vec::new();
         let mut dangling = Vec::new();
@@ -439,9 +709,9 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             hamt.prune(ring.mirror(), &tract, &d.route, (d.hash, d.lba))?;
         }
         let pruned_any = !stale.is_empty() || !dangling.is_empty();
-        let mut live = LiveSet::default();
-        for (lba, hp) in live_blocks {
-            live.map.insert(lba, hp);
+        let mut live = LiveSet::with_len(tract.len);
+        for (lba, _) in live_blocks {
+            live.mark_referenced(lba);
         }
         for lba in referenced {
             live.mark_referenced(lba);
@@ -461,6 +731,9 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             root,
             policy,
             pending_reap: None,
+            lmap: MapLayout::whole(),
+            map_off: false,
+            from_map: false,
         };
         // REPAIR COMMIT FIRST (field 2026-08-25, the boot that re-pruned the same 84 danglings forever): every rescue's opening move is rolling the index back to the COMMITTED head (the survivor law), so prunes still in RAM evaporate the moment the wedge probe below fires — and a broken vault is USUALLY wedge-shaped, which is why the repair open kept "succeeding" while the disk never changed. Commit the pruned index NOW so the pruned head is the one every later rollback restores. A refused commit (a broken vault is usually FULL-shaped too) gets one grow — and because grow is a barrier that reloads the committed (unpruned) head, the recorded routes are re-pruned before the retry. If even that fails, skip the probe: the prunes then survive in RAM until the session's first successful commit lands them.
         let mut probe_allowed = true;
@@ -482,19 +755,24 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             report.stale = stale;
             report.dangling = dangling;
         }
-        // WEDGE PROBE (field 2026-08-21/23/24): a head restored with less budget than one reap window + reserve is the fence deadlock arriving — nothing the ladders do can slide it. Rescue NOW, before any caller writes; best-effort, because a genuinely live-full tract must still open readable (the wedged field boxes served every boot load). NEVER on a migrating-era vault (root present): its legacy mixed layout derives near-zero clean space and looks wedge-shaped by definition — the migration sweep owns that state.
-        let wedged = probe_allowed
-            && !migrating
-            && v.tract.fence_limit.map_or(false, |l| {
-                l.saturating_sub(v.tract.plow) < v.reap_window() + 8
+        let _ = migrating;
+        v.probe_wedge(rescue_now, probe_allowed);
+        Ok(v)
+    }
+
+    /// WEDGE PROBE (field 2026-08-21/23/24): a head restored with less budget than one reap window + reserve is the fence deadlock arriving — nothing the ladders do can slide it. Rescue NOW, before any caller writes; best-effort, because a genuinely live-full tract must still open readable (the wedged field boxes served every boot load). NEVER on a migrating-era vault (root present): its legacy mixed layout derives near-zero clean space and looks wedge-shaped by definition — the migration sweep owns that state.
+    fn probe_wedge(&mut self, rescue_now: i64, allowed: bool) {
+        let wedged = allowed
+            && self.root.is_none()
+            && self.tract.fence_limit.map_or(false, |l| {
+                l.saturating_sub(self.tract.plow) < self.reap_window() + 8
             });
         if wedged {
             // Dead-heavy → the rescue reaps its way out; live-full (rescue says TractFull) → grow, the spine-only move no fence refuses. Best-effort both ways: a vault that can't heal still opens readable.
-            if let Err(Error::TractFull) = v.rescue(rescue_now) {
-                let _ = v.grow(v.tract.len * 2, rescue_now);
+            if let Err(Error::TractFull) = self.rescue(rescue_now) {
+                let _ = self.grow(self.tract.len * 2, rescue_now);
             }
         }
-        Ok(v)
     }
 
     // ======================================================================== KV API =================================================================
@@ -522,7 +800,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         let Some((lba, hash)) = leaf else {
             return Ok(false);
         };
-        if self.live.map.get(&lba) != Some(&hash) {
+        let _ = hash;
+        if !self.live.get(lba) {
             return Ok(false);
         }
         // A committed value that can no longer be READ is a value the vault does not hold — full stop. Field 2026-08-25: a reused furrow passes the repair walk (its own seal is valid, just someone else's content), then this get propagated the Seal and killed every subsequent put of that key BEFORE its write — the one operation that would have healed the key by overwriting it. Unreadable = not held = let the put proceed.
@@ -768,13 +1047,15 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             let Self { ring, tract, hamt, .. } = self;
             hamt.walk_tree_collect(ring.mirror(), tract, &mut live_blocks, &mut referenced, &mut stale)?;
         }
-        self.live = LiveSet::default();
-        for (lba, hp) in live_blocks {
-            self.live.map.insert(lba, hp);
+        self.live = LiveSet::with_len(self.tract.len);
+        for (lba, _) in live_blocks {
+            self.live.mark_referenced(lba);
         }
         for lba in referenced {
             self.live.mark_referenced(lba);
         }
+        // The old map's blocks sit in the old region, which the realign below hands to the reap; the grow's own commit writes the map whole in the new space.
+        self.lmap = MapLayout::whole();
 
         // Re-align the cursors so the CLEAN region is exactly the appended zeros and the OCCUPIED region is exactly the old tract: plow' ≡ old_len (appends start at the first new block), reap' = plow' − old_len (≡ 0 — the whole old region awaits the reap, which migrates its live blocks and retires its dead ones window by window).
         // Monotone order is preserved (plow' ≥ plow), so fence comparisons stay sound; pre-grow entries keep their smaller budgets until they age out of the K-window.
@@ -783,7 +1064,10 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         self.tract.plow = plow + delta;
         self.tract.reap = self.tract.plow - old_len;
         self.tract.len = new_tract_blocks;
-        self.commit(now)
+        self.map_off = true;
+        let r = self.commit(now);
+        self.map_off = false;
+        r
     }
 
     /// Grow WITHOUT the barrier reload — for the one caller whose in-RAM index is MORE authoritative than the committed head: the repair open, whose prunes exist only in RAM. The normal grow discards RAM state and re-walks the committed head STRICTLY, which on a vault mid-repair (a) resurrects the pruned danglings and (b) fails Seal on them — the 2026-08-25 loop where the "repaired" vault re-pruned the same 84 pointers every boot while the disk never changed. Here the pruned hamt + its live set ride across the grow untouched; the trailing commit flushes them into the fresh clean region, landing the repair durably. Sound ONLY when the caller guarantees the RAM state is clean-by-construction (no half-applied put) — the repair open is exactly that.
@@ -798,12 +1082,16 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         self.ring.mirror().grow(need)?;
         // The realign below re-derives the reap from scratch; a staged window's cursor would overwrite it at the commit.
         self.pending_reap = None;
+        self.lmap.rewrite = true;
         let plow = self.tract.plow;
         let delta = (old_len + new_tract_blocks - plow % new_tract_blocks) % new_tract_blocks;
         self.tract.plow = plow + delta;
         self.tract.reap = self.tract.plow - old_len;
         self.tract.len = new_tract_blocks;
-        self.commit(now)
+        self.map_off = true;
+        let r = self.commit(now);
+        self.map_off = false;
+        r
     }
 
     /// Flush the index, append the next generation, recompute the fence. The transaction commit point — everything before this is provisional.
@@ -811,11 +1099,24 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     /// Fence deadlock escape: flushing needs tract appends; appends can be fenced; raising the fence needs generations. HEARTBEAT generations break the cycle — spine entries re-asserting the committed head, written into the (unfenced) ring region, sliding old entries out of the K-window.
     pub fn commit(&mut self, now: i64) -> Result<()> {
         let mut attempts = 0u64;
-        let (root_hash, root_lba) = loop {
+        let ((root_hash, root_lba), (map_root, map_layout, map_own)) = loop {
             let r = {
                 let Self { ring, tract, hamt, live, .. } = self;
                 hamt.flush(ring.mirror(), tract, live)
             };
+            // The live map rides the same run: the pages this commit's delta touches, and their table, appended after the index.
+            // A tract that fits rides its whole bitmap inside the entry: no tract block. A larger one appends pages — except under a grow, whose commit appends nothing.
+            let r = r.and_then(|x| {
+                let len = self.tract.len;
+                if len <= crate::livemap::INLINE_MAX_BITS {
+                    let bytes = self.live.inline_after(self.hamt.delta(), len);
+                    Ok((x, (Some(MapRef::Inline(bytes)), MapLayout::whole(), hashbrown::HashSet::new())))
+                } else if self.map_off {
+                    Ok((x, (None, MapLayout::whole(), hashbrown::HashSet::new())))
+                } else {
+                    self.append_livemap().map(|(root, layout, own)| (x, (Some(MapRef::Root(root.0, root.1)), layout, own)))
+                }
+            });
             match r {
                 Ok(x) => break x,
                 Err(Error::Fenced(_)) if attempts <= FENCE_K + 2 => {
@@ -855,9 +1156,10 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             hamt_lba: root_lba,
             plow: self.tract.plow,
             reap: Some(reap),
-            live: (self.live.len() + added).saturating_sub(removed) as u64,
+            live: (self.live.count as usize + added).saturating_sub(removed) as u64 + map_own.len() as u64,
             eagle_time: now,
             tail,
+            livemap: map_root,
         };
         let landed = if split {
             self.ring.mirror().write_verified_batch(&data).and_then(|_| self.ring.append(&entry))
@@ -874,6 +1176,10 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             let Self { hamt, live, .. } = self;
             live.apply(hamt.take_delta());
         }
+        self.live.dirty.clear();
+        self.live.own = map_own;
+        self.lmap = map_layout;
+        self.map_off = false;
         self.pending_reap = None;
         self.tract.reap = reap;
 
@@ -889,6 +1195,65 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             }
         }
         Ok(())
+    }
+
+    /// Append the live map this commit leaves: every page its delta (or an earlier unwritten change) touches, then the tables over them — or the whole map when [`MapLayout::rewrite`] says so. Nothing in RAM moves here; the commit installs the returned layout and own-block set once its write lands.
+    fn append_livemap(&mut self) -> Result<(crate::livemap::Ptr, MapLayout, hashbrown::HashSet<u64>)> {
+        use crate::livemap::{encode_page, encode_table, pages_for, TABLE_FANOUT};
+        let len = self.tract.len;
+        let n = pages_for(len);
+        let mut layout = self.lmap.clone();
+        let rewrite = layout.rewrite || layout.pages.len() != n || layout.root.is_none();
+        let pages = self.live.preview(self.hamt.delta(), len, rewrite);
+        if !rewrite && pages.is_empty() {
+            let root = layout.root.unwrap();
+            return Ok((root, layout, self.live.own.clone()));
+        }
+        layout.pages.resize(n, None);
+        let encoded: Vec<(usize, crate::block::Block)> = pages.iter().map(|(&p, w)| encode_page(p as u64, w).map(|b| (p, b))).collect::<Result<_>>()?;
+        let blocks: Vec<crate::block::Block> = encoded.iter().map(|(_, b)| *b).collect();
+        let placed = {
+            let Self { ring, tract, live, .. } = self;
+            tract.append(ring.mirror(), live, &blocks)?
+        };
+        for ((p, b), pos) in encoded.iter().zip(&placed) {
+            layout.pages[*p] = Some((crate::tract::sealed_hp(b).unwrap(), *pos));
+        }
+        let page_ptrs: Vec<crate::livemap::Ptr> = layout.pages.iter().map(|p| p.ok_or_else(|| Error::Corrupt("live map page never written".into()))).collect::<Result<_>>()?;
+        let dirty_pages: hashbrown::HashSet<usize> = pages.keys().copied().collect();
+        let mut append_one = |v: &mut Self, block: crate::block::Block| -> Result<crate::livemap::Ptr> {
+            let Self { ring, tract, live, .. } = v;
+            let pos = tract.append(ring.mirror(), live, core::slice::from_ref(&block))?[0];
+            Ok((crate::tract::sealed_hp(&block).unwrap(), pos))
+        };
+        let root = if n <= TABLE_FANOUT {
+            layout.tables.clear();
+            append_one(self, encode_table(1, len, &page_ptrs)?)?
+        } else {
+            let groups = n.div_ceil(TABLE_FANOUT);
+            if rewrite || layout.tables.len() != groups {
+                layout.tables.clear();
+            }
+            let mut tables = Vec::with_capacity(groups);
+            for g in 0..groups {
+                let lo = g * TABLE_FANOUT;
+                let hi = (lo + TABLE_FANOUT).min(n);
+                let keep = layout.tables.get(g).copied().filter(|_| !(lo..hi).any(|p| dirty_pages.contains(&p)));
+                let t = match keep {
+                    Some(t) => t,
+                    None => append_one(self, encode_table(1, len, &page_ptrs[lo..hi])?)?,
+                };
+                tables.push(t);
+            }
+            layout.tables = tables;
+            append_one(self, encode_table(2, len, &layout.tables)?)?
+        };
+        layout.root = Some(root);
+        layout.rewrite = false;
+        let mut own: hashbrown::HashSet<u64> = page_ptrs.iter().map(|p| p.1).collect();
+        own.extend(layout.tables.iter().map(|t| t.1));
+        own.insert(root.1);
+        Ok((root, layout, own))
     }
 
     /// Move the spine to the next residence in the band (RING.md "Migrating Rings").
@@ -954,7 +1319,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     /// 2. The all-survive worst-case sizing is replaced by ACTUAL survivor counts from the LiveSet (no device I/O) — a dead-heavy window stages nearly nothing, so even clean ≈ 0 makes progress.
     /// Returns the windows reaped. Err(TractFull) = a live block sits hard against the reap with no staging room — genuinely full of live data: grow or refuse (the rescue only ever helps dead-heavy occupancy). Each retiring commit re-fences honestly, so the loop's comfort check reads the true post-rescue budget.
     pub fn rescue(&mut self, now: i64) -> Result<u64> {
-        const RESERVE: u64 = 4;
+        const RESERVE: u64 = COMMIT_RESERVE;
         let mut windows = 0u64;
         let mut airlock_grown = false;
         let bound = (self.tract.len / REAP_WINDOW_MIN).max(8);
@@ -1050,7 +1415,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             return Ok(false);
         }
         // Reserve a few clean blocks for the retiring commit's index rewrite; size the window to what the clean region can stage (worst case: every block survives).
-        const RESERVE: u64 = 4;
+        const RESERVE: u64 = COMMIT_RESERVE;
         let mut w = self
             .reap_window()
             .min(cap)
@@ -1080,6 +1445,11 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     /// Until then the window's originals are what the committed head references, so they must not count as clean space for the commit's own flush.
     fn reap_staged(&mut self, w: u64) -> Result<()> {
         let start = self.tract.reap;
+        // The reap leaves the live map's own blocks to the map: a window that holds any of them has the retiring commit write the map whole, elsewhere.
+        let len = self.tract.len;
+        if self.live.own.iter().any(|&p| (p + len - start % len) % len < w) {
+            self.lmap.rewrite = true;
+        }
         {
             let Self { ring, tract, hamt, live, .. } = self;
             hamt.reap_window(ring.mirror(), tract, live, w)?;
@@ -1108,6 +1478,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             live: self.live.len() as u64,
             eagle_time: now,
             tail: None,
+            livemap: head.livemap.clone(),
         };
         self.ring.append(&entry)?;
         let fences = self.ring.recent_fences(FENCE_K)?;
@@ -1144,12 +1515,17 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             hamt.walk_live(ring.mirror(), tract, &mut walked)?;
         }
         let index: HashMap<u64, [u8; 32]> = walked.into_iter().collect();
-        // A tree-only entry has no recorded hash: it agrees with the index when the index holds that position at all.
-        let mut unrouted: Vec<u64> = self.live.map.iter().filter(|(lba, hp)| index.get(*lba) != Some(*hp)).map(|(lba, _)| *lba).chain(self.live.referenced.iter().filter(|lba| !index.contains_key(*lba)).copied()).collect();
-        let mut missing: Vec<u64> = index.iter().filter(|(lba, hp)| self.live.map.get(*lba) != Some(*hp) && !self.live.referenced.contains(*lba)).map(|(lba, _)| *lba).collect();
+        let mut unrouted: Vec<u64> = self.live.indexed().filter(|lba| !index.contains_key(lba)).collect();
+        let mut missing: Vec<u64> = index.keys().filter(|lba| !self.live.get(**lba)).copied().collect();
         unrouted.sort_unstable();
         missing.sort_unstable();
         Ok((unrouted, missing))
+    }
+
+    /// TEST AID — whether this handle opened from the live map rather than by walking the index.
+    #[doc(hidden)]
+    pub fn opened_from_map(&self) -> bool {
+        self.from_map
     }
 
     pub fn tract_blocks(&self) -> u64 {
@@ -1196,12 +1572,7 @@ fn fence_from(budgets_newest_first: &[u64]) -> Option<u64> {
 /// The maximal monotone reap whose clean region [plow, reap + len) holds no live block:
 /// walk the live set for the nearest live position downstream of the plow. Sound for any layout — a legacy mixed tract simply derives little or no clean space.
 fn derive_reap(plow: u64, len: u64, live: &LiveSet) -> u64 {
-    let pos = plow % len;
-    let mut clean = len;
-    for lba in live.positions() {
-        let d = (lba + len - pos) % len;
-        clean = clean.min(d);
-    }
+    let clean = live.clean_run_from(plow % len, len);
     (plow + clean).saturating_sub(len)
 }
 
@@ -1366,6 +1737,12 @@ fn replicate_into<S: BlockDev, D: BlockDev>(
         let mut hamt = Hamt::from_root(head.hamt_hash, head.hamt_lba);
         let mut live = Vec::new();
         hamt.walk_live(ring.mirror(), &tract, &mut live)?;
+        // The live map's own blocks are live too, and the index does not reach them.
+        if let Some(MapRef::Root(h, at)) = head.livemap {
+            if let Ok((map, _)) = load_livemap(ring.mirror(), &tract, (h, at)) {
+                live.extend(map.own.iter().map(|&p| (p, [0u8; 32])));
+            }
+        }
         (live, layout.tract_base)
     };
 

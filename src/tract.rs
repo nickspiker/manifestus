@@ -41,6 +41,10 @@ pub trait Liveness {
     fn is_live(&self, lba: u64, hp: &[u8; 32]) -> bool;
     /// Whether ANY committed pointer references this lba, hp-independent — the append lap guard's question. `is_live` answers "is this exact block current"; this answers "would writing here destroy something the index still points at".
     fn is_referenced(&self, lba: u64) -> bool;
+    /// Live, but not a block of the index — the vault's live map pages and tables. The reap leaves these to their owner, which rewrites them with the retiring commit.
+    fn is_foreign(&self, _lba: u64) -> bool {
+        false
+    }
 }
 
 /// The nothing-is-referenced oracle: genesis paths and tests, where no committed index exists to lap.

@@ -49,6 +49,17 @@ pub struct SpineEntry {
     pub eagle_time: i64,
     /// The run this commit wrote alongside its own entry, under the same single flush (the verified head, 2026-10-22): its first monotone plow position, its length in blocks, and BLAKE3 over its bytes in order. An entry can land while some of its run did not; a head whose run does not hash to this is a torn commit, and the vault opens at the generation before it. None on entries that wrote no run in the same flush (heartbeats, entries from before the field).
     pub tail: Option<Tail>,
+    /// The live map at this generation (see [`crate::livemap`]). None on entries from before the map, and on a grow's entry; such a head opens by walking the index, and the next commit writes the map.
+    pub livemap: Option<MapRef>,
+}
+
+/// Where a generation's live map is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MapRef {
+    /// The whole bitmap inside the entry itself — a tract small enough that it fits (see [`crate::livemap::INLINE_MAX_BITS`]) costs no tract block at all.
+    Inline(Vec<u8>),
+    /// The root table in the tract: (hash, tract position).
+    Root([u8; 32], u64),
 }
 
 /// See [`SpineEntry::tail`].
@@ -109,6 +120,20 @@ impl SpineEntry {
             }
             None => pairs,
         };
+        let pairs: Vec<(&str, VsfType)> = match &self.livemap {
+            Some(MapRef::Root(h, at)) => {
+                let mut p = pairs;
+                p.push(("lmap", VsfType::hp(h.to_vec())));
+                p.push(("lmapat", VsfType::u(*at as usize, false)));
+                p
+            }
+            Some(MapRef::Inline(bits)) => {
+                let mut p = pairs;
+                p.push(("lbits", VsfType::v(b'r', bits.clone())));
+                p
+            }
+            None => pairs,
+        };
         for (name, value) in pairs {
             put(VsfType::d(name.to_string()).flatten(), &mut cursor);
             put(value.flatten(), &mut cursor);
@@ -162,6 +187,9 @@ impl SpineEntry {
         let mut tail_start = None;
         let mut tail_count = None;
         let mut tail_hash = None;
+        let mut lmap = None;
+        let mut lmapat = None;
+        let mut lbits = None;
 
         // Named pairs until zero padding ('d' = 0x64; padding = 0x00). Unknown names are parsed-and-skipped — kernel-profile fields ride thru.
         while block.get(ptr) == Some(&b'd') {
@@ -183,6 +211,9 @@ impl SpineEntry {
                 ("tails", v) if as_u64(&v).is_some() => tail_start = as_u64(&v),
                 ("tailn", v) if as_u64(&v).is_some() => tail_count = as_u64(&v),
                 ("tailh", VsfType::hp(h)) => tail_hash = Some(to32(&h)?),
+                ("lmap", VsfType::hp(h)) => lmap = Some(to32(&h)?),
+                ("lmapat", v) if as_u64(&v).is_some() => lmapat = as_u64(&v),
+                ("lbits", VsfType::v(_, b)) => lbits = Some(b),
                 _ => {} // forward-compat: unknown field or unexpected type — skip
             }
         }
@@ -202,6 +233,12 @@ impl SpineEntry {
                 (Some(start), Some(count), Some(hash)) => Some(Tail { start, count, hash }),
                 (None, None, None) => None,
                 _ => return Err(Error::Corrupt("partial tail".into())),
+            },
+            livemap: match (lmap, lmapat, lbits) {
+                (Some(h), Some(at), None) => Some(MapRef::Root(h, at)),
+                (None, None, Some(b)) => Some(MapRef::Inline(b)),
+                (None, None, None) => None,
+                _ => return Err(Error::Corrupt("ambiguous livemap".into())),
             },
         };
         if entry.ring_log2 == 0 || entry.ring_log2 > 32 {

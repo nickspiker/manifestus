@@ -23,6 +23,8 @@ pub enum StorageEvent {
     LiveLapAverted { lba: u64 },
     /// The head generation's entry was on the device but its data run was not (a crash inside the commit's single flush): the vault opened at the generation before it. (gen of the torn entry)
     TornCommit { gen: u64 },
+    /// The head named a live map that did not load (damaged, or for another tract length); the vault opened by walking the index instead and will write the map whole at its next commit.
+    LiveMapFallback,
 }
 
 /// The injected sink. Implementations must be cheap and non-blocking from the engine's point of view — buffering and durability are the embedder's problem, not the engine's.

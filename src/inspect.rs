@@ -200,6 +200,14 @@ pub fn inspect<D: BlockDev>(dev: &mut D, opts: InspectOptions) -> Result<Inspect
             }
         }
     }
+    // The live map's own blocks (2026-10-22) are live and the index does not reach them: follow the head's map root thru its tables to its pages.
+    if opts.show_tree {
+        if let Some((_, h)) = head.as_ref() {
+            if let Some(crate::ring::MapRef::Root(hash, at)) = h.livemap {
+                livemap_blocks(dev, tract_base, tract_blocks_field, (hash, at), &mut reachable);
+            }
+        }
+    }
     let reachable_blocks = reachable.len();
 
     // Optional orphan scan.
@@ -1020,5 +1028,24 @@ mod tests {
 
         let _ = (&mut gen_check, &mut live_check);
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// Every block of a live map, by position, as far as its seals check out.
+fn livemap_blocks<D: BlockDev>(dev: &mut D, tract_base: u64, tract_len: Option<u64>, root: ([u8; 32], u64), out: &mut BTreeSet<u64>) {
+    use crate::livemap::{decode, Doc};
+    let mut stack = alloc::vec![root];
+    while let Some((hash, pos)) = stack.pop() {
+        if tract_len.is_some_and(|l| pos >= l) {
+            continue;
+        }
+        let mut buf = crate::block::ZERO_BLOCK;
+        if dev.read(tract_base + pos, &mut buf).is_err() || crate::tract::sealed_hp(&buf) != Some(hash) {
+            continue;
+        }
+        out.insert(pos);
+        if let Ok(Doc::Table { children, .. }) = decode(&buf) {
+            stack.extend(children);
+        }
     }
 }

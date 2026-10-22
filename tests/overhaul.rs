@@ -183,3 +183,66 @@ fn follower_survives_kill_nine() {
     }
     assert!(last_gen > 0, "commits happened");
 }
+
+/// Opening from the live map must know exactly what a walk of the index would: same positions, nothing more, nothing less — for an inline map (small tract) and a paged one (past `INLINE_MAX_BITS`), through churn long enough that the reap laps the tract and crosses the map's own pages.
+fn map_matches_walk(blocks: u64, value_len: usize, laps: u64) {
+    let dir = TempDir::new().unwrap();
+    let (pa, pb) = paths(&dir, "map");
+    FileDev::create(&pa, RING + blocks).unwrap();
+    FileDev::create(&pb, RING + blocks).unwrap();
+    let mut now = 100i64;
+    let keys = 24u64;
+    let value = |k: u64, round: u64| -> Vec<u8> {
+        let mut v = vec![(k as u8) ^ (round as u8); value_len];
+        v[..16].copy_from_slice(&blake3::hash(&[k.to_le_bytes(), round.to_le_bytes()].concat()).as_bytes()[..16]);
+        v
+    };
+    let mut latest = vec![0u64; keys as usize];
+    {
+        let mut v = open_pair(&pa, &pb);
+        let mut round = 0u64;
+        while v.tract_blocks_plowed() < laps * v.tract_blocks() {
+            round += 1;
+            for k in 0..keys {
+                now += 1;
+                if (k + round) % 5 == 0 {
+                    v.delete(&key(k), now).unwrap();
+                    latest[k as usize] = u64::MAX;
+                } else {
+                    v.put(&key(k), &value(k, round), now).unwrap();
+                    latest[k as usize] = round;
+                }
+            }
+            if round % 7 == 0 {
+                drop(v);
+                v = open_pair(&pa, &pb);
+                assert!(v.opened_from_map(), "round {round}: the reopen read the live map");
+                let (unrouted, missing) = v.live_map_divergence().unwrap();
+                assert!(unrouted.is_empty() && missing.is_empty(), "round {round}: map vs walk — unrouted {unrouted:?}, missing {missing:?}");
+            }
+        }
+        let (unrouted, missing) = v.live_map_divergence().unwrap();
+        assert!(unrouted.is_empty() && missing.is_empty(), "end: map vs walk — unrouted {unrouted:?}, missing {missing:?}");
+    }
+    let mut v = open_pair(&pa, &pb);
+    assert!(v.opened_from_map(), "the final reopen read the live map");
+    let (unrouted, missing) = v.live_map_divergence().unwrap();
+    assert!(unrouted.is_empty() && missing.is_empty(), "reopened: map vs walk — unrouted {unrouted:?}, missing {missing:?}");
+    for k in 0..keys {
+        let want = match latest[k as usize] {
+            u64::MAX => None,
+            r => Some(value(k, r)),
+        };
+        assert_eq!(v.get(&key(k)).unwrap(), want, "key {k}");
+    }
+}
+
+#[test]
+fn inline_map_matches_walk_through_laps() {
+    map_matches_walk(2048, 9_000, 3);
+}
+
+#[test]
+fn paged_map_matches_walk_through_laps() {
+    map_matches_walk(manifestus::livemap::INLINE_MAX_BITS + 8192, 60_000, 2);
+}
