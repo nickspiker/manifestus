@@ -374,7 +374,17 @@ impl Hamt {
                 Ok(Child::Dirty(idx))
             }
             Some(Child::Committed { hash, lba }) => {
-                let Some(doc) = self.doc(mirror, tract, lba, &hash)? else {
+                let doc = match self.doc(mirror, tract, lba, &hash) {
+                    Ok(d) => d,
+                    // A pointer whose block is bad on every mirror (read_doc already asked the second one): what it named is lost, and it sits on this put's path. Cut it here, as the repair open would — the new leaf takes its slot, the loss is named — instead of refusing every put whose path crosses it. Live opens no longer walk the index, so this is where such a pointer is met.
+                    Err(Error::Seal) | Err(Error::Corrupt(_)) => {
+                        self.delta.removed.push((lba, hash));
+                        mirror.emit(crate::events::StorageEvent::DanglingCut { lba });
+                        return Ok(leaf);
+                    }
+                    Err(e) => return Err(e),
+                };
+                let Some(doc) = doc else {
                     // Stale pointer at a fast-deleted (zeroed) leaf: the new leaf simply replaces it — resurrection after delete.
                     return Ok(leaf);
                 };

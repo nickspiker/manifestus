@@ -828,9 +828,14 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     /// Insert/overwrite, durable on return (commit-per-write). A refused append has no side effects, so the ladder simply makes room and retries: Fenced → commit generations to slide the K-window (heartbeats inside commit if the flush itself is fenced); TractFull → reap windows until space exists. Only a tract that stays full after a complete reap lap surfaces TractFull to the caller — grow or refuse.
     /// True iff `value` is already the COMMITTED value at `key` — the identical-overwrite skip's gate. Committed matters: matching a provisional copy and skipping would claim durability a crash could revoke. One index read against ~1s of flushes; same-value churn (fstate ping-pong, phonebook re-adoption) was pure plow pressure toward the fence cliff (field 2026-08-24/25).
     fn holds_committed(&mut self, key: &[u8; 32], value: &[u8]) -> Result<bool> {
+        // An index path that cannot be READ holds nothing this put could match: let the put proceed (its own descent cuts the bad pointer).
         let leaf = {
             let Self { ring, tract, hamt, .. } = self;
-            hamt.find_leaf(ring.mirror(), tract, key)?
+            match hamt.find_leaf(ring.mirror(), tract, key) {
+                Ok(l) => l,
+                Err(Error::Seal) | Err(Error::Corrupt(_)) => return Ok(false),
+                Err(e) => return Err(e),
+            }
         };
         let Some((lba, hash)) = leaf else {
             return Ok(false);

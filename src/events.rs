@@ -29,6 +29,8 @@ pub enum StorageEvent {
     ReadRepaired { lba: u64 },
     /// The idle scrub found a block bad on one device and rewrote it from the other. (lba, whether the primary was the bad side)
     ScrubRepaired { lba: u64, primary: bool },
+    /// A put's path crossed a pointer whose block is bad on every mirror: the pointer was cut and the new value took its place. Whatever it named is lost — the event is its record. (lba)
+    DanglingCut { lba: u64 },
 }
 
 /// The injected sink. Implementations must be cheap and non-blocking from the engine's point of view — buffering and durability are the embedder's problem, not the engine's.
