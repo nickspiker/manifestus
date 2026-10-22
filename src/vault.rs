@@ -281,6 +281,8 @@ pub struct VaultStats {
     pub live_blocks: u64,
     /// Bytes per block.
     pub block_bytes: u64,
+    /// Blocks the cache values occupy (see [`Vault::put_cached`]).
+    pub cache_blocks: u64,
 }
 
 pub struct Vault<A: BlockDev, B: BlockDev> {
@@ -1356,6 +1358,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             live_entries: self.live.len() as u64,
             live_blocks: self.live.live_blocks(),
             block_bytes: crate::BLOCK as u64,
+            cache_blocks: self.cache_live,
         }
     }
 
