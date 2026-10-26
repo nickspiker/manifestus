@@ -28,6 +28,8 @@ pub struct FileDev {
     blocks: u64,
     direct: bool,
     scratch: Box<AlignedBlock>,
+    /// The aligned bounce buffer for runs (O_DIRECT wants aligned memory), grown to the longest run seen.
+    run: Vec<AlignedBlock>,
 }
 
 impl FileDev {
@@ -68,6 +70,7 @@ impl FileDev {
             blocks: len / BLOCK as u64,
             direct,
             scratch: Box::new(AlignedBlock([0u8; BLOCK])),
+            run: Vec::new(),
         })
     }
 
@@ -145,9 +148,89 @@ impl BlockDev for FileDev {
         }
     }
 
+    fn write_run(&mut self, lba: u64, blocks: &[&Block]) -> Result<()> {
+        let n = blocks.len();
+        if n == 0 {
+            return Ok(());
+        }
+        self.bounds(lba + n as u64 - 1)?;
+        let buf = run_bytes(&mut self.run, n);
+        for (i, b) in blocks.iter().enumerate() {
+            buf[i * BLOCK..(i + 1) * BLOCK].copy_from_slice(&b[..]);
+        }
+        write_block_at(&self.file, buf, lba * BLOCK as u64)
+    }
+
+    fn read_run(&mut self, lba: u64, out: &mut [Block]) -> Result<()> {
+        let n = out.len();
+        if n == 0 {
+            return Ok(());
+        }
+        self.bounds(lba + n as u64 - 1)?;
+        let buf = run_bytes(&mut self.run, n);
+        read_block_at(&self.file, buf, lba * BLOCK as u64)?;
+        for (i, b) in out.iter_mut().enumerate() {
+            b.copy_from_slice(&buf[i * BLOCK..(i + 1) * BLOCK]);
+        }
+        Ok(())
+    }
+
+    fn read_many(&mut self, lbas: &[u64], out: &mut [Block]) -> Result<()> {
+        for &lba in lbas {
+            self.bounds(lba)?;
+        }
+        let per = lbas.len().div_ceil(READERS).max(1);
+        if lbas.len() < 2 * READERS {
+            for (&lba, b) in lbas.iter().zip(out.iter_mut()) {
+                self.read(lba, b)?;
+            }
+            return Ok(());
+        }
+        let (file, direct) = (&self.file, self.direct);
+        // Positioned reads share the one descriptor; each reader has its own aligned bounce block (O_DIRECT).
+        std::thread::scope(|s| {
+            let jobs: Vec<_> = lbas
+                .chunks(per)
+                .zip(out.chunks_mut(per))
+                .map(|(ls, bs)| {
+                    s.spawn(move || -> Result<()> {
+                        let mut scratch = Box::new(AlignedBlock([0u8; BLOCK]));
+                        for (&lba, b) in ls.iter().zip(bs.iter_mut()) {
+                            let off = lba * BLOCK as u64;
+                            if direct {
+                                read_block_at(file, &mut scratch.0, off)?;
+                                b.copy_from_slice(&scratch.0);
+                            } else {
+                                read_block_at(file, b, off)?;
+                            }
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            for j in jobs {
+                j.join().map_err(|_| Error::Corrupt("reader thread panicked".into()))??;
+            }
+            Ok(())
+        })
+    }
+
     fn grow(&mut self, new_blocks: u64) -> Result<()> {
         FileDev::grow(self, new_blocks)
     }
+}
+
+/// Reads in flight at once for `FileDev::read_many`: flash serves a queue of random 4KB reads faster than one at a time where its stack lets reads overlap (btrfs over dm-crypt on a SATA SSD does not: about 110 µs a read either way, 2026-10-25).
+const READERS: usize = 8;
+
+
+/// The run buffer at `n` blocks, as one byte slice.
+fn run_bytes(run: &mut Vec<AlignedBlock>, n: usize) -> &mut [u8] {
+    if run.len() < n {
+        run.resize_with(n, || AlignedBlock([0u8; BLOCK]));
+    }
+    // SAFETY: AlignedBlock is repr(C) over [u8; BLOCK] with BLOCK a multiple of its alignment, so n of them are n * BLOCK contiguous bytes.
+    unsafe { std::slice::from_raw_parts_mut(run.as_mut_ptr() as *mut u8, n * BLOCK) }
 }
 
 /// Read exactly `buf.len()` bytes at file offset `off`. Unix `read_exact_at` loops internally; Windows `seek_read` may return short, so loop until the block is filled (a 0-length read mid-block is a torn/truncated device — Corrupt).

@@ -690,43 +690,41 @@ impl Hamt {
         referenced: &mut Vec<u64>,
         stale: &mut Vec<StalePointer>,
     ) -> Result<()> {
-        let root = self.root.clone();
-        if let Some(Child::Committed { hash, lba }) = root {
-            self.walk_child_tree(mirror, tract, lba, &hash, [0u8; 32], 0, out, referenced, stale)?;
-        }
-        Ok(())
-    }
-
-    fn walk_child_tree<A: BlockDev, B: BlockDev>(
-        &mut self,
-        mirror: &mut Mirror<A, B>,
-        tract: &Tract,
-        lba: u64,
-        hash: &[u8; 32],
-        route: [u8; 32],
-        depth: u8,
-        out: &mut Vec<(u64, [u8; 32])>,
-        referenced: &mut Vec<u64>,
-        stale: &mut Vec<StalePointer>,
-    ) -> Result<()> {
-        let Some(doc) = read_doc(mirror, tract, lba, hash)? else {
-            stale.push(StalePointer { route, hash: *hash, lba });
-            return Ok(());
+        // Breadth first, a level of the tree read at a time with its reads in flight together (Tract::read_many), in bounded chunks: the depth-first walk read one block, decoded it, then read the next — about 0.1 ms each, a second an open at eight thousand entries (2026-10-25). The same checks per block as read_doc.
+        const CHUNK: usize = 1 << 10;
+        let mut frontier: Vec<(u64, [u8; 32], [u8; 32], u8)> = match self.root.clone() {
+            Some(Child::Committed { hash, lba }) => alloc::vec![(lba, hash, [0u8; 32], 0)],
+            _ => Vec::new(),
         };
-        out.push((lba, *hash));
-        match doc {
-            TractDoc::Node(node) => {
-                for (slot, c) in node.children.iter().enumerate() {
-                    if let Some(Child::Committed { hash, lba }) = c {
-                        let (h, l) = (*hash, *lba);
-                        let child_route = route_with_chunk(route, depth, slot as u8);
-                        self.walk_child_tree(mirror, tract, l, &h, child_route, depth + 1, out, referenced, stale)?;
+        let mut blocks: Vec<Block> = Vec::new();
+        while !frontier.is_empty() {
+            let mut next = Vec::new();
+            for part in frontier.chunks(CHUNK) {
+                let lbas: Vec<u64> = part.iter().map(|f| f.0).collect();
+                blocks.clear();
+                blocks.resize(part.len(), ZERO_BLOCK);
+                tract.read_many(mirror, &lbas, &mut blocks)?;
+                for (&(lba, hash, route, depth), buf) in part.iter().zip(&blocks) {
+                    let Some(doc) = doc_of(buf, lba, &hash)? else {
+                        stale.push(StalePointer { route, hash, lba });
+                        continue;
+                    };
+                    out.push((lba, hash));
+                    match doc {
+                        TractDoc::Node(node) => {
+                            for (slot, c) in node.children.iter().enumerate() {
+                                if let Some(Child::Committed { hash, lba }) = c {
+                                    next.push((*lba, *hash, route_with_chunk(route, depth, slot as u8), depth + 1));
+                                }
+                            }
+                        }
+                        TractDoc::Direct { furrows, .. } => referenced.extend(furrows),
+                        TractDoc::Extent { size, runs, .. } => referenced.extend(expand_runs(&runs, size)?),
+                        _ => {}
                     }
                 }
             }
-            TractDoc::Direct { furrows, .. } => referenced.extend(furrows),
-            TractDoc::Extent { size, runs, .. } => referenced.extend(expand_runs(&runs, size)?),
-            _ => {}
+            frontier = next;
         }
         Ok(())
     }
@@ -1303,17 +1301,22 @@ fn read_doc<A: BlockDev, B: BlockDev>(
     expected: &[u8; 32],
 ) -> Result<Option<TractDoc>> {
     let mut buf = ZERO_BLOCK;
-    tract.read(mirror, lba, &mut buf)?;
-    if buf == ZERO_BLOCK {
+    tract.read_cached(mirror, lba, &mut buf)?;
+    doc_of(&buf, lba, expected)
+}
+
+/// A read block as the document a pointer `(lba, expected)` names: None when zeroed (fast-deleted), Corrupt when unsealed, Seal when sealed as something else.
+fn doc_of(buf: &Block, lba: u64, expected: &[u8; 32]) -> Result<Option<TractDoc>> {
+    if *buf == ZERO_BLOCK {
         return Ok(None);
     }
-    let Some(hash) = sealed_hp(&buf) else {
+    let Some(hash) = sealed_hp(buf) else {
         return Err(Error::Corrupt(format!("unsealed block at tract lba {lba}")));
     };
     if &hash != expected {
         return Err(Error::Seal);
     }
-    decode_doc(&buf).map(Some)
+    decode_doc(buf).map(Some)
 }
 
 fn decode_doc(block: &Block) -> Result<TractDoc> {
@@ -1417,13 +1420,20 @@ fn read_furrows<A: BlockDev, B: BlockDev>(
     furrows: &[u64],
 ) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(size as usize);
-    for (i, lba) in furrows.iter().enumerate() {
-        let mut buf = ZERO_BLOCK;
-        tract.read(mirror, *lba, &mut buf)?;
-        if sealed_hp(&buf).is_none() {
+    // The furrows' blocks, each run of consecutive positions as one read (a value lands as one contiguous run, two at a ring wrap).
+    let mut blocks: Vec<Block> = alloc::vec![ZERO_BLOCK; furrows.len()];
+    let mut start = 0;
+    for i in 1..=furrows.len() {
+        if i == furrows.len() || furrows[i] != furrows[i - 1] + 1 {
+            tract.read_run(mirror, furrows[start], &mut blocks[start..i])?;
+            start = i;
+        }
+    }
+    for (i, buf) in blocks.iter().enumerate() {
+        if sealed_hp(buf).is_none() {
             return Err(Error::Corrupt(format!("furrow {i} unsealed")));
         }
-        match decode_doc(&buf)? {
+        match decode_doc(buf)? {
             TractDoc::Furrow { key: k, index, payload } => {
                 if &k != key || index as usize != i {
                     return Err(Error::Corrupt(format!("furrow {i} mismatched owner/index")));

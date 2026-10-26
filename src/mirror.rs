@@ -11,6 +11,7 @@
 //! Hybrid write path: the bulk *data* blocks of a commit go through [`Mirror::write_verified_batch`], which writes both rings concurrently (each ring is its own disk — the ferros two-device case, in software for now) and verifies both, reconciled with the same primary-authoritative rule. The single-block [`Mirror::write_verified`] stays sequential and is what the authoritative spine commit uses, so "one device defines the committed generation" is unchanged.
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use crate::block::{Block, BlockDev, ZERO_BLOCK};
 use crate::error::{Error, Result};
 use crate::events::{EventSink, NullSink, StorageEvent};
@@ -21,20 +22,43 @@ const PAR_BATCH_THRESHOLD: usize = 4;
 
 /// Write + verify every block of a batch on one device, with a device-local scratch (so concurrent device threads never share the read-back buffer).
 /// ONE flush for the whole batch, not one per block (field 2026-08-25: per-block F_FULLFSYNC made a one-note put cost 12-20 drive-cache flushes — a flat, size-independent 0.3-1.4s; ferros boots faster). The crash contract needs ORDERING (everything a spine entry references on media before the spine lands), which the caller's final spine write_one still provides; the media read-back property (F_NOCACHE) is preserved because verification happens AFTER the single flush. A verify miss retries write+flush+verify once for just the failed block — write_one's exact discipline, paid only on damage.
+/// Consecutive positions go as one run each way (BlockDev::write_run / read_run): a commit's appends are runs, and one I/O per 4KB block was a device round trip each.
 #[cfg(feature = "std")]
 fn write_each<D: BlockDev>(dev: &mut D, blocks: &[(u64, &Block)]) -> Result<()> {
     let mut scratch = ZERO_BLOCK;
-    for &(lba, buf) in blocks {
-        dev.write(lba, buf)?;
+    let runs = runs_of(blocks);
+    for r in &runs {
+        let bufs: alloc::vec::Vec<&Block> = blocks[r.clone()].iter().map(|&(_, b)| b).collect();
+        dev.write_run(blocks[r.start].0, &bufs)?;
     }
     dev.flush()?;
-    for &(lba, buf) in blocks {
-        dev.read(lba, &mut scratch)?;
-        if &scratch != buf {
-            write_one(dev, lba, buf, &mut scratch)?;
+    let mut back: alloc::vec::Vec<Block> = alloc::vec::Vec::new();
+    for r in &runs {
+        back.clear();
+        back.resize(r.len(), ZERO_BLOCK);
+        dev.read_run(blocks[r.start].0, &mut back)?;
+        for (i, got) in back.iter().enumerate() {
+            let (lba, buf) = blocks[r.start + i];
+            if got != buf {
+                write_one(dev, lba, buf, &mut scratch)?;
+            }
         }
     }
     Ok(())
+}
+
+/// The batch cut where positions stop being consecutive: index ranges of runs.
+#[cfg(feature = "std")]
+fn runs_of(blocks: &[(u64, &Block)]) -> alloc::vec::Vec<core::ops::Range<usize>> {
+    let mut out = alloc::vec::Vec::new();
+    let mut start = 0;
+    for i in 1..=blocks.len() {
+        if i == blocks.len() || blocks[i].0 != blocks[i - 1].0 + 1 {
+            out.push(start..i);
+            start = i;
+        }
+    }
+    out
 }
 
 pub struct Mirror<A: BlockDev, B: BlockDev> {
@@ -44,7 +68,15 @@ pub struct Mirror<A: BlockDev, B: BlockDev> {
     scratch: Block,
     /// Outbound event sink. Defaults to [`NullSink`]; the embedder attaches its own via [`Mirror::with_events`] (Photon → log.vsf, kernel → Ledger::Vault). Off the hot path — emitted only when a mirror drops to degraded, never per block.
     events: Box<dyn EventSink>,
+    /// Appends staged and not yet written ([`Mirror::stage`]), in order. Reads see them first; every other write, a flush and a grow write them out before themselves, as one verified batch — so a spine entry still lands only after everything it can reference is verified on media.
+    pending: Vec<(u64, Block)>,
+    /// Blocks the index walk read ([`Mirror::read_cached`]): position, last use, contents; sorted by position. Any write to a position drops it, so a hit is exactly what the device holds. The walk re-read the same nodes from the media on every get and put (2026-10-25: thirty-odd single-block reads a put).
+    cache: Vec<(u64, u64, Box<Block>)>,
+    uses: u64,
 }
+
+/// Blocks the index cache holds: 4 MB.
+const CACHE_BLOCKS: usize = 1 << 10;
 
 impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
     pub fn new(a: A, b: B) -> Self {
@@ -54,6 +86,9 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
             degraded: false,
             scratch: ZERO_BLOCK,
             events: Box::new(NullSink),
+            pending: Vec::new(),
+            cache: Vec::new(),
+            uses: 0,
         }
     }
 
@@ -75,11 +110,76 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
             degraded,
             scratch: ZERO_BLOCK,
             events: Box::new(NullSink),
+            pending: Vec::new(),
+            cache: Vec::new(),
+            uses: 0,
         })
     }
 
-    /// Write `buf` at `lba` on every present device, verifying each by read-back before touching the next. See module docs for the failure matrix.
+    /// Stage appended blocks (the tract's appends, which no committed generation references): written, flushed and verified together by the next [`Self::drain`], which every other write, flush and grow runs first. A commit's furrows, leaves and index nodes thus go out as one batch per device — one flush each, contiguous runs as one I/O — instead of a write-flush-verify round per append (2026-10-25: about six sequential drive flushes per put, 35-90 ms on a desktop SSD).
+    pub fn stage(&mut self, blocks: &[(u64, &Block)]) {
+        for &(lba, b) in blocks {
+            self.forget(lba);
+            self.pending.push((lba, *b));
+        }
+    }
+
+    /// A position about to be written leaves the cache.
+    fn forget(&mut self, lba: u64) {
+        if let Ok(i) = self.cache.binary_search_by_key(&lba, |e| e.0) {
+            self.cache.remove(i);
+        }
+    }
+
+    /// [`Self::read`] for the index walk, kept in a small cache of recently read blocks (the least recently used goes when it is full). For the walk's blocks only: furrows, reap windows and verification read the media.
+    pub fn read_cached(&mut self, lba: u64, buf: &mut Block) -> Result<()> {
+        if let Some((_, b)) = self.pending.iter().rev().find(|(l, _)| *l == lba) {
+            buf.copy_from_slice(b);
+            return Ok(());
+        }
+        self.uses += 1;
+        match self.cache.binary_search_by_key(&lba, |e| e.0) {
+            Ok(i) => {
+                self.cache[i].1 = self.uses;
+                buf.copy_from_slice(&self.cache[i].2[..]);
+                Ok(())
+            }
+            Err(_) => {
+                self.read(lba, buf)?;
+                if self.cache.len() >= CACHE_BLOCKS {
+                    let oldest = (0..self.cache.len()).min_by_key(|&i| self.cache[i].1).unwrap();
+                    self.cache.remove(oldest);
+                }
+                let at = self.cache.binary_search_by_key(&lba, |e| e.0).unwrap_err();
+                self.cache.insert(at, (lba, self.uses, Box::new(*buf)));
+                Ok(())
+            }
+        }
+    }
+
+    /// Write out everything staged: one verified batch on each device (see [`Self::write_verified_batch`]). A position staged twice keeps its last block.
+    pub fn drain(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let mut pending = core::mem::take(&mut self.pending);
+        // Last write wins, then position order so runs coalesce: a stable sort keeps a position's stagings in order, and the dedup keeps the last of each.
+        pending.sort_by_key(|&(lba, _)| lba);
+        let mut out: Vec<(u64, Block)> = Vec::with_capacity(pending.len());
+        for (lba, b) in pending {
+            match out.last_mut() {
+                Some(last) if last.0 == lba => last.1 = b,
+                _ => out.push((lba, b)),
+            }
+        }
+        let refs: Vec<(u64, &Block)> = out.iter().map(|(l, b)| (*l, b)).collect();
+        self.write_verified_batch_now(&refs)
+    }
+
+    /// Write `buf` at `lba` on every present device, verifying each by read-back before touching the next. See module docs for the failure matrix. Staged appends are written out first.
     pub fn write_verified(&mut self, lba: u64, buf: &Block) -> Result<()> {
+        self.drain()?;
+        self.forget(lba);
         match (self.a.as_mut(), self.b.as_mut()) {
             (Some(a), b) => {
                 // Primary must land or the op fails — secondary deliberately untouched on primary failure.
@@ -100,6 +200,14 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
 
     /// Concurrent bulk write: fan the whole batch out to both rings on separate threads (each writes + read-back-verifies its own device with a private scratch), then reconcile. The primary stays authoritative — its failure fails the op; a secondary failure drops the ring and flips `degraded`. This is the hybrid for the data-block phase of a commit; the authoritative spine commit still uses the sequential [`write_verified`]. A single device, or a batch below [`PAR_BATCH_THRESHOLD`], falls back to sequential. Per-block discipline is unchanged: write → flush → read back → compare → retry once.
     pub fn write_verified_batch(&mut self, blocks: &[(u64, &Block)]) -> Result<()> {
+        self.drain()?;
+        self.write_verified_batch_now(blocks)
+    }
+
+    fn write_verified_batch_now(&mut self, blocks: &[(u64, &Block)]) -> Result<()> {
+        for &(lba, _) in blocks {
+            self.forget(lba);
+        }
         // The parallel fan-out needs std threads; the kernel profile always takes the sequential path below (per-block discipline is identical, wall-clock is the only difference).
         #[cfg(feature = "std")]
         {
@@ -152,6 +260,7 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
 
     /// Extend every present device to `new_blocks`, same failure matrix as writes: primary must grow or the op fails; a secondary that refuses is dropped for the session (`degraded` flips) — the primary carries the new geometry alone.
     pub fn grow(&mut self, new_blocks: u64) -> Result<()> {
+        self.drain()?;
         match (self.a.as_mut(), self.b.as_mut()) {
             (Some(a), b) => {
                 a.grow(new_blocks)?;
@@ -181,6 +290,11 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
     /// Both rings lock-step relocate to stay byte-identical; the ref re-point (tract) / new spine entry
     /// (ring) is the commit, tombstones advisory. Needed before the calls/attachments layer (one bad block in a large recording must self-heal, not surface as Corrupt).
     pub fn read(&mut self, lba: u64, buf: &mut Block) -> Result<()> {
+        // A staged append reads as staged (the last staging of the position).
+        if let Some((_, b)) = self.pending.iter().rev().find(|(l, _)| *l == lba) {
+            buf.copy_from_slice(b);
+            return Ok(());
+        }
         if let Some(a) = self.a.as_mut() {
             return a.read(lba, buf);
         }
@@ -190,7 +304,43 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
         Err(Error::Corrupt("mirror has no devices".into()))
     }
 
+    /// Consecutive blocks from `lba` from the first healthy device as one I/O (a value's furrows are a run); a run touching a staged append reads block by block, so the staging is seen.
+    pub fn read_run(&mut self, lba: u64, out: &mut [Block]) -> Result<()> {
+        let end = lba + out.len() as u64;
+        if self.pending.iter().any(|(l, _)| (lba..end).contains(l)) {
+            for (i, b) in out.iter_mut().enumerate() {
+                self.read(lba + i as u64, b)?;
+            }
+            return Ok(());
+        }
+        if let Some(a) = self.a.as_mut() {
+            return a.read_run(lba, out);
+        }
+        if let Some(b) = self.b.as_mut() {
+            return b.read_run(lba, out);
+        }
+        Err(Error::Corrupt("mirror has no devices".into()))
+    }
+
+    /// Scattered blocks from the first healthy device, with reads in flight together ([`BlockDev::read_many`]); with appends staged, block by block so they are seen.
+    pub fn read_many(&mut self, lbas: &[u64], out: &mut [Block]) -> Result<()> {
+        if !self.pending.is_empty() {
+            for (&lba, b) in lbas.iter().zip(out.iter_mut()) {
+                self.read(lba, b)?;
+            }
+            return Ok(());
+        }
+        if let Some(a) = self.a.as_mut() {
+            return a.read_many(lbas, out);
+        }
+        if let Some(b) = self.b.as_mut() {
+            return b.read_many(lbas, out);
+        }
+        Err(Error::Corrupt("mirror has no devices".into()))
+    }
+
     pub fn flush(&mut self) -> Result<()> {
+        self.drain()?;
         if let Some(a) = self.a.as_mut() {
             a.flush()?;
         }
@@ -232,6 +382,9 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
 
     /// Direct access for replication / per-device search (verified_replicate reads both sides independently).
     pub fn devices(&mut self) -> (Option<&mut A>, Option<&mut B>) {
+        debug_assert!(self.pending.is_empty(), "raw device access with appends staged");
+        // Raw access may write: nothing cached survives it.
+        self.cache.clear();
         (self.a.as_mut(), self.b.as_mut())
     }
 }

@@ -20,6 +20,30 @@ pub trait BlockDev: Send {
 
     fn write(&mut self, lba: u64, buf: &Block) -> Result<()>;
 
+    /// Consecutive blocks from `lba` as one I/O where the device can: a commit's appends are runs, and a block at a time they were a device round trip each (2026-10-25: a 40 KB put was 40 single-block O_DIRECT writes and as many reads across the two rings). Default: block by block.
+    fn write_run(&mut self, lba: u64, blocks: &[&Block]) -> Result<()> {
+        for (i, b) in blocks.iter().enumerate() {
+            self.write(lba + i as u64, b)?;
+        }
+        Ok(())
+    }
+
+    /// Consecutive blocks from `lba` into `out`, as one I/O where the device can. Default: block by block.
+    fn read_run(&mut self, lba: u64, out: &mut [Block]) -> Result<()> {
+        for (i, b) in out.iter_mut().enumerate() {
+            self.read(lba + i as u64, b)?;
+        }
+        Ok(())
+    }
+
+    /// Scattered blocks, `out[i]` from `lbas[i]`, with as many reads in flight as the device can take where it can (the open's index walk reads a level of the tree at a time). Default: one after another.
+    fn read_many(&mut self, lbas: &[u64], out: &mut [Block]) -> Result<()> {
+        for (&lba, b) in lbas.iter().zip(out.iter_mut()) {
+            self.read(lba, b)?;
+        }
+        Ok(())
+    }
+
     /// TRIM hint. No-op on host (filesystem's problem); kernel profile forwards to UFS/SD on tract wrap boundaries per RING.md.
     fn discard(&mut self, _lba: u64, _count: u64) -> Result<()> {
         Ok(())
@@ -46,6 +70,15 @@ impl<D: BlockDev + ?Sized> BlockDev for &mut D {
     }
     fn write(&mut self, lba: u64, buf: &Block) -> Result<()> {
         (**self).write(lba, buf)
+    }
+    fn write_run(&mut self, lba: u64, blocks: &[&Block]) -> Result<()> {
+        (**self).write_run(lba, blocks)
+    }
+    fn read_run(&mut self, lba: u64, out: &mut [Block]) -> Result<()> {
+        (**self).read_run(lba, out)
+    }
+    fn read_many(&mut self, lbas: &[u64], out: &mut [Block]) -> Result<()> {
+        (**self).read_many(lbas, out)
     }
     fn discard(&mut self, lba: u64, count: u64) -> Result<()> {
         (**self).discard(lba, count)

@@ -92,7 +92,7 @@ impl Tract {
     }
 
     /// Append `blocks` contiguously at the plow (already sealed by the layer above).
-    /// Returns the tract-relative lbas, in order — consecutive positions, wrapping at most once. Checks space, fence AND liveness BEFORE writing a byte: a refused append has no side effects.
+    /// Returns the tract-relative lbas, in order — consecutive positions, wrapping at most once. Checks space, fence AND liveness BEFORE staging a byte: a refused append has no side effects. The blocks are staged in the mirror and reach the devices, verified, before the next spine write.
     pub fn append<A: BlockDev, B: BlockDev>(
         &mut self,
         mirror: &mut Mirror<A, B>,
@@ -121,7 +121,8 @@ impl Tract {
             .enumerate()
             .map(|(i, b)| (self.base + (self.plow + i as u64) % self.len, b))
             .collect();
-        mirror.write_verified_batch(&batch)?;
+        // Staged, not written: the commit that will reference these writes them out first (Mirror::stage / drain).
+        mirror.stage(&batch);
         let placed = (0..n).map(|i| (self.plow + i) % self.len).collect();
         self.plow += n;
         Ok(placed)
@@ -137,6 +138,34 @@ impl Tract {
             return Err(Error::Bounds(lba));
         }
         mirror.write_verified(self.base + lba, &crate::block::ZERO_BLOCK)
+    }
+
+    /// [`Self::read`] thru the mirror's index cache — the index walk's reads (see [`Mirror::read_cached`]).
+    pub fn read_cached<A: BlockDev, B: BlockDev>(&self, mirror: &mut Mirror<A, B>, lba: u64, buf: &mut Block) -> Result<()> {
+        if lba >= self.len {
+            return Err(Error::Bounds(lba));
+        }
+        mirror.read_cached(self.base + lba, buf)
+    }
+
+    /// Consecutive tract blocks from `lba` as one read (no ring wrap inside: callers cut their runs at consecutive positions, which a wrap breaks).
+    pub fn read_run<A: BlockDev, B: BlockDev>(&self, mirror: &mut Mirror<A, B>, lba: u64, out: &mut [Block]) -> Result<()> {
+        if lba + out.len() as u64 > self.len {
+            return Err(Error::Bounds(lba + out.len() as u64 - 1));
+        }
+        mirror.read_run(self.base + lba, out)
+    }
+
+    /// Scattered tract blocks with reads in flight together ([`Mirror::read_many`]).
+    pub fn read_many<A: BlockDev, B: BlockDev>(&self, mirror: &mut Mirror<A, B>, lbas: &[u64], out: &mut [Block]) -> Result<()> {
+        let mut dev: Vec<u64> = Vec::with_capacity(lbas.len());
+        for &lba in lbas {
+            if lba >= self.len {
+                return Err(Error::Bounds(lba));
+            }
+            dev.push(self.base + lba);
+        }
+        mirror.read_many(&dev, out)
     }
 
     /// Plain read of a tract block (callers verify content at their own layer).
