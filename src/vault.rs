@@ -13,7 +13,8 @@ use crate::hamt::{DanglingPointer, Delta, Hamt, StalePointer};
 use crate::mirror::Mirror;
 use crate::ring::{any_sealed_block, append_root, read_root, zero_ring, zero_ring_at, Ring, RootEntry, SpineEntry, FENCE_K, ROOT_SLOTS};
 use crate::tract::{Liveness, Tract};
-use alloc::{format, vec::Vec};
+// `Box` imported by name: without the `std` feature (ferros builds manifestus no_std) there is no prelude to bring it in — lazy open's `Settling` box broke the kernel build (2026-10-25).
+use alloc::{boxed::Box, format, vec::Vec};
 use hashbrown::HashMap;
 
 /// The vault's knowledge of what is referenced: tract lba → sealing hash. Rebuilt from the committed HAMT at open; maintained by deltas afterward. This IS the reap's liveness oracle.
