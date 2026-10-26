@@ -99,7 +99,17 @@ impl Tract {
         live: &dyn Liveness,
         blocks: &[Block],
     ) -> Result<Vec<u64>> {
-        let n = blocks.len() as u64;
+        self.append_with(mirror, live, blocks.len() as u64, |i| blocks[i as usize])
+    }
+
+    /// [`Self::append`] without the caller's copy of the blocks: block `i` is made by `make(i)` and staged as it is made, after every check has passed (so a refused append makes and stages nothing). A large value is then held once, in the staging, instead of once in the caller's vector and again there (2026-10-26: a 2.78 MB put peaked at 3.3x the value in the heap, and ran the ferros kernel's out).
+    pub fn append_with<A: BlockDev, B: BlockDev>(
+        &mut self,
+        mirror: &mut Mirror<A, B>,
+        live: &dyn Liveness,
+        n: u64,
+        mut make: impl FnMut(u64) -> Block,
+    ) -> Result<Vec<u64>> {
         if n > self.clean_blocks() {
             return Err(Error::TractFull);
         }
@@ -116,13 +126,12 @@ impl Tract {
                 return Err(Error::TractFull);
             }
         }
-        let batch: Vec<(u64, &Block)> = blocks
-            .iter()
-            .enumerate()
-            .map(|(i, b)| (self.base + (self.plow + i as u64) % self.len, b))
-            .collect();
         // Staged, not written: the commit that will reference these writes them out first (Mirror::stage / drain).
-        mirror.stage(&batch);
+        mirror.reserve_staged(n as usize);
+        for i in 0..n {
+            let b = make(i);
+            mirror.stage_one(self.base + (self.plow + i) % self.len, &b);
+        }
         let placed = (0..n).map(|i| (self.plow + i) % self.len).collect();
         self.plow += n;
         Ok(placed)

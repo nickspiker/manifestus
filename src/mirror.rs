@@ -69,7 +69,8 @@ pub struct Mirror<A: BlockDev, B: BlockDev> {
     /// Outbound event sink. Defaults to [`NullSink`]; the embedder attaches its own via [`Mirror::with_events`] (Photon → log.vsf, kernel → Ledger::Vault). Off the hot path — emitted only when a mirror drops to degraded, never per block.
     events: Box<dyn EventSink>,
     /// Appends staged and not yet written ([`Mirror::stage`]), in order. Reads see them first; every other write, a flush and a grow write them out before themselves, as one verified batch — so a spine entry still lands only after everything it can reference is verified on media.
-    pending: Vec<(u64, Block)>,
+    /// Kept as batches, each allocated once at its size and never grown: one vector of every staged block reallocated as appends arrived, and a large value's furrows plus the one leaf after them briefly held the furrows twice (2026-10-26: a 2.78 MB put peaked at 5.7x the value). No batch is empty.
+    pending: Vec<Vec<(u64, Block)>>,
     /// Blocks the index walk read ([`Mirror::read_cached`]): position, last use, contents; sorted by position. Any write to a position drops it, so a hit is exactly what the device holds. The walk re-read the same nodes from the media on every get and put (2026-10-25: thirty-odd single-block reads a put).
     cache: Vec<(u64, u64, Box<Block>)>,
     uses: u64,
@@ -118,9 +119,34 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
 
     /// Stage appended blocks (the tract's appends, which no committed generation references): written, flushed and verified together by the next [`Self::drain`], which every other write, flush and grow runs first. A commit's furrows, leaves and index nodes thus go out as one batch per device — one flush each, contiguous runs as one I/O — instead of a write-flush-verify round per append (2026-10-25: about six sequential drive flushes per put, 35-90 ms on a desktop SSD).
     pub fn stage(&mut self, blocks: &[(u64, &Block)]) {
+        if blocks.is_empty() {
+            return;
+        }
+        let mut batch = Vec::with_capacity(blocks.len());
         for &(lba, b) in blocks {
             self.forget(lba);
-            self.pending.push((lba, *b));
+            batch.push((lba, *b));
+        }
+        self.pending.push(batch);
+    }
+
+    /// Room for `n` blocks in a batch of their own, for the [`Self::stage_one`] calls that follow (a caller that makes its blocks one at a time, and need not hold them all first).
+    pub fn reserve_staged(&mut self, n: usize) {
+        if n > 0 {
+            self.pending.push(Vec::with_capacity(n));
+        }
+    }
+
+    /// Stage one block, into the last batch while it has room, else into a batch of its own.
+    pub fn stage_one(&mut self, lba: u64, b: &Block) {
+        self.forget(lba);
+        match self.pending.last_mut() {
+            Some(batch) if batch.len() < batch.capacity() => batch.push((lba, *b)),
+            _ => {
+                let mut batch = Vec::with_capacity(1);
+                batch.push((lba, *b));
+                self.pending.push(batch);
+            }
         }
     }
 
@@ -133,7 +159,7 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
 
     /// [`Self::read`] for the index walk, kept in a small cache of recently read blocks (the least recently used goes when it is full). For the walk's blocks only: furrows, reap windows and verification read the media.
     pub fn read_cached(&mut self, lba: u64, buf: &mut Block) -> Result<()> {
-        if let Some((_, b)) = self.pending.iter().rev().find(|(l, _)| *l == lba) {
+        if let Some((_, b)) = self.pending.iter().rev().flat_map(|batch| batch.iter().rev()).find(|(l, _)| *l == lba) {
             buf.copy_from_slice(b);
             return Ok(());
         }
@@ -162,17 +188,18 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
         if self.pending.is_empty() {
             return Ok(());
         }
-        let mut pending = core::mem::take(&mut self.pending);
-        // Last write wins, then position order so runs coalesce: a stable sort keeps a position's stagings in order, and the dedup keeps the last of each.
-        pending.sort_by_key(|&(lba, _)| lba);
-        let mut out: Vec<(u64, Block)> = Vec::with_capacity(pending.len());
-        for (lba, b) in pending {
-            match out.last_mut() {
-                Some(last) if last.0 == lba => last.1 = b,
-                _ => out.push((lba, b)),
+        let pending = core::mem::take(&mut self.pending);
+        // Last write wins, then position order so runs coalesce: references to the staged blocks in staging order, a stable sort keeps a position's stagings in order, and the dedup keeps the last of each. The blocks themselves are not copied (a deduplicated copy was a second copy of a large value, 2026-10-26). `dedup_by` hands (later, earlier): the later reference takes the earlier one's place.
+        let mut refs: Vec<(u64, &Block)> = pending.iter().flatten().map(|(l, b)| (*l, b)).collect();
+        refs.sort_by_key(|&(lba, _)| lba);
+        refs.dedup_by(|later, earlier| {
+            if later.0 == earlier.0 {
+                *earlier = *later;
+                true
+            } else {
+                false
             }
-        }
-        let refs: Vec<(u64, &Block)> = out.iter().map(|(l, b)| (*l, b)).collect();
+        });
         self.write_verified_batch_now(&refs)
     }
 
@@ -291,7 +318,7 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
     /// (ring) is the commit, tombstones advisory. Needed before the calls/attachments layer (one bad block in a large recording must self-heal, not surface as Corrupt).
     pub fn read(&mut self, lba: u64, buf: &mut Block) -> Result<()> {
         // A staged append reads as staged (the last staging of the position).
-        if let Some((_, b)) = self.pending.iter().rev().find(|(l, _)| *l == lba) {
+        if let Some((_, b)) = self.pending.iter().rev().flat_map(|batch| batch.iter().rev()).find(|(l, _)| *l == lba) {
             buf.copy_from_slice(b);
             return Ok(());
         }
@@ -307,7 +334,7 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
     /// Consecutive blocks from `lba` from the first healthy device as one I/O (a value's furrows are a run); a run touching a staged append reads block by block, so the staging is seen.
     pub fn read_run(&mut self, lba: u64, out: &mut [Block]) -> Result<()> {
         let end = lba + out.len() as u64;
-        if self.pending.iter().any(|(l, _)| (lba..end).contains(l)) {
+        if self.pending.iter().flatten().any(|(l, _)| (lba..end).contains(l)) {
             for (i, b) in out.iter_mut().enumerate() {
                 self.read(lba + i as u64, b)?;
             }

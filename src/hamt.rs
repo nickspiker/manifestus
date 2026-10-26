@@ -257,15 +257,18 @@ impl Hamt {
         } else {
             // Furrows first (the leaf references their positions, so they must land first).
             // One contiguous append — the runs come back as one extent, two at a ring wrap.
+            // Each furrow encoded as it is staged (Tract::append_with), its hash kept for the delta: the value is held once, in the staging, not first as a vector of every furrow too (2026-10-26).
             let per = furrow_capacity();
-            let payload: Vec<Block> = value
-                .chunks(per)
-                .enumerate()
-                .map(|(i, c)| encode_furrow(key, i as u64, c))
-                .collect();
-            let placed = tract.append(mirror, live, &payload)?;
-            for (lba, b) in placed.iter().zip(&payload) {
-                self.delta.added.push((*lba, sealed_hp(b).unwrap()));
+            let count = value.len().div_ceil(per) as u64;
+            let mut hashes = Vec::with_capacity(count as usize);
+            let placed = tract.append_with(mirror, live, count, |i| {
+                let lo = i as usize * per;
+                let b = encode_furrow(key, i, &value[lo..(lo + per).min(value.len())]);
+                hashes.push(sealed_hp(&b).unwrap());
+                b
+            })?;
+            for (lba, h) in placed.iter().zip(hashes) {
+                self.delta.added.push((*lba, h));
             }
             let runs = compress_runs(&placed);
             let leaf = encode_extent(key, value.len() as u64, &runs)?;

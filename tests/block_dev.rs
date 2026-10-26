@@ -131,6 +131,37 @@ fn mirror_writes_both_devices() {
     }
 }
 
+/// Staged appends (a batch from `stage`, then one at a time into a reserved batch, then a lone `stage_one`): reads see the last staging of a position before the drain, and the drain writes exactly the last staging of each position to both devices.
+#[test]
+fn mirror_staging_last_wins_across_batches() {
+    let dir = TempDir::new().unwrap();
+    let pa = dir.path().join("a.bin");
+    let pb = dir.path().join("b.bin");
+    let a = FileDev::create(&pa, 16).unwrap();
+    let b = FileDev::create(&pb, 16).unwrap();
+    let mut m = Mirror::new(a, b);
+
+    m.stage(&[(3, &pattern(3, 1)), (4, &pattern(4, 1))]);
+    m.reserve_staged(2);
+    m.stage_one(4, &pattern(4, 2));
+    m.stage_one(5, &pattern(5, 2));
+    m.stage_one(3, &pattern(3, 3));
+    let mut buf = ZERO_BLOCK;
+    for (lba, seed) in [(3, 3), (4, 2), (5, 2)] {
+        m.read(lba, &mut buf).unwrap();
+        assert_eq!(buf, pattern(lba, seed), "staged read of {lba}");
+    }
+    m.drain().unwrap();
+    drop(m);
+    for p in [&pa, &pb] {
+        let bytes = std::fs::read(p).unwrap();
+        for (lba, seed) in [(3u64, 3u8), (4, 2), (5, 2)] {
+            let got = &bytes[lba as usize * BLOCK..(lba as usize + 1) * BLOCK];
+            assert_eq!(got, pattern(lba, seed).as_slice(), "{p:?} block {lba}");
+        }
+    }
+}
+
 /// Test-local failing device: forwards to inner FileDev, fails writes after a fuse burns.
 struct Flaky {
     inner: FileDev,
