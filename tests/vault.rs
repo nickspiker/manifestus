@@ -397,8 +397,11 @@ fn vault_kill_child_worker() {
     let a = FileDev::open(std::path::Path::new(&format!("{base}-a.vsf"))).unwrap();
     let b = FileDev::open(std::path::Path::new(&format!("{base}-b.vsf"))).unwrap();
     let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 5_000, DeletePolicy::UnlinkOnly).unwrap();
-    // Resume the sequence where the committed history says we are.
-    let mut i = v.generation().unwrap_or(0); // gen g = g puts committed (genesis is gen 0)
+    // Resume the sequence where the committed puts end: the first key absent. Not the generation — reaps and fence heartbeats commit generations of their own, so it runs ahead of the puts.
+    let mut i = 0u64;
+    while v.get(&key(i)).unwrap().is_some() {
+        i += 1;
+    }
     loop {
         let _ = v.put(&key(i), &val(i), 5_000 + i as i64);
         i += 1;
@@ -444,18 +447,16 @@ fn vault_survives_kill_nine_with_exact_committed_prefix() {
         assert!(g >= last_gen, "round {round}: generations must be monotone");
         last_gen = g;
 
-        for i in 0..g {
-            assert_eq!(
-                v.get(&key(i)).unwrap(),
-                Some(val(i)),
-                "round {round}: committed put {i} of {g} must be intact"
-            );
+        // The committed puts are EXACTLY a prefix: keys 0..k intact, every key after absent (the in-flight put died provisional, never partially visible). The generation only bounds k — reaps and fence heartbeats commit generations of their own.
+        let mut k = 0u64;
+        while let Some(got) = v.get(&key(k)).unwrap() {
+            assert_eq!(got, val(k), "round {round}: committed put {k} must be intact");
+            k += 1;
         }
-        assert_eq!(
-            v.get(&key(g)).unwrap(),
-            None,
-            "round {round}: the in-flight put must be fully absent — never partially visible"
-        );
+        assert!(k <= g, "round {round}: {k} puts visible under generation {g}");
+        for i in k..k + 64 {
+            assert_eq!(v.get(&key(i)).unwrap(), None, "round {round}: put {i}, past the committed prefix of {k}, must be absent");
+        }
     }
     assert!(last_gen > 0, "at least one put committed across the rounds");
 }
