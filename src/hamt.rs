@@ -41,6 +41,12 @@ pub struct Delta {
     pub removed: Vec<(u64, [u8; 32])>,
 }
 
+/// A pointer the tree walk has still to read: its target's position and hash, the route to it, its depth.
+pub type WalkItem = (u64, [u8; 32], [u8; 32], u8);
+
+/// Pointers a tree-walk step reads together: a lazy open's reader waits for at most one step (about 30 ms at 0.1 ms a read on a desktop SSD).
+pub const WALK_STEP: usize = 1 << 8;
+
 /// A committed pointer whose target reads as all-zero: a fast-deleted leaf whose index unlink never landed. `route` is a key that descends to the pointer (path chunks set, rest zero).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StalePointer {
@@ -690,41 +696,56 @@ impl Hamt {
         referenced: &mut Vec<u64>,
         stale: &mut Vec<StalePointer>,
     ) -> Result<()> {
-        // Breadth first, a level of the tree read at a time with its reads in flight together (Tract::read_many), in bounded chunks: the depth-first walk read one block, decoded it, then read the next — about 0.1 ms each, a second an open at eight thousand entries (2026-10-25). The same checks per block as read_doc.
-        const CHUNK: usize = 1 << 10;
-        let mut frontier: Vec<(u64, [u8; 32], [u8; 32], u8)> = match self.root.clone() {
-            Some(Child::Committed { hash, lba }) => alloc::vec![(lba, hash, [0u8; 32], 0)],
+        let mut todo = self.walk_start();
+        while !todo.is_empty() {
+            Self::walk_tree_step(mirror, tract, &mut todo, out, referenced, stale)?;
+        }
+        Ok(())
+    }
+
+    /// The tree walk's work list at its start: the committed root, if any.
+    pub fn walk_start(&self) -> Vec<WalkItem> {
+        match &self.root {
+            Some(Child::Committed { hash, lba }) => alloc::vec![(*lba, *hash, [0u8; 32], 0)],
             _ => Vec::new(),
-        };
-        let mut blocks: Vec<Block> = Vec::new();
-        while !frontier.is_empty() {
-            let mut next = Vec::new();
-            for part in frontier.chunks(CHUNK) {
-                let lbas: Vec<u64> = part.iter().map(|f| f.0).collect();
-                blocks.clear();
-                blocks.resize(part.len(), ZERO_BLOCK);
-                tract.read_many(mirror, &lbas, &mut blocks)?;
-                for (&(lba, hash, route, depth), buf) in part.iter().zip(&blocks) {
-                    let Some(doc) = doc_of(buf, lba, &hash)? else {
-                        stale.push(StalePointer { route, hash, lba });
-                        continue;
-                    };
-                    out.push((lba, hash));
-                    match doc {
-                        TractDoc::Node(node) => {
-                            for (slot, c) in node.children.iter().enumerate() {
-                                if let Some(Child::Committed { hash, lba }) = c {
-                                    next.push((*lba, *hash, route_with_chunk(route, depth, slot as u8), depth + 1));
-                                }
-                            }
+        }
+    }
+
+    /// One step of the tree walk: up to [`WALK_STEP`] pointers off the work list read together (Tract::read_many, the reads in flight at once), each checked as read_doc checks, its children put on the list. The depth-first walk read one block, decoded it, then read the next — about 0.1 ms each, a second an open at eight thousand entries (2026-10-25); in steps, a lazy open walks between the caller's reads ([`crate::Vault::settle_step`]).
+    pub fn walk_tree_step<A: BlockDev, B: BlockDev>(
+        mirror: &mut Mirror<A, B>,
+        tract: &Tract,
+        todo: &mut Vec<WalkItem>,
+        out: &mut Vec<(u64, [u8; 32])>,
+        referenced: &mut Vec<u64>,
+        stale: &mut Vec<StalePointer>,
+    ) -> Result<()> {
+        // WHY/PROOF: the list's last step holds fewer than WALK_STEP pointers — the subtraction would underflow usize.
+        let part: Vec<WalkItem> = todo.split_off(todo.len().saturating_sub(WALK_STEP));
+        let lbas: Vec<u64> = part.iter().map(|f| f.0).collect();
+        let mut blocks: Vec<Block> = alloc::vec![ZERO_BLOCK; part.len()];
+        if let Err(e) = tract.read_many(mirror, &lbas, &mut blocks) {
+            todo.extend(part);
+            return Err(e);
+        }
+        for (&(lba, hash, route, depth), buf) in part.iter().zip(&blocks) {
+            let Some(doc) = doc_of(buf, lba, &hash)? else {
+                stale.push(StalePointer { route, hash, lba });
+                continue;
+            };
+            out.push((lba, hash));
+            match doc {
+                TractDoc::Node(node) => {
+                    for (slot, c) in node.children.iter().enumerate() {
+                        if let Some(Child::Committed { hash, lba }) = c {
+                            todo.push((*lba, *hash, route_with_chunk(route, depth, slot as u8), depth + 1));
                         }
-                        TractDoc::Direct { furrows, .. } => referenced.extend(furrows),
-                        TractDoc::Extent { size, runs, .. } => referenced.extend(expand_runs(&runs, size)?),
-                        _ => {}
                     }
                 }
+                TractDoc::Direct { furrows, .. } => referenced.extend(furrows),
+                TractDoc::Extent { size, runs, .. } => referenced.extend(expand_runs(&runs, size)?),
+                _ => {}
             }
-            frontier = next;
         }
         Ok(())
     }

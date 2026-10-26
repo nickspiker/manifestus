@@ -138,11 +138,30 @@ pub struct Vault<A: BlockDev, B: BlockDev> {
     /// A reaped window awaiting its retiring commit: the cursor value the reap reached, held back from `tract.reap` until that commit's flush has landed.
     /// The window's originals are what the COMMITTED head still references, so counting them as clean before the retiring entry exists let the flush plow straight into them whenever the fence was waived (rescue) — the lap guard caught it, which is the confession Emma's phone logged as "LIVE-LAP AVERTED at lba 19" inside a 3.3 s commit, and the TractFull it raised sent the put into a full grow barrier (fuzz repro 2026-10-21).
     pending_reap: Option<u64>,
+    /// A lazy open's walk, still to finish ([`Vault::open_lazy`]); None once settled. Every write finishes it first.
+    settling: Option<Box<Settling>>,
+}
+
+/// The open's walk of the committed index, resumable: the pointers still to read and what the read ones gave.
+struct Settling {
+    todo: Vec<crate::hamt::WalkItem>,
+    live_blocks: Vec<(u64, [u8; 32])>,
+    referenced: Vec<u64>,
+    stale: Vec<StalePointer>,
 }
 
 impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     /// Open an existing vault or genesis a fresh one, per the open ladder above. `default_tract_blocks` sizes genesis only — an existing vault's geometry comes from its head entry, never from arguments.
-    pub fn open(mut mirror: Mirror<A, B>, ring_log2: u8, now: i64, policy: crate::DeletePolicy) -> Result<Self> {
+    pub fn open(mirror: Mirror<A, B>, ring_log2: u8, now: i64, policy: crate::DeletePolicy) -> Result<Self> {
+        Self::open_with(mirror, ring_log2, now, policy, false)
+    }
+
+    /// [`Self::open`] returning before the walk of the index that finds what is live: reads are served at once, and the walk is the caller's to step ([`Self::settle_step`]) between them — every write finishes it first, so writes behave exactly as after an eager open. Its refusals (a torn or reused block behind a committed pointer) arrive from the walk, not from here. Open cost becomes the head search, whatever the vault holds (2026-10-25: the walk read one leaf per entry, 1.3 s at eight thousand on a desktop SSD). A migrating-layout vault opens eagerly.
+    pub fn open_lazy(mirror: Mirror<A, B>, ring_log2: u8, now: i64, policy: crate::DeletePolicy) -> Result<Self> {
+        Self::open_with(mirror, ring_log2, now, policy, true)
+    }
+
+    fn open_with(mut mirror: Mirror<A, B>, ring_log2: u8, now: i64, policy: crate::DeletePolicy, lazy: bool) -> Result<Self> {
         // Migrating layout first: a root entry at blocks [0, 4) names the spine's residence.
         {
             let (a, b) = mirror.devices();
@@ -156,6 +175,10 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             }
         }
         match Ring::bootstrap_n(&mut mirror)? {
+            Some(r) if lazy => {
+                let ring = Ring::open(mirror, r)?;
+                Self::resume_unsettled(ring, 1u64 << r, None, policy)
+            }
             Some(r) => Self::resume(mirror, r, policy),
             None => {
                 // Nothing bootstrappable: trash-vs-real decided by the WHOLE file, both sides — a valid block is its own proof (2^-256 false positive).
@@ -216,6 +239,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             root: None,
             policy,
             pending_reap: None,
+            settling: None,
         })
     }
 
@@ -317,6 +341,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             root: Some(root),
             policy,
             pending_reap: None,
+            settling: None,
         })
     }
 
@@ -374,16 +399,37 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         Self::resume_common_with(ring, tract_base, root, None, policy)
     }
 
-    fn resume_common_with(mut ring: Ring<A, B>, tract_base: u64, root: Option<RootEntry>, repair: Option<&mut RepairReport>, policy: crate::DeletePolicy) -> Result<Self> {
+    fn resume_common_with(ring: Ring<A, B>, tract_base: u64, root: Option<RootEntry>, repair: Option<&mut RepairReport>, policy: crate::DeletePolicy) -> Result<Self> {
+        let mut v = Self::resume_unsettled(ring, tract_base, root, policy)?;
+        match repair {
+            None => v.settle()?,
+            Some(report) => {
+                // A repair open walks everything (that one exists to find what is broken), in one go.
+                v.settling = None;
+                let mut live_blocks = Vec::new();
+                let mut stale = Vec::new();
+                let mut dangling = Vec::new();
+                {
+                    let Self { ring, tract, hamt, .. } = &mut v;
+                    hamt.walk_live_repair(ring.mirror(), tract, &mut live_blocks, &mut stale, &mut dangling)?;
+                }
+                v.finish_open(live_blocks, Vec::new(), stale, dangling, Some(report))?;
+            }
+        }
+        Ok(v)
+    }
+
+    /// The committed head as a vault that can read but not yet write: the index from the head's root, the tract's geometry, and the walk that will know what is live still to do ([`Self::settle_step`]).
+    fn resume_unsettled(mut ring: Ring<A, B>, tract_base: u64, root: Option<RootEntry>, policy: crate::DeletePolicy) -> Result<Self> {
         let head = ring
             .head()
             .ok_or_else(|| Error::Corrupt("bootstrap found entries but head search found none".into()))?
             .clone();
-        let mut tract = Tract {
+        let tract = Tract {
             base: tract_base,
             len: head.tract_blocks,
             plow: head.plow,
-            reap: 0, // derived below, once the live set is known
+            reap: 0, // derived when the walk is done, once the live set is known
             fence_limit: None,
         };
         // Host-only truncation guard: the device must hold the committed geometry. The fs is a witness, never the authority.
@@ -393,22 +439,67 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 "device truncated: committed geometry needs {need} blocks"
             )));
         }
-        let mut hamt = Hamt::from_root(head.hamt_hash, head.hamt_lba);
-        let mut live_blocks = Vec::new();
-        let mut stale = Vec::new();
-        let mut dangling = Vec::new();
-        // TREE-ONLY OPEN (2026-09-12): the ordinary open reads the INDEX — nodes and leaves — and marks each leaf's furrows and extent runs live by position without reading them. It used to read every data block of every value to take its seal hash (a full read of the vault: 6 s on a phone with a season of kept waves, growing with each one). A repair open still walks everything: that one exists to find what is broken.
-        let mut referenced: Vec<u64> = Vec::new();
-        match repair {
-            None => hamt.walk_tree_collect(ring.mirror(), &tract, &mut live_blocks, &mut referenced, &mut stale)?,
-            Some(_) => hamt.walk_live_repair(ring.mirror(), &tract, &mut live_blocks, &mut stale, &mut dangling)?,
+        let hamt = Hamt::from_root(head.hamt_hash, head.hamt_lba);
+        // TREE-ONLY OPEN (2026-09-12): the ordinary open reads the INDEX — nodes and leaves — and marks each leaf's furrows and extent runs live by position without reading them. It used to read every data block of every value to take its seal hash (a full read of the vault: 6 s on a phone with a season of kept waves, growing with each one).
+        let settling = Some(Box::new(Settling { todo: hamt.walk_start(), live_blocks: Vec::new(), referenced: Vec::new(), stale: Vec::new() }));
+        Ok(Self {
+            ring,
+            tract,
+            hamt,
+            live: LiveSet::default(),
+            root,
+            policy,
+            pending_reap: None,
+            settling,
+        })
+    }
+
+    /// Whether the open's walk is done: the live set known, the vault writable without waiting.
+    pub fn settled(&self) -> bool {
+        self.settling.is_none()
+    }
+
+    /// One step of a lazy open's walk ([`Self::open_lazy`]): a chunk of the index read; the last step finishes the open (the live set, the derived reap, the fence, the stale-pointer repair, the wedge probe — what the eager open does before it returns). True when settled. An error leaves the vault unsettled and readable; a Seal or Corrupt one is the eager open's refusal, met later — reopen with [`Self::open_repairing`].
+    pub fn settle_step(&mut self) -> Result<bool> {
+        let Some(mut s) = self.settling.take() else {
+            return Ok(true);
+        };
+        if !s.todo.is_empty() {
+            let r = {
+                let Self { ring, tract, .. } = &mut *self;
+                Hamt::walk_tree_step(ring.mirror(), tract, &mut s.todo, &mut s.live_blocks, &mut s.referenced, &mut s.stale)
+            };
+            if let Err(e) = r {
+                self.settling = Some(s);
+                return Err(e);
+            }
+            if !s.todo.is_empty() {
+                self.settling = Some(s);
+                return Ok(false);
+            }
         }
+        let Settling { live_blocks, referenced, stale, .. } = *s;
+        self.finish_open(live_blocks, referenced, stale, Vec::new(), None)?;
+        Ok(true)
+    }
+
+    /// The open's walk to its end: what every write waits for, so a lazily opened vault writes exactly as an eagerly opened one.
+    pub fn settle(&mut self) -> Result<()> {
+        while !self.settle_step()? {}
+        Ok(())
+    }
+
+    /// The open's tail, once the walk has found what is live: prune the stale and dangling pointers, build the live set, derive the reap and the fence, land a repair, probe for the wedge.
+    fn finish_open(&mut self, live_blocks: Vec<(u64, [u8; 32])>, referenced: Vec<u64>, stale: Vec<StalePointer>, dangling: Vec<DanglingPointer>, repair: Option<&mut RepairReport>) -> Result<()> {
         // Pre-fix vaults (and a crash between a delete's zero and its retiring commit) leave stale pointers at zeroed slots. They are time bombs: the reap retires the slot, the plow reuses it, and the pointer flips from "reads as deleted" to Seal-on-open. Unlink them now, in RAM — the next commit persists the pruned index; a session that never commits changes nothing.
-        for s in &stale {
-            hamt.prune(ring.mirror(), &tract, &s.route, (s.hash, s.lba))?;
-        }
-        for d in &dangling {
-            hamt.prune(ring.mirror(), &tract, &d.route, (d.hash, d.lba))?;
+        {
+            let Self { ring, tract, hamt, .. } = &mut *self;
+            for s in &stale {
+                hamt.prune(ring.mirror(), tract, &s.route, (s.hash, s.lba))?;
+            }
+            for d in &dangling {
+                hamt.prune(ring.mirror(), tract, &d.route, (d.hash, d.lba))?;
+            }
         }
         let pruned_any = !stale.is_empty() || !dangling.is_empty();
         let mut live = LiveSet::default();
@@ -419,21 +510,14 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             live.mark_referenced(lba);
         }
         // The reap is DERIVED, not trusted: the maximal monotone value whose clean region [plow, reap + len) is verifiably live-free right now. Works identically for legacy (pre-reap) vaults, whose mixed layout simply derives near-zero clean space — ordinary cleaning then migrates them, no format break.
-        tract.reap = derive_reap(tract.plow, tract.len, &live);
-        let fences = ring.recent_fences(FENCE_K)?;
-        tract.fence_limit = fence_from(&fences);
+        self.tract.reap = derive_reap(self.tract.plow, self.tract.len, &live);
+        self.live = live;
+        let fences = self.ring.recent_fences(FENCE_K)?;
+        self.tract.fence_limit = fence_from(&fences);
         // Rescue commits stamp head-time+1 — resume has no wall clock, and monotonicity over the head is all the spine asks of a generation's eagle_time.
-        let rescue_now = ring.head().map(|h| h.eagle_time + 1).unwrap_or(1);
-        let migrating = root.is_some();
-        let mut v = Self {
-            ring,
-            tract,
-            hamt,
-            live,
-            root,
-            policy,
-            pending_reap: None,
-        };
+        let rescue_now = self.ring.head().map(|h| h.eagle_time + 1).unwrap_or(1);
+        let migrating = self.root.is_some();
+        let v = self;
         // REPAIR COMMIT FIRST (field 2026-08-25, the boot that re-pruned the same 84 danglings forever): every rescue's opening move is rolling the index back to the COMMITTED head (the survivor law), so prunes still in RAM evaporate the moment the wedge probe below fires — and a broken vault is USUALLY wedge-shaped, which is why the repair open kept "succeeding" while the disk never changed. Commit the pruned index NOW so the pruned head is the one every later rollback restores. A refused commit (a broken vault is usually FULL-shaped too) gets one grow — and because grow is a barrier that reloads the committed (unpruned) head, the recorded routes are re-pruned before the retry. If even that fails, skip the probe: the prunes then survive in RAM until the session's first successful commit lands them.
         let mut probe_allowed = true;
         if pruned_any {
@@ -466,7 +550,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 let _ = v.grow(v.tract.len * 2, rescue_now);
             }
         }
-        Ok(v)
+        Ok(())
     }
 
     // ======================================================================== KV API =================================================================
@@ -625,6 +709,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
 
     /// GROUP COMMIT with deletes: apply MANY put-or-delete ops IN ORDER, durable on return, under ONE spine commit (put_batch's law extended to mixed ops — a rarangi transaction's apply phase is [row puts + catalog put + superroot put + WAL retire-delete], and each riding its own commit was the 4-5x amplification behind the field's 40s message sends, 2026-09-02). `Some(value)` = put (identical-overwrite skipped), `None` = delete (absent key skipped). Order is preserved, which is load-bearing for callers whose LAST op is their visibility/cleanup edge (rarangi puts the WAL retire last): a mid-ladder Fenced heartbeat commit can land a PREFIX of the batch early — durability sooner, never out of order — so an op only ever lands after everything before it. NOT atomic under that heartbeat window: a caller needing all-or-nothing must anchor on its own journal (rarangi's WAL put precedes this and replays the full set on crash).
     pub fn apply_batch(&mut self, items: &[(&[u8; 32], Option<&[u8]>)], now: i64) -> Result<()> {
+        // A lazy open's walk first: a write needs the live set (see open_lazy).
+        self.settle()?;
         if items.is_empty() {
             return Ok(());
         }
@@ -697,6 +783,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
 
     /// Delete, durable on return. Returns false if the key was absent.
     pub fn delete(&mut self, key: &[u8; 32], now: i64) -> Result<bool> {
+        // A lazy open's walk first: a write needs the live set (see open_lazy).
+        self.settle()?;
         let existed = {
             let Self { ring, tract, hamt, policy, .. } = self;
             hamt.delete(ring.mirror(), tract, key, *policy)?
@@ -712,6 +800,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     ///
     /// The plow is re-aligned to the smallest monotone value ≥ the current plow whose wrapped position under the NEW length equals the current wrapped position, so the sweep continues from the same physical block. With that continuity, any position's revisit gap stays ≥ the tract length at its previous visit, and the per-generation fence (min of plow_i + tract_blocks_i) keeps every pre-grow generation in the K-window fully restorable. The alignment jump only burns fence budget, never adds any — strictly conservative; the put/commit heartbeat ladders absorb a tight window.
     pub fn grow(&mut self, new_tract_blocks: u64, now: i64) -> Result<()> {
+        // A lazy open's walk first: a write needs the live set (see open_lazy).
+        self.settle()?;
         let old_len = self.tract.len;
         // A target at or below the current length is a NO-OP, never an error (field 2026-08-27): callers compute their target from a tract_blocks() read, and between that read and this call other queued work may have grown the tract past it — the request isn't wrong, it's already satisfied. Erroring here failed every chains persist on the Mac with "grow cannot shrink 35072 -> 18752" while the vault was perfectly healthy at 35072.
         if new_tract_blocks <= old_len {
@@ -758,6 +848,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
 
     /// Grow WITHOUT the barrier reload — for the one caller whose in-RAM index is MORE authoritative than the committed head: the repair open, whose prunes exist only in RAM. The normal grow discards RAM state and re-walks the committed head STRICTLY, which on a vault mid-repair (a) resurrects the pruned danglings and (b) fails Seal on them — the 2026-08-25 loop where the "repaired" vault re-pruned the same 84 pointers every boot while the disk never changed. Here the pruned hamt + its live set ride across the grow untouched; the trailing commit flushes them into the fresh clean region, landing the repair durably. Sound ONLY when the caller guarantees the RAM state is clean-by-construction (no half-applied put) — the repair open is exactly that.
     pub(crate) fn grow_preserving(&mut self, new_tract_blocks: u64, now: i64) -> Result<()> {
+        // A lazy open's walk first: a write needs the live set (see open_lazy).
+        self.settle()?;
         let old_len = self.tract.len;
         if new_tract_blocks <= old_len {
             return Ok(());
@@ -778,6 +870,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     ///
     /// Fence deadlock escape: flushing needs tract appends; appends can be fenced; raising the fence needs generations. HEARTBEAT generations break the cycle — spine entries re-asserting the committed head, written into the (unfenced) ring region, sliding old entries out of the K-window.
     pub fn commit(&mut self, now: i64) -> Result<()> {
+        // A lazy open's walk first: a write needs the live set (see open_lazy).
+        self.settle()?;
         let mut attempts = 0u64;
         let (root_hash, root_lba) = loop {
             let r = {
@@ -897,6 +991,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     /// 2. The all-survive worst-case sizing is replaced by ACTUAL survivor counts from the LiveSet (no device I/O) — a dead-heavy window stages nearly nothing, so even clean ≈ 0 makes progress.
     /// Returns the windows reaped. Err(TractFull) = a live block sits hard against the reap with no staging room — genuinely full of live data: grow or refuse (the rescue only ever helps dead-heavy occupancy). Each retiring commit re-fences honestly, so the loop's comfort check reads the true post-rescue budget.
     pub fn rescue(&mut self, now: i64) -> Result<u64> {
+        // A lazy open's walk first: a write needs the live set (see open_lazy).
+        self.settle()?;
         const RESERVE: u64 = 4;
         let mut windows = 0u64;
         let mut airlock_grown = false;
@@ -956,6 +1052,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     /// One bounded window per call (at most RECLAIM_WINDOW_MAX blocks, and at most half the clean space so the retiring flush always has room), so an op arriving mid-step waits for one small window; the embedder calls again only while it stays idle.
     /// Wants clean space of at least an eighth of the tract, and dead space under the quarter that maybe_reap acts on inline.
     pub fn reclaim_ahead(&mut self, now: i64) -> Result<Reclaim> {
+        // A lazy open's walk first: a write needs the live set (see open_lazy).
+        self.settle()?;
         let len = self.tract.len;
         let clean = self.tract.clean_blocks();
         let occupied = self.tract.plow - self.tract.reap;
@@ -979,6 +1077,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
 
     /// Clean one window at the reap and commit the retiring generation. Returns false when no progress is possible right now (nothing occupied, or not even a one-block window can stage its survivors — the caller's ladder commits/grows and comes back).
     pub fn reap_one_window(&mut self, now: i64) -> Result<bool> {
+        // A lazy open's walk first: a write needs the live set (see open_lazy).
+        self.settle()?;
         self.reap_one_window_capped(now, u64::MAX)
     }
 
@@ -1060,6 +1160,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     /// TEST/MIGRATION AID — write a value in the LEGACY per-lba direct format and commit it, exactly as pre-extent engines did. Exists so migration tests can build old-format state inside a modern vault.
     #[doc(hidden)]
     pub fn put_legacy_direct_for_tests(&mut self, key: &[u8; 32], value: &[u8], now: i64) -> Result<()> {
+        // A lazy open's walk first: a write needs the live set (see open_lazy).
+        self.settle()?;
         {
             let Self { ring, tract, hamt, live, .. } = self;
             hamt.put_legacy_direct_for_tests(ring.mirror(), tract, live, key, value)?;
@@ -1080,6 +1182,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     /// TEST AID — the live map against the index, block for block: (in the map but unreachable from the root, reachable but not in the map). Both empty = the two agree, which is the invariant every commit must keep and the plow's classification depends on. Walks the whole index; test scale only.
     #[doc(hidden)]
     pub fn live_map_divergence(&mut self) -> Result<(Vec<u64>, Vec<u64>)> {
+        // A lazy open's walk first: a write needs the live set (see open_lazy).
+        self.settle()?;
         let mut walked: Vec<(u64, [u8; 32])> = Vec::new();
         {
             let Self { ring, tract, hamt, .. } = self;
@@ -1272,21 +1376,65 @@ fn replicate_into<S: BlockDev, D: BlockDev>(
             fence_limit: None,
         };
         let mut hamt = Hamt::from_root(head.hamt_hash, head.hamt_lba);
-        let mut live = Vec::new();
-        hamt.walk_live(ring.mirror(), &tract, &mut live)?;
+        // The tree walk: the index's own blocks read, the values' furrows and extent runs by position, unread — the compare below reads every one of them on both sides anyway (2026-10-25: walk_live read every data block of the winner a block at a time first, and a diverged desktop vault took 42 s to open).
+        let (mut nodes, mut referenced, mut stale) = (Vec::new(), Vec::new(), Vec::new());
+        hamt.walk_tree_collect(ring.mirror(), &tract, &mut nodes, &mut referenced, &mut stale)?;
+        let mut live: Vec<u64> = nodes.into_iter().map(|(l, _)| l).chain(referenced).collect();
+        live.sort_unstable();
+        live.dedup();
         (live, layout.tract_base)
     };
 
-    for (lba, _hp) in live {
-        let dev_lba = tract_base + lba;
-        src.read(dev_lba, &mut sbuf)?;
-        dst.read(dev_lba, &mut dbuf)?;
-        if sbuf != dbuf {
-            write_verified_one(dst, dev_lba, &sbuf)?;
-            out.tract_copied += 1;
+    // Every live block compared, consecutive positions as one read a side (in runs of at most a step), the differing ones copied a batch at a time: written, one flush, read back and compared — the discipline of write_verified_one, its flush shared.
+    const STEP: usize = 1 << 8;
+    let mut fix: Vec<(u64, crate::block::Block)> = Vec::new();
+    let (mut sbufs, mut dbufs): (Vec<crate::block::Block>, Vec<crate::block::Block>) = (Vec::new(), Vec::new());
+    let mut start = 0;
+    for i in 1..=live.len() {
+        if i < live.len() && live[i] == live[i - 1] + 1 && i - start < STEP {
+            continue;
+        }
+        let at = tract_base + live[start];
+        let n = i - start;
+        sbufs.clear();
+        sbufs.resize(n, ZERO_BLOCK);
+        dbufs.clear();
+        dbufs.resize(n, ZERO_BLOCK);
+        src.read_run(at, &mut sbufs)?;
+        dst.read_run(at, &mut dbufs)?;
+        for k in 0..n {
+            // Only what verifies on the winner crosses: a torn block there must not overwrite a sound copy on the loser (walk_live left unsealed furrows out the same way).
+            if sbufs[k] != dbufs[k] && crate::tract::sealed_hp(&sbufs[k]).is_some() {
+                fix.push((at + k as u64, sbufs[k]));
+            }
+        }
+        if fix.len() >= STEP {
+            out.tract_copied += write_verified_batch_solo(dst, &fix)?;
+            fix.clear();
+        }
+        start = i;
+    }
+    out.tract_copied += write_verified_batch_solo(dst, &fix)?;
+    Ok(out)
+}
+
+/// write_verified_one for many blocks: each written, ONE flush, each read back and compared, a mismatch retried alone. Returns how many were written.
+fn write_verified_batch_solo<D: BlockDev>(dev: &mut D, blocks: &[(u64, crate::block::Block)]) -> Result<u64> {
+    if blocks.is_empty() {
+        return Ok(0);
+    }
+    for (lba, b) in blocks {
+        dev.write(*lba, b)?;
+    }
+    dev.flush()?;
+    let mut check = ZERO_BLOCK;
+    for (lba, b) in blocks {
+        dev.read(*lba, &mut check)?;
+        if &check != b {
+            write_verified_one(dev, *lba, b)?;
         }
     }
-    Ok(out)
+    Ok(blocks.len() as u64)
 }
 
 /// write → flush → read back → compare → retry once. The file-discipline rule: an unverified byte is not a written byte.

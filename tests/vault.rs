@@ -922,3 +922,61 @@ fn reclaim_ahead_restores_headroom_before_the_next_commit() {
         assert_eq!(v.get(&key(i)).unwrap(), Some(vec![i as u8; 30_000]), "untouched value {i} survives the reclaim");
     }
 }
+
+/// A lazy open reads at once and settles to exactly what an eager open knows: the same live set and reap; a write before it settles settles first; a reopen sees every value.
+#[test]
+fn lazy_open_reads_at_once_and_settles_to_the_eager_state() {
+    let dir = TempDir::new().unwrap();
+    let (pa, pb) = paths(&dir, "lazy");
+    {
+        let mut v = open_vault(&pa, &pb, RING + 8192);
+        // Enough entries for the walk to take several steps (WALK_STEP pointers a step), small and large values both.
+        let items: Vec<([u8; 32], Vec<u8>)> = (0..3000u64).map(|i| (key(i), if i % 50 == 0 { vec![i as u8; 20_000] } else { val(i) })).collect();
+        for chunk in items.chunks(250) {
+            let refs: Vec<(&[u8; 32], &[u8])> = chunk.iter().map(|(k, v)| (k, v.as_slice())).collect();
+            v.put_batch(&refs, 2_000).unwrap();
+        }
+        assert!(v.delete(&key(7), 2_100).unwrap());
+    }
+    let eager_stats = {
+        let a = FileDev::open(&pa).unwrap();
+        let b = FileDev::open(&pb).unwrap();
+        let v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 3_000, DeletePolicy::UnlinkOnly).unwrap();
+        let s = v.engine_stats();
+        (s.live_entries, s.reap, s.plow)
+    };
+    let a = FileDev::open(&pa).unwrap();
+    let b = FileDev::open(&pb).unwrap();
+    let mut v = Vault::open_lazy(Mirror::new(a, b), HOST_RING_LOG2, 3_000, DeletePolicy::UnlinkOnly).unwrap();
+    assert!(!v.settled(), "a lazy open returns before its walk");
+    assert_eq!(v.get(&key(5)).unwrap(), Some(val(5)), "reads are served before the walk");
+    assert_eq!(v.get(&key(7)).unwrap(), None);
+    let mut steps = 0;
+    while !v.settle_step().unwrap() {
+        steps += 1;
+        assert_eq!(v.get(&key(2999)).unwrap(), Some(val(2999)), "and between its steps");
+    }
+    assert!(steps > 1, "the walk took several steps");
+    assert!(v.settled());
+    let s = v.engine_stats();
+    assert_eq!((s.live_entries, s.reap, s.plow), eager_stats, "settled, the lazy open knows what the eager one does");
+    let (missing, extra) = v.live_map_divergence().unwrap();
+    assert!(missing.is_empty() && extra.is_empty(), "the live set agrees with the index");
+    drop(v);
+
+    // A write before the walk is done finishes it first, then lands.
+    let a = FileDev::open(&pa).unwrap();
+    let b = FileDev::open(&pb).unwrap();
+    let mut v = Vault::open_lazy(Mirror::new(a, b), HOST_RING_LOG2, 4_000, DeletePolicy::UnlinkOnly).unwrap();
+    v.put(&key(5000), &val(5000), 4_000).unwrap();
+    assert!(v.settled());
+    drop(v);
+    let a = FileDev::open(&pa).unwrap();
+    let b = FileDev::open(&pb).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 5_000, DeletePolicy::UnlinkOnly).unwrap();
+    for i in (0..3000u64).filter(|&i| i != 7) {
+        let want = if i % 50 == 0 { vec![i as u8; 20_000] } else { val(i) };
+        assert_eq!(v.get(&key(i)).unwrap(), Some(want), "value {i}");
+    }
+    assert_eq!(v.get(&key(5000)).unwrap(), Some(val(5000)));
+}
