@@ -24,6 +24,10 @@ pub const SCHEMA_FURROW: &str = "manifestus.furrow";
 use alloc::{format, string::ToString, vec, vec::Vec};
 use hashbrown::HashMap;
 
+/// Levels a 256-bit key can route: 256 / 5 rounded up, so depths 0..MAX_DEPTH exist and a node at MAX_DEPTH cannot.
+/// `chunk` at MAX_DEPTH would index byte 32 of the key, and two distinct keys always diverge before it.
+const MAX_DEPTH: u8 = ((32 * 8 + 4) / 5) as u8;
+
 /// 5-bit chunk of the key at `depth`. 256 bits / 5 = 51 full levels — two distinct keys always diverge within 52.
 fn chunk(key: &[u8; 32], depth: u8) -> u8 {
     let bit = depth as usize * 5;
@@ -83,6 +87,44 @@ fn route_with_chunk(mut base: [u8; 32], depth: u8, slot: u8) -> [u8; 32] {
         base[byte + 1] = (new & 0xFF) as u8;
     }
     base
+}
+
+/// The walk's record of the tract positions it has reached, one bit a block.
+/// A bitset rather than a map or a sorted list: its size is fixed by the tract's geometry (one bit a block, 1/32768 of the device), a mark is O(1), and a linear scan over the reached list would be quadratic in the index.
+pub struct Visited {
+    bits: Vec<u64>,
+}
+
+impl Visited {
+    pub fn new(tract_len: u64) -> Self {
+        Self { bits: alloc::vec![0; (tract_len as usize).div_ceil(1 << 6)] }
+    }
+
+    /// Mark `lba` reached; Corrupt when it already was.
+    /// A healthy COW HAMT is a tree, every block with exactly one parent, so a second arrival is corruption by definition — and without this the walk re-explores a shared subtree once per parent, 32^k over k levels (the audit's LIB-05, the inspector's 2026-09-03 wedge).
+    /// The index is in bounds by the caller's order: every lba here was either read thru the tract (which refuses lba ≥ len) or checked against the tract by `doc_of` before it was offered.
+    fn reach(&mut self, lba: u64) -> Result<()> {
+        let word = (lba >> 6) as usize;
+        let mask = 1u64 << (lba & ((1 << 6) - 1));
+        if self.bits[word] & mask != 0 {
+            return Err(Error::Corrupt(format!(
+                "tract lba {lba} reached twice: a block with two parents cannot exist in a healthy tree"
+            )));
+        }
+        self.bits[word] |= mask;
+        Ok(())
+    }
+}
+
+/// A node read at path depth `depth` must say so itself: its stored depth is the self-address the reap repoints by, and a chain of nodes claiming other depths is how a crafted tree runs the walk past the key's 52 levels (`chunk` would index byte 32).
+fn node_at_depth(node: &Node, lba: u64, depth: u8) -> Result<()> {
+    if node.depth != depth {
+        return Err(Error::Corrupt(format!(
+            "node at tract lba {lba} claims depth {} on a path at depth {depth}",
+            node.depth
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -188,6 +230,7 @@ impl Hamt {
                     };
                     match doc {
                         TractDoc::Node(node) => {
+                            node_at_depth(&node, lba, depth)?;
                             match &node.children[chunk(key, depth) as usize] {
                                 None => return Ok(None),
                                 Some(c) => {
@@ -314,6 +357,7 @@ impl Hamt {
                 };
                 match doc {
                     TractDoc::Node(node) => {
+                        node_at_depth(&node, lba, depth)?;
                         // COW: committed node enters the arena, then recurse.
                         let idx = self.arena.len();
                         self.arena.push(node);
@@ -440,6 +484,7 @@ impl Hamt {
                 };
                 match doc {
                     TractDoc::Node(node) => {
+                        node_at_depth(&node, lba, depth)?;
                         let idx = self.arena.len();
                         self.arena.push(node);
                         self.delta.removed.push((lba, hash));
@@ -478,13 +523,16 @@ impl Hamt {
                 Child::Committed { hash, lba } => {
                     let Some(doc) = read_doc(mirror, tract, lba, &hash)? else { return Ok(None) };
                     match doc {
-                        TractDoc::Node(node) => match &node.children[chunk(key, depth) as usize] {
-                            None => return Ok(None),
-                            Some(c) => {
-                                current = c.clone();
-                                depth += 1;
+                        TractDoc::Node(node) => {
+                            node_at_depth(&node, lba, depth)?;
+                            match &node.children[chunk(key, depth) as usize] {
+                                None => return Ok(None),
+                                Some(c) => {
+                                    current = c.clone();
+                                    depth += 1;
+                                }
                             }
-                        },
+                        }
                         TractDoc::Lone { key: k, .. }
                         | TractDoc::Direct { key: k, .. }
                         | TractDoc::Extent { key: k, .. } => {
@@ -594,28 +642,34 @@ impl Hamt {
     ) -> Result<()> {
         let root = self.root.clone();
         if let Some(Child::Committed { hash, lba }) = root {
-            self.walk_keys_child(mirror, tract, lba, &hash, out)?;
+            let mut visited = Visited::new(tract.len);
+            self.walk_keys_child(mirror, tract, lba, &hash, 0, &mut visited, out)?;
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn walk_keys_child<A: BlockDev, B: BlockDev>(
         &mut self,
         mirror: &mut Mirror<A, B>,
         tract: &Tract,
         lba: u64,
         hash: &[u8; 32],
+        depth: u8,
+        visited: &mut Visited,
         out: &mut Vec<[u8; 32]>,
     ) -> Result<()> {
         let Some(doc) = read_doc(mirror, tract, lba, hash)? else {
             return Ok(()); // fast-deleted leaf behind a stale pointer — not live, walk_live's repair path owns reporting it
         };
+        visited.reach(lba)?;
         match doc {
             TractDoc::Node(node) => {
+                node_at_depth(&node, lba, depth)?;
                 for c in node.children.iter() {
                     if let Some(Child::Committed { hash, lba }) = c {
                         let (h, l) = (*hash, *lba);
-                        self.walk_keys_child(mirror, tract, l, &h, out)?;
+                        self.walk_keys_child(mirror, tract, l, &h, depth + 1, visited, out)?;
                     }
                 }
             }
@@ -637,7 +691,8 @@ impl Hamt {
     ) -> Result<()> {
         let root = self.root.clone();
         if let Some(Child::Committed { hash, lba }) = root {
-            self.walk_child(mirror, tract, lba, &hash, [0u8; 32], 0, out, stale)?;
+            let mut visited = Visited::new(tract.len);
+            self.walk_child(mirror, tract, lba, &hash, [0u8; 32], 0, &mut visited, out, stale)?;
         }
         Ok(())
     }
@@ -651,10 +706,13 @@ impl Hamt {
         hash: &[u8; 32],
         route: [u8; 32],
         depth: u8,
+        visited: &mut Visited,
         out: &mut Vec<(u64, [u8; 32])>,
         stale: &mut Vec<StalePointer>,
     ) -> Result<()> {
-        let Some(doc) = read_doc(mirror, tract, lba, hash)? else {
+        let doc = read_doc(mirror, tract, lba, hash)?;
+        visited.reach(lba)?;
+        let Some(doc) = doc else {
             // Fast-deleted leaf behind a stale pointer: not live — and report it so resume can unlink it before the slot is ever reused.
             stale.push(StalePointer { route, hash: *hash, lba });
             return Ok(());
@@ -662,17 +720,19 @@ impl Hamt {
         out.push((lba, *hash));
         match doc {
             TractDoc::Node(node) => {
+                node_at_depth(&node, lba, depth)?;
                 for (slot, c) in node.children.iter().enumerate() {
                     if let Some(Child::Committed { hash, lba }) = c {
                         let (h, l) = (*hash, *lba);
                         let child_route = route_with_chunk(route, depth, slot as u8);
-                        self.walk_child(mirror, tract, l, &h, child_route, depth + 1, out, stale)?;
+                        self.walk_child(mirror, tract, l, &h, child_route, depth + 1, visited, out, stale)?;
                     }
                 }
             }
             TractDoc::Direct { furrows, .. } => {
                 let mut buf = ZERO_BLOCK;
                 for f in furrows {
+                    visited.reach(f)?;
                     tract.read(mirror, f, &mut buf)?;
                     if let Some(fh) = sealed_hp(&buf) {
                         out.push((f, fh));
@@ -682,6 +742,7 @@ impl Hamt {
             TractDoc::Extent { size, runs, .. } => {
                 let mut buf = ZERO_BLOCK;
                 for pos in expand_runs(&runs, size, tract.len)? {
+                    visited.reach(pos)?;
                     tract.read(mirror, pos, &mut buf)?;
                     if let Some(fh) = sealed_hp(&buf) {
                         out.push((pos, fh));
@@ -703,8 +764,9 @@ impl Hamt {
         stale: &mut Vec<StalePointer>,
     ) -> Result<()> {
         let mut todo = self.walk_start();
+        let mut visited = Visited::new(tract.len);
         while !todo.is_empty() {
-            Self::walk_tree_step(mirror, tract, &mut todo, out, referenced, stale)?;
+            Self::walk_tree_step(mirror, tract, &mut todo, &mut visited, out, referenced, stale)?;
         }
         Ok(())
     }
@@ -718,10 +780,12 @@ impl Hamt {
     }
 
     /// One step of the tree walk: up to [`WALK_STEP`] pointers off the work list read together (Tract::read_many, the reads in flight at once), each checked as read_doc checks, its children put on the list. The depth-first walk read one block, decoded it, then read the next — about 0.1 ms each, a second an open at eight thousand entries (2026-10-25); in steps, a lazy open walks between the caller's reads ([`crate::Vault::settle_step`]).
+    /// `visited` is the walk's record of reached positions across its steps (one [`Visited`] for the whole walk, made at `Visited::new(tract.len)`): a position offered twice ends the walk as Corrupt.
     pub fn walk_tree_step<A: BlockDev, B: BlockDev>(
         mirror: &mut Mirror<A, B>,
         tract: &Tract,
         todo: &mut Vec<WalkItem>,
+        visited: &mut Visited,
         out: &mut Vec<(u64, [u8; 32])>,
         referenced: &mut Vec<u64>,
         stale: &mut Vec<StalePointer>,
@@ -735,21 +799,33 @@ impl Hamt {
             return Err(e);
         }
         for (&(lba, hash, route, depth), buf) in part.iter().zip(&blocks) {
-            let Some(doc) = doc_of(buf, lba, &hash)? else {
+            visited.reach(lba)?;
+            let Some(doc) = doc_of(buf, lba, &hash, tract.len)? else {
                 stale.push(StalePointer { route, hash, lba });
                 continue;
             };
             out.push((lba, hash));
             match doc {
                 TractDoc::Node(node) => {
+                    node_at_depth(&node, lba, depth)?;
                     for (slot, c) in node.children.iter().enumerate() {
                         if let Some(Child::Committed { hash, lba }) = c {
                             todo.push((*lba, *hash, route_with_chunk(route, depth, slot as u8), depth + 1));
                         }
                     }
                 }
-                TractDoc::Direct { furrows, .. } => referenced.extend(furrows),
-                TractDoc::Extent { size, runs, .. } => referenced.extend(expand_runs(&runs, size, tract.len)?),
+                TractDoc::Direct { furrows, .. } => {
+                    for f in furrows {
+                        visited.reach(f)?;
+                        referenced.push(f);
+                    }
+                }
+                TractDoc::Extent { size, runs, .. } => {
+                    for pos in expand_runs(&runs, size, tract.len)? {
+                        visited.reach(pos)?;
+                        referenced.push(pos);
+                    }
+                }
                 _ => {}
             }
         }
@@ -767,7 +843,8 @@ impl Hamt {
     ) -> Result<()> {
         let root = self.root.clone();
         if let Some(Child::Committed { hash, lba }) = root {
-            self.walk_child_repair(mirror, tract, lba, &hash, [0u8; 32], 0, out, stale, dangling)?;
+            let mut visited = Visited::new(tract.len);
+            self.walk_child_repair(mirror, tract, lba, &hash, [0u8; 32], 0, &mut visited, out, stale, dangling)?;
         }
         Ok(())
     }
@@ -781,6 +858,7 @@ impl Hamt {
         hash: &[u8; 32],
         route: [u8; 32],
         depth: u8,
+        visited: &mut Visited,
         out: &mut Vec<(u64, [u8; 32])>,
         stale: &mut Vec<StalePointer>,
         dangling: &mut Vec<DanglingPointer>,
@@ -807,24 +885,33 @@ impl Hamt {
             }
             Err(e) => return Err(e),
         };
+        // A block reached twice, or a node at the wrong depth, is a pointer into a stranger's subtree (the reused-slot shape the repair exists for): the repair prunes that pointer and keeps the first arrival, as the inspector does.
+        if let Err(Error::Corrupt(reason)) = visited.reach(lba) {
+            dangling.push(DanglingPointer { route, hash: *hash, lba, key: None, reason });
+            return Ok(());
+        }
         match doc {
             TractDoc::Node(node) => {
+                if let Err(Error::Corrupt(reason)) = node_at_depth(&node, lba, depth) {
+                    dangling.push(DanglingPointer { route, hash: *hash, lba, key: None, reason });
+                    return Ok(());
+                }
                 out.push((lba, *hash));
                 for (slot, c) in node.children.iter().enumerate() {
                     if let Some(Child::Committed { hash, lba }) = c {
                         let (h, l) = (*hash, *lba);
                         let child_route = route_with_chunk(route, depth, slot as u8);
-                        self.walk_child_repair(mirror, tract, l, &h, child_route, depth + 1, out, stale, dangling)?;
+                        self.walk_child_repair(mirror, tract, l, &h, child_route, depth + 1, visited, out, stale, dangling)?;
                     }
                 }
             }
             TractDoc::Lone { .. } => out.push((lba, *hash)),
             TractDoc::Direct { key, furrows, .. } => {
-                self.repair_check_furrows(mirror, tract, lba, hash, route, &key, &furrows, out, dangling)?;
+                self.repair_check_furrows(mirror, tract, lba, hash, route, &key, &furrows, visited, out, dangling)?;
             }
             TractDoc::Extent { key, size, runs } => match expand_runs(&runs, size, tract.len) {
                 Ok(positions) => {
-                    self.repair_check_furrows(mirror, tract, lba, hash, route, &key, &positions, out, dangling)?;
+                    self.repair_check_furrows(mirror, tract, lba, hash, route, &key, &positions, visited, out, dangling)?;
                 }
                 Err(Error::Corrupt(reason)) => {
                     dangling.push(DanglingPointer { route, hash: *hash, lba, key: Some(key), reason });
@@ -855,11 +942,17 @@ impl Hamt {
         route: [u8; 32],
         key: &[u8; 32],
         positions: &[u64],
+        visited: &mut Visited,
         out: &mut Vec<(u64, [u8; 32])>,
         dangling: &mut Vec<DanglingPointer>,
     ) -> Result<()> {
         let mut furrow_live = Vec::with_capacity(positions.len());
         for (i, pos) in positions.iter().enumerate() {
+            // A furrow another leaf (or the index) already claims is not this value's: the leaf is dangling, like one whose furrow is lost.
+            if let Err(Error::Corrupt(reason)) = visited.reach(*pos) {
+                dangling.push(DanglingPointer { route, hash: *leaf_hash, lba: leaf_lba, key: Some(*key), reason });
+                return Ok(());
+            }
             let mut buf = ZERO_BLOCK;
             tract.read(mirror, *pos, &mut buf)?;
             let ok = sealed_hp(&buf)
@@ -1102,6 +1195,7 @@ impl Hamt {
                 };
                 match doc {
                     TractDoc::Node(node) => {
+                        node_at_depth(&node, lba, depth)?;
                         let idx = self.arena.len();
                         self.arena.push(node);
                         self.delta.removed.push((lba, hash));
@@ -1354,11 +1448,12 @@ fn read_doc<A: BlockDev, B: BlockDev>(
 ) -> Result<Option<TractDoc>> {
     let mut buf = ZERO_BLOCK;
     tract.read_cached(mirror, lba, &mut buf)?;
-    doc_of(&buf, lba, expected)
+    doc_of(&buf, lba, expected, tract.len)
 }
 
 /// A read block as the document a pointer `(lba, expected)` names: None when zeroed (fast-deleted), Corrupt when unsealed, Seal when sealed as something else.
-fn doc_of(buf: &Block, lba: u64, expected: &[u8; 32]) -> Result<Option<TractDoc>> {
+/// Every position the document points at is checked against the tract of `tract_len` blocks before a caller sees it: a child or furrow past the tract is corruption, met here once rather than at every walk.
+fn doc_of(buf: &Block, lba: u64, expected: &[u8; 32], tract_len: u64) -> Result<Option<TractDoc>> {
     if *buf == ZERO_BLOCK {
         return Ok(None);
     }
@@ -1368,7 +1463,22 @@ fn doc_of(buf: &Block, lba: u64, expected: &[u8; 32]) -> Result<Option<TractDoc>
     if &hash != expected {
         return Err(Error::Seal);
     }
-    decode_doc(buf).map(Some)
+    let doc = decode_doc(buf)?;
+    // WHY/PROOF: the positions are fields of the block whose seal is an unkeyed hash; one at or past the tract would index past the walk's bitset of reached positions, and `base + lba` wrapped for an lba near u64::MAX before the tract's own read check saw it (the audit's LIB-05 and LIB-06).
+    let past = match &doc {
+        TractDoc::Node(node) => node.children.iter().flatten().find_map(|c| match c {
+            Child::Committed { lba, .. } if *lba >= tract_len => Some(*lba),
+            _ => None,
+        }),
+        TractDoc::Direct { furrows, .. } => furrows.iter().copied().find(|f| *f >= tract_len),
+        _ => None,
+    };
+    if let Some(p) = past {
+        return Err(Error::Corrupt(format!(
+            "block at tract lba {lba} points at {p}, past the tract of {tract_len} blocks"
+        )));
+    }
+    Ok(Some(doc))
 }
 
 fn decode_doc(block: &Block) -> Result<TractDoc> {
@@ -1444,8 +1554,13 @@ fn decode_doc(block: &Block) -> Result<TractDoc> {
             if presence.count_ones() as usize != hashes.len() || hashes.len() != lbas.len() {
                 return Err(Error::Corrupt("node: presence/children mismatch".into()));
             }
+            let depth = depth.ok_or_else(|| Error::Corrupt("node: missing depth".into()))?;
+            // WHY/PROOF: `depth` is a field of the block; `chunk` at a depth of 52 or more indexes past the 32-byte key and panics, and the cast below would read 256 as 0 and hide the claim.
+            if depth >= MAX_DEPTH as u64 {
+                return Err(Error::Corrupt(format!("node: depth {depth} beyond the key's {MAX_DEPTH} levels")));
+            }
             let mut node = Node::new(
-                depth.ok_or_else(|| Error::Corrupt("node: missing depth".into()))? as u8,
+                depth as u8,
                 route.ok_or_else(|| Error::Corrupt("node: missing route".into()))?,
             );
             let mut next = 0usize;
@@ -1554,7 +1669,7 @@ mod tests {
         sealed_hp(block).unwrap()
     }
 
-    fn corrupt<T: core::fmt::Debug>(r: Result<T>) -> bool {
+    fn corrupt<T>(r: Result<T>) -> bool {
         matches!(r, Err(Error::Corrupt(_)))
     }
 
@@ -1586,5 +1701,65 @@ mod tests {
         let hash = plant(&mut m, 1, &leaf);
         let mut h = Hamt::from_root(hash, 1);
         assert!(corrupt(h.lookup(&mut m, &tract, &key)), "a 2^60 size behind one furrow");
+    }
+
+    fn node_block(depth: u8, children: &[(usize, [u8; 32], u64)]) -> Block {
+        let mut node = Node::new(depth, [0u8; 32]);
+        for &(slot, hash, lba) in children {
+            node.children[slot] = Some(Child::Committed { hash, lba });
+        }
+        encode_node(&node)
+    }
+
+    fn walk_all(h: &mut Hamt, m: &mut Mirror<MemDev, MemDev>, tract: &Tract) -> Result<()> {
+        let (mut live, mut referenced, mut stale) = (Vec::new(), Vec::new(), Vec::new());
+        h.walk_tree_collect(m, tract, &mut live, &mut referenced, &mut stale)
+    }
+
+    /// LIB-05: a subtree with two parents, a node claiming a depth other than its path's, and a depth past the key are each refused instead of walked.
+    #[test]
+    fn shared_subtrees_and_lying_depths_are_refused() {
+        let (mut m, tract) = mem();
+        let key = [0u8; 32];
+        let leaf = encode_lone(&key, b"leaf");
+        let leaf_hash = plant(&mut m, 3, &leaf);
+        // B at depth 1 holds the leaf; A at the root points at B from two slots: the walk must stop at B's second arrival.
+        let b = node_block(1, &[(0, leaf_hash, 3)]);
+        let b_hash = plant(&mut m, 2, &b);
+        let a = node_block(0, &[(0, b_hash, 2), (1, b_hash, 2)]);
+        let a_hash = plant(&mut m, 1, &a);
+        let mut h = Hamt::from_root(a_hash, 1);
+        assert!(corrupt(walk_all(&mut h, &mut m, &tract)), "a node reached from two parents");
+        let mut keys = Vec::new();
+        assert!(corrupt(h.walk_keys(&mut m, &tract, &mut keys)), "the key walk refuses it too");
+        let mut live = Vec::new();
+        assert!(corrupt(h.walk_live(&mut m, &tract, &mut live)), "the live walk refuses it too");
+        // The same leaf claimed as a furrow of a direct leaf elsewhere in the tree: one block, two roles.
+        let d = encode_direct(&key, 4, &[3]);
+        let d_hash = plant(&mut m, 4, &d);
+        let a = node_block(0, &[(0, b_hash, 2), (1, d_hash, 4)]);
+        let a_hash = plant(&mut m, 1, &a);
+        let mut h = Hamt::from_root(a_hash, 1);
+        assert!(corrupt(walk_all(&mut h, &mut m, &tract)), "a furrow that is also an index block");
+
+        // A node whose stored depth is not the path's: refused at the node, by the walk and by a point lookup.
+        let liar = node_block(7, &[(0, leaf_hash, 3)]);
+        let liar_hash = plant(&mut m, 5, &liar);
+        let a = node_block(0, &[(0, liar_hash, 5)]);
+        let a_hash = plant(&mut m, 1, &a);
+        let mut h = Hamt::from_root(a_hash, 1);
+        assert!(corrupt(walk_all(&mut h, &mut m, &tract)), "a node lying about its depth");
+        assert!(corrupt(h.lookup(&mut m, &tract, &key)), "lookup meets the same lie");
+
+        // A depth the key cannot route is refused at decode, before any chunk is taken.
+        let deep = node_block(MAX_DEPTH, &[(0, leaf_hash, 3)]);
+        assert!(corrupt(decode_doc(&deep)), "depth {MAX_DEPTH} is past the key's levels");
+        assert!(decode_doc(&node_block(MAX_DEPTH - 1, &[])).is_ok(), "the last level decodes");
+
+        // A child past the tract is refused where the pointer is decoded.
+        let far = node_block(0, &[(0, leaf_hash, TRACT)]);
+        let far_hash = plant(&mut m, 1, &far);
+        let mut h = Hamt::from_root(far_hash, 1);
+        assert!(corrupt(walk_all(&mut h, &mut m, &tract)), "a child at the tract's end");
     }
 }

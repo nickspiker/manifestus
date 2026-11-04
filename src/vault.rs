@@ -146,6 +146,8 @@ pub struct Vault<A: BlockDev, B: BlockDev> {
 /// The open's walk of the committed index, resumable: the pointers still to read and what the read ones gave.
 struct Settling {
     todo: Vec<crate::hamt::WalkItem>,
+    /// The positions the walk has reached across its steps: a second arrival at one is the refusal of LIB-05.
+    visited: crate::hamt::Visited,
     live_blocks: Vec<(u64, [u8; 32])>,
     referenced: Vec<u64>,
     stale: Vec<StalePointer>,
@@ -442,7 +444,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         }
         let hamt = Hamt::from_root(head.hamt_hash, head.hamt_lba);
         // TREE-ONLY OPEN (2026-09-12): the ordinary open reads the INDEX — nodes and leaves — and marks each leaf's furrows and extent runs live by position without reading them. It used to read every data block of every value to take its seal hash (a full read of the vault: 6 s on a phone with a season of kept waves, growing with each one).
-        let settling = Some(Box::new(Settling { todo: hamt.walk_start(), live_blocks: Vec::new(), referenced: Vec::new(), stale: Vec::new() }));
+        let settling = Some(Box::new(Settling { todo: hamt.walk_start(), visited: crate::hamt::Visited::new(tract.len), live_blocks: Vec::new(), referenced: Vec::new(), stale: Vec::new() }));
         Ok(Self {
             ring,
             tract,
@@ -468,7 +470,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         if !s.todo.is_empty() {
             let r = {
                 let Self { ring, tract, .. } = &mut *self;
-                Hamt::walk_tree_step(ring.mirror(), tract, &mut s.todo, &mut s.live_blocks, &mut s.referenced, &mut s.stale)
+                Hamt::walk_tree_step(ring.mirror(), tract, &mut s.todo, &mut s.visited, &mut s.live_blocks, &mut s.referenced, &mut s.stale)
             };
             if let Err(e) = r {
                 self.settling = Some(s);
