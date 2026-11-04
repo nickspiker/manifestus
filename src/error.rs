@@ -22,6 +22,9 @@ pub enum Error {
     Fenced(u64),
     /// A full lap was scanned without finding enough dead space: the tract is full (grow or refuse).
     TractFull,
+    /// The ring file is held by another process (its exclusive lock, taken for the life of every FileDev): one engine per file, enforced across processes. Carries the path.
+    #[cfg(feature = "std")]
+    Busy(String),
 }
 
 #[cfg(feature = "std")]
@@ -43,6 +46,8 @@ impl core::fmt::Display for Error {
             Error::Bounds(lba) => write!(f, "block {} out of device bounds", lba),
             Error::Fenced(w) => write!(f, "rollback fence reached at plow {}", w),
             Error::TractFull => write!(f, "tract full — no dead space in a full lap"),
+            #[cfg(feature = "std")]
+            Error::Busy(p) => write!(f, "ring {} is held by another process", p),
         }
     }
 }

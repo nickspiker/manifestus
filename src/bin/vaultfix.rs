@@ -24,14 +24,26 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    // A live ring is held by its engine's lock (LIB-07): this tool writes in place, so it refuses one instead of committing a stale generation over the running app's.
+    let open = |f: &String| match FileDev::open(std::path::Path::new(f)) {
+        Ok(dev) => Ok(dev),
+        Err(manifestus::Error::Busy(p)) => {
+            eprintln!("vaultfix: {p} is open in another process (a running app, or another tool) — refusing to repair a live ring; stop it or run on a copy");
+            Err(())
+        }
+        Err(e) => {
+            eprintln!("vaultfix: cannot open {f}: {e}");
+            Err(())
+        }
+    };
     let mirror = match files.len() {
         1 => {
-            let a = FileDev::open(std::path::Path::new(&files[0])).unwrap();
+            let Ok(a) = open(&files[0]) else { return ExitCode::from(1) };
             Mirror::from_parts(Some(a), None).unwrap()
         }
         _ => {
-            let a = FileDev::open(std::path::Path::new(&files[0])).unwrap();
-            let b = FileDev::open(std::path::Path::new(&files[1])).unwrap();
+            let Ok(a) = open(&files[0]) else { return ExitCode::from(1) };
+            let Ok(b) = open(&files[1]) else { return ExitCode::from(1) };
             Mirror::new(a, b)
         }
     };

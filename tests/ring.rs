@@ -213,6 +213,8 @@ fn whole_file_scan_and_zero_ring() {
     assert!(any_sealed_block(&mut dev).unwrap(), "one valid block anywhere = real");
 
     // zero_ring turns Corrupt wreckage into Empty so genesis-era head searches are clean.
+    // The scan's handle goes first: a ring is one engine's while its FileDev lives (LIB-07), so the mirror's open of the same file would be Busy under it.
+    drop(dev);
     let mut mirror = Mirror::new(
         FileDev::open(&path).unwrap(),
         FileDev::create(&dir.path().join("trash-b.bin"), 16).unwrap(),

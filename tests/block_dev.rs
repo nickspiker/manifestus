@@ -78,6 +78,8 @@ fn filedev_create_adopts_existing() {
     let mut out = ZERO_BLOCK;
     dev.read(2, &mut out).unwrap();
     assert_eq!(out, pattern(2, 0x99), "adoption must not destroy existing blocks");
+    // The handle goes first: a ring is one engine's while its FileDev lives (LIB-07), so a second create of the same path is Busy until then.
+    drop(dev);
     // Adopting with a smaller request never shrinks.
     let dev = FileDev::create(&path, 4).unwrap();
     assert_eq!(dev.block_count(), 8);

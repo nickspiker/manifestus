@@ -264,6 +264,8 @@ fn migrating_survives_kill_nine_with_exact_committed_prefix() {
         );
 
         // The root ring survived too, and migrations are actually happening under fire.
+        // The vault's handles go first: a ring is one engine's while its FileDev lives (LIB-07), so the root read below would be Busy under them.
+        drop(v);
         let mut da = FileDev::open(std::path::Path::new(&format!("{base}-a.vsf"))).unwrap();
         let root = read_root(&mut da).unwrap().expect("root entry must survive kill -9");
         assert!(root.gen >= last_root_gen, "round {round}: root generations monotone");

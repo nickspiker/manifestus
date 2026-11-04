@@ -60,6 +60,7 @@ impl FileDev {
     /// Open an existing device file. Length must be block-aligned — anything else was not written by us.
     pub fn open(path: &Path) -> Result<Self> {
         let (file, direct) = open_rw(path)?;
+        lock_exclusive(&file, path)?;
         let len = file.metadata()?.len();
         if len % BLOCK as u64 != 0 {
             return Err(Error::Corrupt(format!(
@@ -326,6 +327,54 @@ fn open_rw(path: &Path) -> Result<(File, bool)> {
     Ok((f, false))
 }
 
+/// The one-engine-per-file rule, enforced by the kernel: an exclusive advisory lock held for the life of the handle (released when the file closes, so a dead process holds nothing). A second engine on the same ring — a second app instance, a tool run against live rings — commits stale state over the first's (the vault-destroying incident kete's `open_shared` documents, which only guarded within one process); the second open fails here with [`Error::Busy`] instead. flock on unix, LockFileEx on Windows, both tried without waiting.
+#[cfg(unix)]
+fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let r = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if r == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        return Err(Error::Busy(path.display().to_string()));
+    }
+    Err(e.into())
+}
+
+#[cfg(windows)]
+fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        event: *mut core::ffi::c_void,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LockFileEx(file: *mut core::ffi::c_void, flags: u32, reserved: u32, bytes_low: u32, bytes_high: u32, overlapped: *mut Overlapped) -> i32;
+    }
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 1 << 0;
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 1 << 1;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    let mut overlapped = Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: core::ptr::null_mut() };
+    // The whole file: every byte of the range from offset zero, whatever the file's length becomes after a grow.
+    let r = unsafe {
+        LockFileEx(file.as_raw_handle() as *mut core::ffi::c_void, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, u32::MAX, u32::MAX, &mut overlapped)
+    };
+    if r != 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() == Some(ERROR_LOCK_VIOLATION) {
+        return Err(Error::Busy(path.display().to_string()));
+    }
+    Err(e.into())
+}
+
 /// Preallocate so ENOSPC fires at format/grow time, never mid-commit. fallocate on Linux/Android; set_len (sparse) as the portable fallback (macOS, Windows, fallocate-less filesystems).
 fn preallocate(f: &File, len: u64) -> Result<()> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -355,5 +404,21 @@ mod tests {
         dev.read_run(6, &mut out).unwrap();
         let one = ZERO_BLOCK;
         assert!(matches!(dev.write_run(u64::MAX, &[&one]), Err(Error::Bounds(_))));
+    }
+
+    /// LIB-07: a ring file open in one engine refuses a second open with Busy, and opens again once the first handle is gone.
+    #[test]
+    fn second_open_of_a_held_ring_is_busy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ring.bin");
+        let held = FileDev::create(&path, 8).unwrap();
+        match FileDev::open(&path) {
+            Err(Error::Busy(p)) => assert!(p.ends_with("ring.bin"), "the error names the ring: {p}"),
+            Err(e) => panic!("expected Busy, got {e}"),
+            Ok(_) => panic!("a second open of a held ring must fail"),
+        }
+        assert!(matches!(FileDev::create(&path, 8), Err(Error::Busy(_))), "create adopts thru open and is refused the same way");
+        drop(held);
+        FileDev::open(&path).unwrap();
     }
 }
