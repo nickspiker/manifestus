@@ -47,6 +47,9 @@ pub type WalkItem = (u64, [u8; 32], [u8; 32], u8);
 /// Pointers a tree-walk step reads together: a lazy open's reader waits for at most one step (about 30 ms at 0.1 ms a read on a desktop SSD).
 pub const WALK_STEP: usize = 1 << 8;
 
+/// Blocks a value read takes at once: a furrow run longer than this is read in steps, so the bounce buffer is one step (1 MiB) however large the value.
+const RUN_STEP: usize = 1 << 8;
+
 /// A committed pointer whose target reads as all-zero: a fast-deleted leaf whose index unlink never landed. `route` is a key that descends to the pointer (path chunks set, rest zero).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StalePointer {
@@ -206,7 +209,7 @@ impl Hamt {
                             if &k != key {
                                 return Ok(None);
                             }
-                            let positions = expand_runs(&runs, size)?;
+                            let positions = expand_runs(&runs, size, tract.len)?;
                             return Ok(Some(read_furrows(mirror, tract, key, size, &positions)?));
                         }
                         TractDoc::Furrow { .. } => {
@@ -383,7 +386,7 @@ impl Hamt {
                         }
                     }
                     TractDoc::Extent { size, runs, .. } => {
-                        for pos in expand_runs(&runs, size)? {
+                        for pos in expand_runs(&runs, size, tract.len)? {
                             tract.zero_delete(mirror, pos)?;
                         }
                     }
@@ -515,7 +518,7 @@ impl Hamt {
             }
             Some(TractDoc::Extent { size, runs, .. }) => {
                 let mut buf = ZERO_BLOCK;
-                for pos in expand_runs(&runs, size)? {
+                for pos in expand_runs(&runs, size, tract.len)? {
                     tract.read(mirror, pos, &mut buf)?;
                     if let Some(h) = sealed_hp(&buf) {
                         self.delta.removed.push((pos, h));
@@ -678,7 +681,7 @@ impl Hamt {
             }
             TractDoc::Extent { size, runs, .. } => {
                 let mut buf = ZERO_BLOCK;
-                for pos in expand_runs(&runs, size)? {
+                for pos in expand_runs(&runs, size, tract.len)? {
                     tract.read(mirror, pos, &mut buf)?;
                     if let Some(fh) = sealed_hp(&buf) {
                         out.push((pos, fh));
@@ -746,7 +749,7 @@ impl Hamt {
                     }
                 }
                 TractDoc::Direct { furrows, .. } => referenced.extend(furrows),
-                TractDoc::Extent { size, runs, .. } => referenced.extend(expand_runs(&runs, size)?),
+                TractDoc::Extent { size, runs, .. } => referenced.extend(expand_runs(&runs, size, tract.len)?),
                 _ => {}
             }
         }
@@ -819,7 +822,7 @@ impl Hamt {
             TractDoc::Direct { key, furrows, .. } => {
                 self.repair_check_furrows(mirror, tract, lba, hash, route, &key, &furrows, out, dangling)?;
             }
-            TractDoc::Extent { key, size, runs } => match expand_runs(&runs, size) {
+            TractDoc::Extent { key, size, runs } => match expand_runs(&runs, size, tract.len) {
                 Ok(positions) => {
                     self.repair_check_furrows(mirror, tract, lba, hash, route, &key, &positions, out, dangling)?;
                 }
@@ -943,7 +946,7 @@ impl Hamt {
                     let placed = tract.append(mirror, oracle, &payload)?;
                     // Patch the moved positions into the run list, coalescing.
                     // TODO(scale): expand_runs materializes one u64 per furrow (~24MB transiently for a 12GB value) — fine on hosts, wants a run-walking iterator for the no_std kernel profile.
-                    let mut positions = expand_runs(&runs, size)?;
+                    let mut positions = expand_runs(&runs, size, tract.len)?;
                     for (&(_, idx), &newpos) in group.iter().zip(&placed) {
                         let i = idx as usize;
                         if i >= positions.len() {
@@ -1232,20 +1235,45 @@ fn encode_extent(key: &[u8; 32], size: u64, runs: &[(u64, u64)]) -> Result<Block
     Ok(buf)
 }
 
-/// The value's furrow position for every index, in order. Runs never wrap internally (appends split at the ring boundary), so expansion is plain arithmetic.
-fn expand_runs(runs: &[(u64, u64)], size: u64) -> Result<Vec<u64>> {
-    let mut out = Vec::new();
-    for (s, c) in runs {
-        for j in 0..*c {
-            out.push(s + j);
+/// The furrows one extent's runs name, counted without expanding them: every run checked against the tract's geometry, the total against the tract's length.
+/// A run that passes lies inside the tract and the total is at most the tract's length, so expanding it is bounded by the device.
+fn check_runs(runs: &[(u64, u64)], tract_len: u64) -> Result<u64> {
+    let mut total = 0u64;
+    for &(s, c) in runs {
+        // WHY/PROOF: `s` and `c` are fields of a leaf block whose seal is an unkeyed hash, so a crafted run can start past the tract or claim 2^40 blocks; the old expansion pushed `c` positions before comparing anything, which exhausted memory, and `s + j` wrapped for `s` near u64::MAX.
+        // The subtraction form cannot overflow: `s < tract_len` is checked first, so `tract_len - s` is defined, and no sum is formed.
+        if s >= tract_len || c > tract_len - s {
+            return Err(Error::Corrupt(format!(
+                "extent run ({s}, {c}) reaches past the tract of {tract_len} blocks"
+            )));
+        }
+        // WHY/PROOF: a value's furrows are distinct tract blocks, so a sound total never exceeds the tract; a crafted list of many full-tract runs would otherwise size the expansion at runs × tract.
+        // No overflow is possible here: `total` is at most `tract_len` on entry (the check below held last time) and `c` is at most `tract_len`, and a device of 2^63 blocks does not exist.
+        total += c;
+        if total > tract_len {
+            return Err(Error::Corrupt(format!(
+                "extent runs total {total} blocks in a tract of {tract_len}"
+            )));
         }
     }
-    let expect = size.div_ceil(furrow_capacity() as u64) as usize;
-    if out.len() != expect {
+    Ok(total)
+}
+
+/// The value's furrow position for every index, in order. Runs never wrap internally (appends split at the ring boundary), so expansion is plain arithmetic.
+/// The runs are checked against the tract and the leaf's own `size` BEFORE anything is allocated: the leaf's counts are untrusted, and the expected count is known from `size` up front.
+fn expand_runs(runs: &[(u64, u64)], size: u64, tract_len: u64) -> Result<Vec<u64>> {
+    let total = check_runs(runs, tract_len)?;
+    let expect = size.div_ceil(furrow_capacity() as u64);
+    if total != expect {
         return Err(Error::Corrupt(format!(
-            "extent run total {} != furrow count {expect}",
-            out.len()
+            "extent run total {total} != furrow count {expect}"
         )));
+    }
+    let mut out = Vec::with_capacity(total as usize);
+    for &(s, c) in runs {
+        for j in 0..c {
+            out.push(s + j);
+        }
     }
     Ok(out)
 }
@@ -1443,32 +1471,120 @@ fn read_furrows<A: BlockDev, B: BlockDev>(
     size: u64,
     furrows: &[u64],
 ) -> Result<Vec<u8>> {
+    // WHY/PROOF: `size` is a field of the leaf block and its seal is an unkeyed hash, so a crafted 2^60 made this Vec::with_capacity abort the process before a byte was read; a value cannot hold more than its furrows carry, and their count is bounded by the tract (extent runs) or by one block's fields (a direct leaf).
+    if size > furrows.len() as u64 * furrow_capacity() as u64 {
+        return Err(Error::Corrupt(format!(
+            "value size {size} exceeds what {} furrows can carry",
+            furrows.len()
+        )));
+    }
     let mut out = Vec::with_capacity(size as usize);
-    // The furrows' blocks, each run of consecutive positions as one read (a value lands as one contiguous run, two at a ring wrap).
-    let mut blocks: Vec<Block> = alloc::vec![ZERO_BLOCK; furrows.len()];
+    // The furrows' blocks, each run of consecutive positions as one read (a value lands as one contiguous run, two at a ring wrap), at most RUN_STEP blocks a read so the bounce buffer stays one step whatever the value's size.
+    let mut blocks: Vec<Block> = Vec::new();
     let mut start = 0;
     for i in 1..=furrows.len() {
-        if i == furrows.len() || furrows[i] != furrows[i - 1] + 1 {
-            tract.read_run(mirror, furrows[start], &mut blocks[start..i])?;
-            start = i;
-        }
-    }
-    for (i, buf) in blocks.iter().enumerate() {
-        if sealed_hp(buf).is_none() {
-            return Err(Error::Corrupt(format!("furrow {i} unsealed")));
-        }
-        match decode_doc(buf)? {
-            TractDoc::Furrow { key: k, index, payload } => {
-                if &k != key || index as usize != i {
-                    return Err(Error::Corrupt(format!("furrow {i} mismatched owner/index")));
+        if i == furrows.len() || furrows[i] != furrows[i - 1] + 1 || i - start == RUN_STEP {
+            blocks.clear();
+            blocks.resize(i - start, ZERO_BLOCK);
+            tract.read_run(mirror, furrows[start], &mut blocks)?;
+            for (j, buf) in blocks.iter().enumerate() {
+                let index_here = start + j;
+                if sealed_hp(buf).is_none() {
+                    return Err(Error::Corrupt(format!("furrow {index_here} unsealed")));
                 }
-                out.extend_from_slice(&payload);
+                match decode_doc(buf)? {
+                    TractDoc::Furrow { key: k, index, payload } => {
+                        if &k != key || index as usize != index_here {
+                            return Err(Error::Corrupt(format!("furrow {index_here} mismatched owner/index")));
+                        }
+                        out.extend_from_slice(&payload);
+                    }
+                    _ => return Err(Error::Corrupt(format!("furrow {index_here} wrong schema"))),
+                }
             }
-            _ => return Err(Error::Corrupt(format!("furrow {i} wrong schema"))),
+            start = i;
         }
     }
     if out.len() as u64 != size {
         return Err(Error::Corrupt("assembled size mismatch".into()));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An in-memory block device: the crafted-block tests below write a block, point the index at it, and watch the walk refuse it, with no file underneath.
+    struct MemDev(Vec<Block>);
+
+    impl BlockDev for MemDev {
+        fn block_count(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn read(&mut self, lba: u64, buf: &mut Block) -> Result<()> {
+            if lba >= self.block_count() {
+                return Err(Error::Bounds(lba));
+            }
+            *buf = self.0[lba as usize];
+            Ok(())
+        }
+        fn write(&mut self, lba: u64, buf: &Block) -> Result<()> {
+            if lba >= self.block_count() {
+                return Err(Error::Bounds(lba));
+            }
+            self.0[lba as usize] = *buf;
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    const TRACT: u64 = 1 << 6;
+
+    fn mem() -> (Mirror<MemDev, MemDev>, Tract) {
+        let m = Mirror::from_parts(Some(MemDev(alloc::vec![ZERO_BLOCK; TRACT as usize])), None).unwrap();
+        (m, Tract { base: 0, len: TRACT, plow: TRACT, reap: 0, fence_limit: None })
+    }
+
+    /// Writes a crafted block at tract position `lba` and returns its seal, the pointer an index would carry.
+    fn plant(m: &mut Mirror<MemDev, MemDev>, lba: u64, block: &Block) -> [u8; 32] {
+        m.write_verified(lba, block).unwrap();
+        sealed_hp(block).unwrap()
+    }
+
+    fn corrupt<T: core::fmt::Debug>(r: Result<T>) -> bool {
+        matches!(r, Err(Error::Corrupt(_)))
+    }
+
+    /// LIB-04: an extent leaf's counts and size are checked against the tract before a position or a byte is allocated.
+    #[test]
+    fn crafted_extent_counts_are_refused_before_allocation() {
+        let cap = furrow_capacity() as u64;
+        let huge = 1u64 << 40;
+        assert!(corrupt(expand_runs(&[(0, huge)], huge * cap, TRACT)), "2^40 furrows in a 64-block tract");
+        assert!(corrupt(expand_runs(&[(TRACT - 4, 8)], 8 * cap, TRACT)), "a run reaching past the tract");
+        assert!(corrupt(expand_runs(&[(u64::MAX - 1, 4)], 4 * cap, TRACT)), "a start whose s + j wraps");
+        assert!(corrupt(expand_runs(&[(0, TRACT), (0, 1)], (TRACT + 1) * cap, TRACT)), "runs totalling more than the tract");
+        assert_eq!(expand_runs(&[(3, 2), (9, 1)], 3 * cap, TRACT).unwrap(), alloc::vec![3, 4, 9]);
+
+        // Thru the engine: a sealed leaf claiming 2^40 furrows, the index root pointing at it.
+        let (mut m, tract) = mem();
+        let key = [7u8; 32];
+        let leaf = encode_extent(&key, huge * cap, &[(0, huge)]).unwrap();
+        let hash = plant(&mut m, 1, &leaf);
+        let mut h = Hamt::from_root(hash, 1);
+        assert!(corrupt(h.lookup(&mut m, &tract, &key)), "lookup must refuse the crafted extent");
+        let mut live = Vec::new();
+        let mut referenced = Vec::new();
+        let mut stale = Vec::new();
+        assert!(corrupt(h.walk_tree_collect(&mut m, &tract, &mut live, &mut referenced, &mut stale)), "the open's walk must refuse it too");
+
+        // A direct leaf whose size no furrow count can carry: refused before the value is sized.
+        let leaf = encode_direct(&key, 1 << 60, &[2]);
+        let hash = plant(&mut m, 1, &leaf);
+        let mut h = Hamt::from_root(hash, 1);
+        assert!(corrupt(h.lookup(&mut m, &tract, &key)), "a 2^60 size behind one furrow");
+    }
 }

@@ -30,6 +30,23 @@ fn furrow_capacity() -> u64 {
     (BLOCK - body_start - (1 << 7)) as u64
 }
 
+/// The furrows an extent's runs name, counted without expanding them; Err carries the finding when a run leaves the tract or the total exceeds it (the engine's `hamt::check_runs`, reimplemented here so the inspector stands alone).
+fn count_runs(runs: &[(u64, u64)], tract_len: u64) -> core::result::Result<u64, String> {
+    let mut total = 0u64;
+    for &(s, c) in runs {
+        // WHY/PROOF: `s` and `c` are fields of the leaf; a crafted count sized the expansion at 2^40 positions and a crafted start wrapped `s + j`; the subtraction form checks `s` first so `tract_len - s` is defined, and forms no sum.
+        if s >= tract_len || c > tract_len - s {
+            return Err(format!("extent run ({s}, {c}) reaches past the tract of {tract_len} blocks"));
+        }
+        // WHY/PROOF: a value's furrows are distinct blocks, so a sound total never exceeds the tract; `total` is at most `tract_len` on entry and `c` at most `tract_len`, so the sum cannot overflow.
+        total += c;
+        if total > tract_len {
+            return Err(format!("extent runs total {total} blocks in a tract of {tract_len}"));
+        }
+    }
+    Ok(total)
+}
+
 /// What to show + how hard to look.
 #[derive(Clone, Copy)]
 pub struct InspectOptions {
@@ -150,7 +167,8 @@ pub fn inspect<D: BlockDev>(dev: &mut D, opts: InspectOptions) -> Result<Inspect
     let tract_base = ring_n;
 
     // Classify every ring slot.
-    let mut slots = Vec::with_capacity(ring_n as usize);
+    // WHY/PROOF: `ring_log2` is read off a spine block, and `SpineEntry::decode` admits exponents up to 32: a crafted 32 sized this vector at 2^32 slot entries (hundreds of GB) before a slot was read; the loop below never visits more slots than the file holds, so that is the honest capacity.
+    let mut slots = Vec::with_capacity(ring_n.min(file_blocks) as usize);
     let mut buf = ZERO_BLOCK;
     for slot in 0..ring_n.min(file_blocks) {
         dev.read(slot, &mut buf)?;
@@ -460,8 +478,9 @@ fn walk_tree<D: BlockDev>(
     n_leaves: &mut usize,
     n_furrows: &mut usize,
 ) -> Result<()> {
-    let abs = tract_base + lba;
-    if abs >= dev.block_count() {
+    // WHY/PROOF: `lba` is a pointer field read off a block; `tract_base + lba` wrapped for an lba near u64::MAX and passed the old compare, so the read landed inside the spine (the audit of 2026-11-03, LIB-06).
+    // The subtraction form forms no sum: the base is checked against the device first, then the lba against what lies past the base.
+    if tract_base >= dev.block_count() || lba >= dev.block_count() - tract_base {
         out.push(TreeNode {
             indent,
             lba,
@@ -472,6 +491,7 @@ fn walk_tree<D: BlockDev>(
         });
         return Ok(());
     }
+    let abs = tract_base + lba;
     let mut buf = ZERO_BLOCK;
     dev.read(abs, &mut buf)?;
 
@@ -550,19 +570,22 @@ fn walk_tree<D: BlockDev>(
                     let (furrow_lbas, run_note) = match &doc {
                         TractBlock::Direct { furrows, .. } => (furrows.clone(), None),
                         TractBlock::Extent { size, runs, .. } => {
-                            let mut positions = Vec::new();
-                            for (s, c) in runs {
-                                for j in 0..*c {
-                                    positions.push(s + j);
+                            // The runs are counted and checked against the tract BEFORE they are expanded: the counts are fields of the leaf, and a crafted one (field 2026-11-03, the audit's LIB-04) sized the expansion at 2^40 positions.
+                            let tract_len = dev.block_count() - tract_base;
+                            let expect = size.div_ceil(furrow_capacity());
+                            match count_runs(runs, tract_len) {
+                                Err(rn) => (Vec::new(), Some(rn)),
+                                Ok(total) if total != expect => (Vec::new(), Some(format!("extent run total {total} != furrow count {expect}"))),
+                                Ok(_) => {
+                                    let mut positions = Vec::new();
+                                    for (s, c) in runs {
+                                        for j in 0..*c {
+                                            positions.push(s + j);
+                                        }
+                                    }
+                                    (positions, None)
                                 }
                             }
-                            let expect = size.div_ceil(furrow_capacity());
-                            let rn = if positions.len() as u64 != expect {
-                                Some(format!("extent run total {} != furrow count {expect}", positions.len()))
-                            } else {
-                                None
-                            };
-                            (positions, rn)
                         }
                         _ => (Vec::new(), None),
                     };
@@ -629,11 +652,13 @@ fn walk_furrow<D: BlockDev>(
     reachable: &mut BTreeSet<u64>,
     n_furrows: &mut usize,
 ) -> Result<()> {
-    let abs = tract_base + lba;
-    if abs >= dev.block_count() {
+    // WHY/PROOF: `lba` is a pointer field read off a block; `tract_base + lba` wrapped for an lba near u64::MAX and passed the old compare, so the read landed inside the spine (the audit of 2026-11-03, LIB-06).
+    // The subtraction form forms no sum: the base is checked against the device first, then the lba against what lies past the base.
+    if tract_base >= dev.block_count() || lba >= dev.block_count() - tract_base {
         return Ok(());
     }
     reachable.insert(lba);
+    let abs = tract_base + lba;
     let mut buf = ZERO_BLOCK;
     dev.read(abs, &mut buf)?;
     *n_furrows += 1;
