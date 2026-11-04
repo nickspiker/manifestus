@@ -1762,4 +1762,14 @@ mod tests {
         let mut h = Hamt::from_root(far_hash, 1);
         assert!(corrupt(walk_all(&mut h, &mut m, &tract)), "a child at the tract's end");
     }
+
+    /// LIB-06: a furrow position near u64::MAX does not wrap the tract's run check onto the spine.
+    #[test]
+    fn tract_run_bounds_do_not_wrap() {
+        let (mut m, tract) = mem();
+        let mut out = [ZERO_BLOCK; 2];
+        assert!(matches!(tract.read_run(&mut m, u64::MAX - 1, &mut out), Err(Error::Bounds(_))));
+        assert!(matches!(tract.read_run(&mut m, TRACT - 1, &mut out), Err(Error::Bounds(_))), "a run reaching past the tract");
+        tract.read_run(&mut m, TRACT - 2, &mut out).unwrap();
+    }
 }

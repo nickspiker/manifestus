@@ -17,6 +17,8 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use crate::block::{Block, BlockDev, BLOCK};
+#[cfg(test)]
+use crate::block::ZERO_BLOCK;
 use crate::error::{Error, Result};
 
 /// O_DIRECT requires buffer alignment to the logical block size; 4096 satisfies every real device. (Unused on Windows, which is always buffered, but cheap to keep.)
@@ -98,6 +100,16 @@ impl FileDev {
             Ok(())
         }
     }
+
+    /// Bounds of a run of `n` blocks from `lba`, formed without a sum.
+    fn bounds_run(&self, lba: u64, n: usize) -> Result<()> {
+        // WHY/PROOF: a run's lba reaches the device from pointers read off blocks (the tract adds its base to a furrow position); `lba + n - 1` wrapped for an lba near u64::MAX and passed `bounds`, so the I/O went to an unrelated block; checking lba first makes `blocks - lba` defined.
+        if lba >= self.blocks || n as u64 > self.blocks - lba {
+            Err(Error::Bounds(lba))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl BlockDev for FileDev {
@@ -153,7 +165,7 @@ impl BlockDev for FileDev {
         if n == 0 {
             return Ok(());
         }
-        self.bounds(lba + n as u64 - 1)?;
+        self.bounds_run(lba, n)?;
         let buf = run_bytes(&mut self.run, n);
         for (i, b) in blocks.iter().enumerate() {
             buf[i * BLOCK..(i + 1) * BLOCK].copy_from_slice(&b[..]);
@@ -166,7 +178,7 @@ impl BlockDev for FileDev {
         if n == 0 {
             return Ok(());
         }
-        self.bounds(lba + n as u64 - 1)?;
+        self.bounds_run(lba, n)?;
         let buf = run_bytes(&mut self.run, n);
         read_block_at(&self.file, buf, lba * BLOCK as u64)?;
         for (i, b) in out.iter_mut().enumerate() {
@@ -326,4 +338,22 @@ fn preallocate(f: &File, len: u64) -> Result<()> {
     }
     f.set_len(len)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// LIB-06: a run whose lba is near u64::MAX is refused by the device, not wrapped onto block zero.
+    #[test]
+    fn run_bounds_do_not_wrap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut dev = FileDev::create(&dir.path().join("run.bin"), 8).unwrap();
+        let mut out = [ZERO_BLOCK; 2];
+        assert!(matches!(dev.read_run(u64::MAX - 1, &mut out), Err(Error::Bounds(_))));
+        assert!(matches!(dev.read_run(7, &mut out), Err(Error::Bounds(_))), "a run reaching past the end");
+        dev.read_run(6, &mut out).unwrap();
+        let one = ZERO_BLOCK;
+        assert!(matches!(dev.write_run(u64::MAX, &[&one]), Err(Error::Bounds(_))));
+    }
 }

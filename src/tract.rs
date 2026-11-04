@@ -159,8 +159,9 @@ impl Tract {
 
     /// Consecutive tract blocks from `lba` as one read (no ring wrap inside: callers cut their runs at consecutive positions, which a wrap breaks).
     pub fn read_run<A: BlockDev, B: BlockDev>(&self, mirror: &mut Mirror<A, B>, lba: u64, out: &mut [Block]) -> Result<()> {
-        if lba + out.len() as u64 > self.len {
-            return Err(Error::Bounds(lba + out.len() as u64 - 1));
+        // WHY/PROOF: `lba` is a furrow position read off a leaf block; `lba + out.len()` wrapped for an lba near u64::MAX, passed the old compare, and `base + lba` then wrapped into the spine; the subtraction form checks lba first so `len - lba` is defined, and forms no sum.
+        if lba >= self.len || out.len() as u64 > self.len - lba {
+            return Err(Error::Bounds(lba));
         }
         mirror.read_run(self.base + lba, out)
     }

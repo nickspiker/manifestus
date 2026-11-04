@@ -436,7 +436,10 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             fence_limit: None,
         };
         // Host-only truncation guard: the device must hold the committed geometry. The fs is a witness, never the authority.
-        let need = tract_base + head.tract_blocks;
+        // WHY/PROOF: `tract_blocks` is a field of the head entry; `tract_base + tract_blocks` wrapped for a value near u64::MAX and passed this guard, and the walk's bitset was then sized by the claim.
+        let need = tract_base.checked_add(head.tract_blocks).ok_or_else(|| {
+            Error::Corrupt(format!("committed geometry {} + {} overflows the device address", tract_base, head.tract_blocks))
+        })?;
         if ring.mirror().block_count() < need {
             return Err(Error::Corrupt(format!(
                 "device truncated: committed geometry needs {need} blocks"
@@ -1232,6 +1235,7 @@ fn fence_from(budgets_newest_first: &[u64]) -> Option<u64> {
 /// The maximal monotone reap whose clean region [plow, reap + len) holds no live block:
 /// walk the live set for the nearest live position downstream of the plow. Sound for any layout — a legacy mixed tract simply derives little or no clean space.
 fn derive_reap(plow: u64, len: u64, live: &LiveSet) -> u64 {
+    // `len` is never zero here: SpineEntry::decode refuses a tract of zero blocks, so no head carries one.
     let pos = plow % len;
     let mut clean = len;
     for lba in live.positions() {
@@ -1371,6 +1375,16 @@ fn replicate_into<S: BlockDev, D: BlockDev>(
         let Some(head) = ring.head().cloned() else {
             return Ok(out);
         };
+        // The same truncation guard as the open's: the winner's device must hold the geometry its head commits to, or the walk below sizes its bitset by a claim.
+        // WHY/PROOF: `tract_blocks` is a field of the head entry; the sum wraps for a value near u64::MAX.
+        let need = layout.tract_base.checked_add(head.tract_blocks).ok_or_else(|| {
+            Error::Corrupt(format!("committed geometry {} + {} overflows the device address", layout.tract_base, head.tract_blocks))
+        })?;
+        if ring.mirror().block_count() < need {
+            return Err(Error::Corrupt(format!(
+                "winner truncated: committed geometry needs {need} blocks"
+            )));
+        }
         let tract = Tract {
             base: layout.tract_base,
             len: head.tract_blocks,

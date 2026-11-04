@@ -693,8 +693,9 @@ fn scan_orphans<D: BlockDev>(
 ) -> Result<Vec<u64>> {
     let mut out = Vec::new();
     let mut buf = ZERO_BLOCK;
-    let end = match tract_blocks {
-        Some(n) => (tract_base + n).min(dev.block_count()),
+    // WHY/PROOF: `tract_blocks` is the head's field; `tract_base + n` wrapped for a crafted value and cut the scan short, so a claim the device cannot hold scans the whole device as an absent field does.
+    let end = match tract_blocks.and_then(|n| tract_base.checked_add(n)) {
+        Some(end) => end.min(dev.block_count()),
         None => dev.block_count(),
     };
     for abs in tract_base..end {

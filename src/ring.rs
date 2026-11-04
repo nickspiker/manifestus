@@ -176,10 +176,31 @@ impl SpineEntry {
         if entry.ring_log2 == 0 || entry.ring_log2 > 32 {
             return Err(Error::Corrupt(format!("insane ring exponent {}", entry.ring_log2)));
         }
+        // WHY/PROOF: the geometry fields are read off the block and its seal is an unkeyed hash, so a crafted entry passes classification; a tract of zero blocks divides by zero in `plow % len` (derive_reap, Tract::position) at open.
+        if entry.tract_blocks == 0 {
+            return Err(Error::Corrupt("tract of zero blocks".into()));
+        }
+        // WHY/PROOF: the cursors obey reap ≤ plow ≤ reap + len in every committed generation (append refuses past clean space, the grow realigns to old_len ≤ new_len, the derived reap is at most the plow and at least plow − len); `clean_blocks` subtracts by that invariant and would wrap on an entry that breaks it.
+        if let Some(reap) = entry.reap {
+            if reap > entry.plow || entry.plow - reap > entry.tract_blocks {
+                return Err(Error::Corrupt(format!(
+                    "cursors reap {reap} plow {} break reap ≤ plow ≤ reap + {}",
+                    entry.plow, entry.tract_blocks
+                )));
+            }
+        }
+        // WHY/PROOF: `plow + tract_blocks` is the fence budget and the grow's realignment; a crafted plow near u64::MAX wraps it in release and panics in debug, and reap + tract_blocks is at most it (reap ≤ plow above).
+        if entry.plow.checked_add(entry.tract_blocks).is_none() {
+            return Err(Error::Corrupt(format!(
+                "plow {} + tract {} overflows the monotone domain",
+                entry.plow, entry.tract_blocks
+            )));
+        }
         Ok(entry)
     }
 
     /// This generation's contribution to the rollback fence: appends must stay below reap + len (space that was clean when this generation committed contains nothing it references). A legacy entry without a reap contributes its plow — zero append budget — and K subsequent generations age it out.
+    /// The sum cannot overflow: `decode` admits an entry only when plow + tract_blocks fits and reap ≤ plow.
     pub fn fence_budget(&self) -> u64 {
         match self.reap {
             Some(r) => r + self.tract_blocks,
@@ -672,4 +693,42 @@ pub fn append_root<A: BlockDev, B: BlockDev>(
 ) -> Result<()> {
     let block = entry.encode();
     mirror.write_verified(entry.gen & (ROOT_SLOTS - 1), &block)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(tract_blocks: u64, plow: u64, reap: Option<u64>) -> SpineEntry {
+        SpineEntry {
+            gen: 3,
+            prev_hash: [1u8; 32],
+            ring_log2: 8,
+            tract_blocks,
+            hamt_hash: [2u8; 32],
+            hamt_lba: 0,
+            plow,
+            reap,
+            live: 0,
+            eagle_time: 1,
+        }
+    }
+
+    fn decoded(e: &SpineEntry) -> Result<SpineEntry> {
+        SpineEntry::decode(&e.encode())
+    }
+
+    /// LIB-06: a sealed entry whose geometry would divide by zero, wrap the fence, or break the cursor invariant is Corrupt at decode, so it never classifies Valid and never becomes a head.
+    #[test]
+    fn crafted_geometry_is_refused_at_decode() {
+        assert!(decoded(&entry(1 << 10, 12, Some(4))).is_ok(), "a sound entry decodes");
+        assert!(decoded(&entry(1 << 10, 12, None)).is_ok(), "a legacy entry without a reap decodes");
+        assert!(matches!(decoded(&entry(0, 0, Some(0))), Err(Error::Corrupt(_))), "a tract of zero blocks");
+        assert!(matches!(decoded(&entry(1 << 10, 4, Some(12))), Err(Error::Corrupt(_))), "reap past the plow");
+        assert!(matches!(decoded(&entry(1 << 4, 40, Some(4))), Err(Error::Corrupt(_))), "plow more than a tract past the reap");
+        assert!(matches!(decoded(&entry(1 << 4, u64::MAX - 4, Some(u64::MAX - 8))), Err(Error::Corrupt(_))), "plow + tract overflows");
+        // The classifier agrees: the block is Corrupt, not Valid, at its own slot.
+        let block = entry(0, 0, Some(0)).encode();
+        assert!(matches!(classify(&block, 3, Some(8)), Classified::Corrupt));
+    }
 }
