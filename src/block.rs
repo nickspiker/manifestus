@@ -58,6 +58,12 @@ pub trait BlockDev: Send {
             "device does not support grow".into(),
         ))
     }
+
+    /// `grow` told where the committed extent ended before: the blocks `old_blocks..new_blocks` are the new ones. A device whose space is larger than its extent (ferros's vault process: a window bigger than the tract) zeroes exactly those and nothing below; the default ignores `old_blocks` and grows as `grow` does. The engine calls this, never `grow` directly, when it grows a tract (2026-11-08: a device that guessed where the old extent ended zeroed a whole vault).
+    fn grow_from(&mut self, old_blocks: u64, new_blocks: u64) -> Result<()> {
+        let _ = old_blocks;
+        self.grow(new_blocks)
+    }
 }
 
 /// Forwarding impl so borrowed devices compose (verified_replicate wraps `&mut A` / `&mut B` in temporary solo Mirrors).
@@ -88,5 +94,8 @@ impl<D: BlockDev + ?Sized> BlockDev for &mut D {
     }
     fn grow(&mut self, new_blocks: u64) -> Result<()> {
         (**self).grow(new_blocks)
+    }
+    fn grow_from(&mut self, old_blocks: u64, new_blocks: u64) -> Result<()> {
+        (**self).grow_from(old_blocks, new_blocks)
     }
 }

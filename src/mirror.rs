@@ -287,12 +287,21 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
 
     /// Extend every present device to `new_blocks`, same failure matrix as writes: primary must grow or the op fails; a secondary that refuses is dropped for the session (`degraded` flips) — the primary carries the new geometry alone.
     pub fn grow(&mut self, new_blocks: u64) -> Result<()> {
+        self.grow_with(None, new_blocks)
+    }
+
+    /// `grow`, telling each device where the committed extent ended before (`BlockDev::grow_from`): what the vault calls when it grows a tract.
+    pub fn grow_from(&mut self, old_blocks: u64, new_blocks: u64) -> Result<()> {
+        self.grow_with(Some(old_blocks), new_blocks)
+    }
+
+    fn grow_with(&mut self, old_blocks: Option<u64>, new_blocks: u64) -> Result<()> {
         self.drain()?;
         match (self.a.as_mut(), self.b.as_mut()) {
             (Some(a), b) => {
-                a.grow(new_blocks)?;
+                grow_dev(a, old_blocks, new_blocks)?;
                 if let Some(b) = b {
-                    if b.grow(new_blocks).is_err() {
+                    if grow_dev(b, old_blocks, new_blocks).is_err() {
                         self.b = None;
                         self.degraded = true;
                         self.events.emit(StorageEvent::MirrorDegraded);
@@ -300,7 +309,7 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
                 }
                 Ok(())
             }
-            (None, Some(b)) => b.grow(new_blocks),
+            (None, Some(b)) => grow_dev(b, old_blocks, new_blocks),
             (None, None) => Err(Error::Corrupt("mirror has no devices".into())),
         }
     }
@@ -430,4 +439,12 @@ fn write_one<D: BlockDev>(dev: &mut D, lba: u64, buf: &Block, scratch: &mut Bloc
         }
     }
     Err(Error::Verify(lba))
+}
+
+/// One device grown: told the old extent when the caller knows it (`BlockDev::grow_from`), else `grow`.
+fn grow_dev<D: BlockDev>(d: &mut D, old_blocks: Option<u64>, new_blocks: u64) -> Result<()> {
+    match old_blocks {
+        Some(old) => d.grow_from(old, new_blocks),
+        None => d.grow(new_blocks),
+    }
 }

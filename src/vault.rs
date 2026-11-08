@@ -814,7 +814,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             return Ok(());
         }
         let need = self.tract.base + new_tract_blocks;
-        self.ring.mirror().grow(need)?;
+        // The devices told the old extent, so a device larger than its extent zeroes only the new blocks (`BlockDev::grow_from`).
+        self.ring.mirror().grow_from(self.tract.base + old_len, need)?;
 
         // Grow is a barrier: the usual caller just hit TractFull/Fenced mid-put, leaving a dirty arena and half-applied liveness. Discard all provisional state by reloading the committed head — exactly resume's path. Orphaned blocks the wedged op placed classify dead and are reclaimed by the sweep.
         let head = self
@@ -861,7 +862,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             return Ok(());
         }
         let need = self.tract.base + new_tract_blocks;
-        self.ring.mirror().grow(need)?;
+        // The devices told the old extent, so a device larger than its extent zeroes only the new blocks (`BlockDev::grow_from`).
+        self.ring.mirror().grow_from(self.tract.base + old_len, need)?;
         // The realign below re-derives the reap from scratch; a staged window's cursor would overwrite it at the commit.
         self.pending_reap = None;
         let plow = self.tract.plow;
@@ -1206,6 +1208,11 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
 
     pub fn tract_blocks(&self) -> u64 {
         self.tract.len
+    }
+
+    /// Where the tract starts on the device: past the root slots and the ring's band. The device's committed extent is `tract_base() + tract_blocks()`, the point a device that grows itself zeroes from (ferros's vault process: its window is larger than its first extent).
+    pub fn tract_base(&self) -> u64 {
+        self.tract.base
     }
 
     /// Monotone append total — laps = plowed / tract_blocks.

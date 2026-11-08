@@ -980,3 +980,88 @@ fn lazy_open_reads_at_once_and_settles_to_the_eager_state() {
     }
     assert_eq!(v.get(&key(5000)).unwrap(), Some(val(5000)));
 }
+
+/// A device the shape of ferros's vault window: a fixed space larger than the vault's extent, stale bytes past it, `grow` refused, and `grow_from` zeroing exactly the blocks it is told are new.
+#[derive(Clone)]
+struct WindowDev {
+    blocks: std::sync::Arc<std::sync::Mutex<Vec<manifestus::Block>>>,
+}
+
+impl BlockDev for WindowDev {
+    fn block_count(&self) -> u64 {
+        self.blocks.lock().unwrap().len() as u64
+    }
+    fn read(&mut self, lba: u64, buf: &mut manifestus::Block) -> manifestus::Result<()> {
+        *buf = self.blocks.lock().unwrap()[lba as usize];
+        Ok(())
+    }
+    fn write(&mut self, lba: u64, buf: &manifestus::Block) -> manifestus::Result<()> {
+        self.blocks.lock().unwrap()[lba as usize] = *buf;
+        Ok(())
+    }
+    fn flush(&mut self) -> manifestus::Result<()> {
+        Ok(())
+    }
+    fn grow(&mut self, _new_blocks: u64) -> manifestus::Result<()> {
+        Err(manifestus::Error::Corrupt("a window grows only from a known extent".into()))
+    }
+    fn grow_from(&mut self, old_blocks: u64, new_blocks: u64) -> manifestus::Result<()> {
+        assert!(old_blocks <= new_blocks, "grow_from {old_blocks}..{new_blocks} shrinks");
+        if new_blocks > self.block_count() {
+            return Err(manifestus::Error::Corrupt("the window is full".into()));
+        }
+        for b in &mut self.blocks.lock().unwrap()[old_blocks as usize..new_blocks as usize] {
+            *b = ZERO_BLOCK;
+        }
+        Ok(())
+    }
+}
+
+/// 2026-11-08, ferros's Pro: a vault in a window larger than its extent filled up, grew while opening, and its device, guessing where the old extent ended, zeroed the whole vault. Every grow now tells the device the old extent (`grow_from`): a full vault reopened in a larger window grows (at open and in use, several times over), its device zeroing only the new blocks, and every value written before and after survives a reopen.
+#[test]
+fn window_device_grows_from_the_old_extent() {
+    let small = RING + 24;
+    let window = small * 16;
+    let new_dev = || WindowDev { blocks: std::sync::Arc::new(std::sync::Mutex::new(vec![ZERO_BLOCK; small as usize])) };
+    let (a, b) = (new_dev(), new_dev());
+    let mut written: Vec<u64> = Vec::new();
+    let mut t0 = 0;
+    {
+        let mut v = Vault::open(Mirror::new(a.clone(), b.clone()), HOST_RING_LOG2, 1_000, DeletePolicy::UnlinkOnly).unwrap();
+        let mut i = 0u64;
+        loop {
+            match v.put(&key(i), &val(i), 1_000 + i as i64) {
+                Ok(()) => {
+                    written.push(i);
+                    i += 1;
+                }
+                Err(manifestus::Error::TractFull) | Err(manifestus::Error::Fenced(_)) => break,
+                // The small window full: what the Pro's first session (bounded at 512 MiB) met.
+                Err(manifestus::Error::Corrupt(m)) if m.contains("window is full") => break,
+                Err(e) => panic!("unexpected error while filling: {e}"),
+            }
+            assert!(i < 10_000, "the small vault never filled");
+        }
+        t0 = v.tract_blocks();
+    }
+    // The window: the same blocks, then stale bytes up to its end, as a partition holds.
+    for d in [&a, &b] {
+        d.blocks.lock().unwrap().resize(window as usize, [0xA5; 4096]);
+    }
+    {
+        let mut v = Vault::open(Mirror::new(a.clone(), b.clone()), HOST_RING_LOG2, 2_000, DeletePolicy::UnlinkOnly).unwrap();
+        for &j in &written {
+            assert_eq!(v.get(&key(j)).unwrap(), Some(val(j)), "key {j} lost at the reopen in the window");
+        }
+        let first = written.len() as u64;
+        for j in first..first * 6 {
+            v.put(&key(j), &val(j), 3_000 + j as i64).unwrap();
+            written.push(j);
+        }
+        assert!(v.tract_blocks() > t0, "the vault never grew into the window");
+    }
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 9_000, DeletePolicy::UnlinkOnly).unwrap();
+    for &j in &written {
+        assert_eq!(v.get(&key(j)).unwrap(), Some(val(j)), "key {j} lost across the grows");
+    }
+}
