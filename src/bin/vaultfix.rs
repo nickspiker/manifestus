@@ -48,10 +48,8 @@ fn main() -> ExitCode {
         }
     };
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    // The repaired generation's `time` is eagle oscillations, the clock the spine field is defined in (SpineEntry::eagle_time) and the one kete stamps every commit with.
+    let now = vsf::eagle_time_oscillations();
 
     match Vault::open_repairing(mirror, HOST_RING_LOG2, now, manifestus::DeletePolicy::UnlinkOnly) {
         Err(e) => {
