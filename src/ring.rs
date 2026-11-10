@@ -7,7 +7,7 @@
 //! - Empty: zeroed / no magic — expected state (sparse ring, pre-genesis), sorts below all valid.
 //! - Corrupt: magic present but hp fails, OR valid-but-misplaced (congruence fails) — AMBIGUOUS, never compared; head search branches both halves around it.
 
-use alloc::{format, string::ToString, vec, vec::Vec};
+use alloc::{format, vec, vec::Vec};
 use crate::block::{Block, BlockDev, BLOCK, ZERO_BLOCK};
 use crate::error::{Error, Result};
 use crate::mirror::Mirror;
@@ -69,7 +69,7 @@ impl SpineEntry {
         };
 
         // Schema id first, standalone — then name:value pairs.
-        put(VsfType::d(SCHEMA.to_string()).flatten(), &mut cursor);
+        put(VsfType::d(vsf::Ascii::lit(SCHEMA)).flatten(), &mut cursor);
         let pairs: Vec<(&str, VsfType)> = vec![
             ("gen", VsfType::u(self.gen as usize, false)),
             ("prev", VsfType::hp(self.prev_hash.to_vec())),
@@ -90,7 +90,7 @@ impl SpineEntry {
             None => pairs,
         };
         for (name, value) in pairs {
-            put(VsfType::d(name.to_string()).flatten(), &mut cursor);
+            put(VsfType::d(vsf::Ascii::name(name)).flatten(), &mut cursor);
             put(value.flatten(), &mut cursor);
         }
         debug_assert!(cursor < BLOCK, "spine entry overflowed 4KB");
@@ -576,7 +576,7 @@ impl RootEntry {
             buf[*cursor..*cursor + bytes.len()].copy_from_slice(&bytes);
             *cursor += bytes.len();
         };
-        put(VsfType::d(SCHEMA_ROOT.to_string()).flatten(), &mut cursor);
+        put(VsfType::d(vsf::Ascii::lit(SCHEMA_ROOT)).flatten(), &mut cursor);
         let pairs: Vec<(&str, VsfType)> = vec![
             ("gen", VsfType::u(self.gen as usize, false)),
             ("prev", VsfType::hp(self.prev_hash.to_vec())),
@@ -589,7 +589,7 @@ impl RootEntry {
             ("time", VsfType::e(EtType::e6(self.eagle_time))),
         ];
         for (name, value) in pairs {
-            put(VsfType::d(name.to_string()).flatten(), &mut cursor);
+            put(VsfType::d(vsf::Ascii::name(name)).flatten(), &mut cursor);
             put(value.flatten(), &mut cursor);
         }
         debug_assert!(cursor < BLOCK, "root entry overflowed 4KB");

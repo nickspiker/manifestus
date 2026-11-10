@@ -21,7 +21,7 @@ pub const SCHEMA_EXTENT: &str = "manifestus.extent";
 pub const SCHEMA_DIRECT: &str = "manifestus.direct";
 pub const SCHEMA_FURROW: &str = "manifestus.furrow";
 
-use alloc::{format, string::ToString, vec, vec::Vec};
+use alloc::{format, vec, vec::Vec};
 use hashbrown::HashMap;
 
 /// Levels a 256-bit key can route: 256 / 5 rounded up, so depths 0..MAX_DEPTH exist and a node at MAX_DEPTH cannot.
@@ -1253,7 +1253,7 @@ impl Hamt {
 // ============================================================================ codecs =================================================================
 
 fn put_field(buf: &mut Block, cursor: &mut usize, name: &str, value: VsfType) {
-    let n = VsfType::d(name.to_string()).flatten();
+    let n = VsfType::d(vsf::Ascii::name(name)).flatten();
     buf[*cursor..*cursor + n.len()].copy_from_slice(&n);
     *cursor += n.len();
     let v = value.flatten();
@@ -1276,7 +1276,7 @@ fn begin_block(schema: &str) -> (Block, usize) {
     buf[4..4 + hp_len].copy_from_slice(&hp0);
     buf[4 + hp_len] = b'>';
     let mut cursor = body_start();
-    let s = VsfType::d(schema.to_string()).flatten();
+    let s = VsfType::d(vsf::Ascii::name(schema)).flatten();
     buf[cursor..cursor + s.len()].copy_from_slice(&s);
     cursor += s.len();
     (buf, cursor)
