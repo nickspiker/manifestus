@@ -1065,3 +1065,49 @@ fn window_device_grows_from_the_old_extent() {
         assert_eq!(v.get(&key(j)).unwrap(), Some(val(j)), "key {j} lost across the grows");
     }
 }
+
+/// `locate` + `read_tract_run` + `check_furrows` (the furrows checked apart from the walk, on any thread) give what `get` gives; a lone value comes back whole, an absent key absent; furrows checked under another key or out of place, or tampered on the disk, are refused, as `get` refuses them.
+#[test]
+fn locate_then_check_matches_get() {
+    use manifestus::{check_furrows, furrows_whole, Block, Located};
+    let dir = TempDir::new().unwrap();
+    let (pa, pb) = paths(&dir, "locate");
+    let mut v = open_vault(&pa, &pb, RING + 4096);
+    let big: Vec<u8> = (0..70_000u32).map(|i| (i * 7 + 3) as u8).collect();
+    v.put(&key(1), &big, 1_000).unwrap();
+    v.put(&key(2), &val(2), 1_001).unwrap();
+    let checked = |v: &mut Vault<FileDev, FileDev>, k: &[u8; 32], with: &[u8; 32], first: usize| -> manifestus::Result<Vec<u8>> {
+        let Located::Furrows { size, furrows } = v.locate(k)? else { panic!("not furrows") };
+        let mut blocks: Vec<Block> = vec![ZERO_BLOCK; furrows.len()];
+        for (b, &lba) in blocks.iter_mut().zip(furrows.iter()) {
+            v.read_tract_run(lba, core::slice::from_mut(b))?;
+        }
+        let mut out = Vec::new();
+        check_furrows(&blocks, with, first, &mut out)?;
+        furrows_whole(size, &out)?;
+        Ok(out)
+    };
+    assert_eq!(checked(&mut v, &key(1), &key(1), 0).unwrap(), big);
+    assert_eq!(v.get(&key(1)).unwrap(), Some(big.clone()));
+    assert_eq!(v.locate(&key(2)).unwrap(), Located::Lone(val(2)));
+    assert_eq!(v.locate(&key(3)).unwrap(), Located::Absent);
+    assert!(checked(&mut v, &key(1), &key(2), 0).is_err(), "another key's furrows");
+    assert!(checked(&mut v, &key(1), &key(1), 1).is_err(), "furrows out of place");
+    // One furrow's byte flipped on both mirrors: the check and `get` both refuse it.
+    let Located::Furrows { furrows, .. } = v.locate(&key(1)).unwrap() else { panic!("not furrows") };
+    let base = v.tract_base();
+    drop(v);
+    for p in [&pa, &pb] {
+        let mut d = FileDev::open(p).unwrap();
+        let mut b = ZERO_BLOCK;
+        d.read(base + furrows[1], &mut b).unwrap();
+        b[2048] ^= 1;
+        d.write(base + furrows[1], &b).unwrap();
+        d.flush().unwrap();
+    }
+    let a = FileDev::open(&pa).unwrap();
+    let b = FileDev::open(&pb).unwrap();
+    let mut v = Vault::open(Mirror::new(a, b), HOST_RING_LOG2, 2_000, DeletePolicy::UnlinkOnly).unwrap();
+    assert!(checked(&mut v, &key(1), &key(1), 0).is_err());
+    assert!(v.get(&key(1)).is_err());
+}

@@ -7,7 +7,7 @@
 //! 2. Found → head search → geometry/index/live-set from the committed head.
 //! 3. Nothing → WHOLE-FILE scan, both mirrors. Any sealed block anywhere = real vault → refuse to format (recovery ladder, v0 refuses loudly). Zero sealed blocks = trash or fresh → zero the ring, genesis.
 
-use crate::block::{BlockDev, ZERO_BLOCK};
+use crate::block::{Block, BlockDev, ZERO_BLOCK};
 use crate::error::{Error, Result};
 use crate::hamt::{DanglingPointer, Delta, Hamt, StalePointer};
 use crate::mirror::Mirror;
@@ -572,6 +572,18 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     pub fn get(&mut self, key: &[u8; 32]) -> Result<Option<Vec<u8>>> {
         let Self { ring, tract, hamt, .. } = self;
         hamt.lookup(ring.mirror(), tract, key)
+    }
+
+    /// [`Self::get`]'s index walk alone ([`Hamt::locate`]): where the value lies, its furrows not read. With [`Self::read_tract_run`] and the pure [`crate::hamt::check_furrows`] a reader checks the furrows on other threads, every check [`Self::get`] makes kept.
+    pub fn locate(&mut self, key: &[u8; 32]) -> Result<crate::hamt::Located> {
+        let Self { ring, tract, hamt, .. } = self;
+        hamt.locate(ring.mirror(), tract, key)
+    }
+
+    /// Consecutive tract positions from `lba` into `out` as one read, unchecked (staged blocks read as staged): a located value's furrows, for [`crate::hamt::check_furrows`].
+    pub fn read_tract_run(&mut self, lba: u64, out: &mut [Block]) -> Result<()> {
+        let Self { ring, tract, .. } = self;
+        tract.read_run(ring.mirror(), lba, out)
     }
 
     /// Insert/overwrite, durable on return (commit-per-write). A refused append has no side effects, so the ladder simply makes room and retries: Fenced → commit generations to slide the K-window (heartbeats inside commit if the flush itself is fenced); TractFull → reap windows until space exists. Only a tract that stays full after a complete reap lap surfaces TractFull to the caller — grow or refuse.

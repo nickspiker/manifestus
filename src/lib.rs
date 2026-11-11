@@ -27,7 +27,7 @@ pub use host::FileDev;
 pub use inspect::{inspect, InspectOptions, InspectReport};
 pub use mirror::Mirror;
 pub use vault::{verified_replicate, LiveSet, Reclaim, RepairReport, Replicated, Vault, VaultStats};
-pub use hamt::{lone_capacity, max_runs, DanglingPointer, Delta, Hamt, StalePointer, Visited};
+pub use hamt::{check_furrows, furrows_fit, furrows_whole, lone_capacity, max_runs, DanglingPointer, Delta, Hamt, Located, StalePointer, Visited};
 pub use tract::{sealed_hp, Liveness, NoLive, Reloc, Tract};
 /// What "delete" physically does to a value's blocks — a REQUIRED open parameter so every embedder (and every future port) answers the question consciously instead of inheriting an assumption (Nick's verdict, 2026-09-08).
 ///

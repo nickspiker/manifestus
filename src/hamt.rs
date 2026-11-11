@@ -205,8 +205,22 @@ impl Hamt {
         tract: &Tract,
         key: &[u8; 32],
     ) -> Result<Option<Vec<u8>>> {
+        match self.locate(mirror, tract, key)? {
+            Located::Absent => Ok(None),
+            Located::Lone(value) => Ok(Some(value)),
+            Located::Furrows { size, furrows } => Ok(Some(read_furrows(mirror, tract, key, size, &furrows)?)),
+        }
+    }
+
+    /// [`Self::lookup`]'s index walk alone: where the value under `key` lies, every node and the leaf checked on the way; its furrows, if any, not read. A reader that checks the furrows itself, on other threads, reads their blocks ([`Tract::read_run`]) and holds each to [`check_furrows`], the whole to [`furrows_fit`] first and [`furrows_whole`] last, exactly as [`Self::lookup`] does (ferros's vault process, 2026-11-11: the furrows' BLAKE3 guards were most of a large read's time on one core).
+    pub fn locate<A: BlockDev, B: BlockDev>(
+        &mut self,
+        mirror: &mut Mirror<A, B>,
+        tract: &Tract,
+        key: &[u8; 32],
+    ) -> Result<Located> {
         let mut current = match &self.root {
-            None => return Ok(None),
+            None => return Ok(Located::Absent),
             Some(c) => c.clone(),
         };
         let mut depth = 0u8;
@@ -216,7 +230,7 @@ impl Hamt {
                     let node = &self.arena[idx];
                     debug_assert_eq!(node.depth, depth);
                     match &node.children[chunk(key, depth) as usize] {
-                        None => return Ok(None),
+                        None => return Ok(Located::Absent),
                         Some(c) => {
                             current = c.clone();
                             depth += 1;
@@ -225,14 +239,14 @@ impl Hamt {
                 }
                 Child::Committed { hash, lba } => {
                     let doc = match read_doc(mirror, tract, lba, &hash)? {
-                        None => return Ok(None), // zeroed: fast-deleted target
+                        None => return Ok(Located::Absent), // zeroed: fast-deleted target
                         Some(d) => d,
                     };
                     match doc {
                         TractDoc::Node(node) => {
                             node_at_depth(&node, lba, depth)?;
                             match &node.children[chunk(key, depth) as usize] {
-                                None => return Ok(None),
+                                None => return Ok(Located::Absent),
                                 Some(c) => {
                                     current = c.clone();
                                     depth += 1;
@@ -240,20 +254,22 @@ impl Hamt {
                             }
                         }
                         TractDoc::Lone { key: k, value } => {
-                            return Ok(if &k == key { Some(value) } else { None });
+                            return Ok(if &k == key { Located::Lone(value) } else { Located::Absent });
                         }
                         TractDoc::Direct { key: k, size, furrows } => {
                             if &k != key {
-                                return Ok(None);
+                                return Ok(Located::Absent);
                             }
-                            return Ok(Some(read_furrows(mirror, tract, key, size, &furrows)?));
+                            furrows_fit(size, furrows.len())?;
+                            return Ok(Located::Furrows { size, furrows });
                         }
                         TractDoc::Extent { key: k, size, runs } => {
                             if &k != key {
-                                return Ok(None);
+                                return Ok(Located::Absent);
                             }
-                            let positions = expand_runs(&runs, size, tract.len)?;
-                            return Ok(Some(read_furrows(mirror, tract, key, size, &positions)?));
+                            let furrows = expand_runs(&runs, size, tract.len)?;
+                            furrows_fit(size, furrows.len())?;
+                            return Ok(Located::Furrows { size, furrows });
                         }
                         TractDoc::Furrow { .. } => {
                             return Err(Error::Corrupt("furrow reached via index walk".into()));
@@ -1586,13 +1602,7 @@ fn read_furrows<A: BlockDev, B: BlockDev>(
     size: u64,
     furrows: &[u64],
 ) -> Result<Vec<u8>> {
-    // WHY/PROOF: `size` is a field of the leaf block and its seal is an unkeyed hash, so a crafted 2^60 made this Vec::with_capacity abort the process before a byte was read; a value cannot hold more than its furrows carry, and their count is bounded by the tract (extent runs) or by one block's fields (a direct leaf).
-    if size > furrows.len() as u64 * furrow_capacity() as u64 {
-        return Err(Error::Corrupt(format!(
-            "value size {size} exceeds what {} furrows can carry",
-            furrows.len()
-        )));
-    }
+    furrows_fit(size, furrows.len())?;
     let mut out = Vec::with_capacity(size as usize);
     // The furrows' blocks, each run of consecutive positions as one read (a value lands as one contiguous run, two at a ring wrap), at most RUN_STEP blocks a read so the bounce buffer stays one step whatever the value's size.
     let mut blocks: Vec<Block> = Vec::new();
@@ -1602,28 +1612,57 @@ fn read_furrows<A: BlockDev, B: BlockDev>(
             blocks.clear();
             blocks.resize(i - start, ZERO_BLOCK);
             tract.read_run(mirror, furrows[start], &mut blocks)?;
-            for (j, buf) in blocks.iter().enumerate() {
-                let index_here = start + j;
-                if sealed_hp(buf).is_none() {
-                    return Err(Error::Corrupt(format!("furrow {index_here} unsealed")));
-                }
-                match decode_doc(buf)? {
-                    TractDoc::Furrow { key: k, index, payload } => {
-                        if &k != key || index as usize != index_here {
-                            return Err(Error::Corrupt(format!("furrow {index_here} mismatched owner/index")));
-                        }
-                        out.extend_from_slice(&payload);
-                    }
-                    _ => return Err(Error::Corrupt(format!("furrow {index_here} wrong schema"))),
-                }
-            }
+            check_furrows(&blocks, key, start, &mut out)?;
             start = i;
         }
     }
+    furrows_whole(size, &out)?;
+    Ok(out)
+}
+
+/// Where a value lies ([`Hamt::locate`]): nowhere, in its leaf (a lone value, already checked with the leaf), or in its furrows: the value's size and the furrows' tract positions in order, still to be read and checked ([`check_furrows`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Located {
+    Absent,
+    Lone(Vec<u8>),
+    Furrows { size: u64, furrows: Vec<u64> },
+}
+
+/// Whether `count` furrows can carry a value of `size` bytes: checked before anything is reserved for it.
+pub fn furrows_fit(size: u64, count: usize) -> Result<()> {
+    // WHY/PROOF: `size` is a field of the leaf block and its seal is an unkeyed hash, so a crafted 2^60 made a Vec::with_capacity of it abort the process before a byte was read; a value cannot hold more than its furrows carry, and their count is bounded by the tract (extent runs) or by one block's fields (a direct leaf).
+    if size > count as u64 * furrow_capacity() as u64 {
+        return Err(Error::Corrupt(format!("value size {size} exceeds what {count} furrows can carry")));
+    }
+    Ok(())
+}
+
+/// Furrows `first..first + blocks.len()` of the value under `key`, as read from the tract, each held to its seal, its schema, its owner and its place, its payload appended to `out`. Pure (touches nothing but `out`), so any thread may check a value's furrows; the runs are joined in order and the whole is held to the leaf's size ([`furrows_whole`]).
+pub fn check_furrows(blocks: &[Block], key: &[u8; 32], first: usize, out: &mut Vec<u8>) -> Result<()> {
+    for (j, buf) in blocks.iter().enumerate() {
+        let index_here = first + j;
+        if sealed_hp(buf).is_none() {
+            return Err(Error::Corrupt(format!("furrow {index_here} unsealed")));
+        }
+        match decode_doc(buf)? {
+            TractDoc::Furrow { key: k, index, payload } => {
+                if &k != key || index as usize != index_here {
+                    return Err(Error::Corrupt(format!("furrow {index_here} mismatched owner/index")));
+                }
+                out.extend_from_slice(&payload);
+            }
+            _ => return Err(Error::Corrupt(format!("furrow {index_here} wrong schema"))),
+        }
+    }
+    Ok(())
+}
+
+/// The joined furrows are exactly the leaf's size.
+pub fn furrows_whole(size: u64, out: &[u8]) -> Result<()> {
     if out.len() as u64 != size {
         return Err(Error::Corrupt("assembled size mismatch".into()));
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
