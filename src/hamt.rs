@@ -54,6 +54,9 @@ pub const WALK_STEP: usize = 1 << 8;
 /// Blocks a value read takes at once: a furrow run longer than this is read in steps, so the bounce buffer is one step (1 MiB) however large the value.
 const RUN_STEP: usize = 1 << 8;
 
+/// Survivors a reap copies before writing them out (`Hamt::reap_window`): the window is a sixty-fourth of the tract, so without this bound a reap held up to twice the window in memory, its survivors read and their staged copies, and the memory a reap needs grew with the tract (2 MiB at most now, whatever the tract).
+const REAP_CHUNK: usize = 1 << 8;
+
 /// A committed pointer whose target reads as all-zero: a fast-deleted leaf whose index unlink never landed. `route` is a key that descends to the pointer (path chunks set, rest zero).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StalePointer {
@@ -1046,34 +1049,40 @@ impl Hamt {
             match read_doc(mirror, tract, leaf_lba, &leaf_hash)? {
                 Some(TractDoc::Extent { key: k, size, runs }) if k == key => {
                     group.sort_by_key(|&(_, idx)| idx);
-                    let mut payload = Vec::with_capacity(group.len());
-                    for &(pos, _) in &group {
-                        let mut b = ZERO_BLOCK;
-                        tract.read(mirror, pos, &mut b)?;
-                        payload.push(b);
-                    }
-                    let placed = tract.append(mirror, oracle, &payload)?;
-                    // Patch the moved positions into the run list, coalescing.
                     // TODO(scale): expand_runs materializes one u64 per furrow (~24MB transiently for a 12GB value) — fine on hosts, wants a run-walking iterator for the no_std kernel profile.
                     let mut positions = expand_runs(&runs, size, tract.len)?;
-                    for (&(_, idx), &newpos) in group.iter().zip(&placed) {
-                        let i = idx as usize;
-                        if i >= positions.len() {
-                            return Err(Error::Corrupt("furrow index beyond its extent".into()));
+                    // The group's furrows copied REAP_CHUNK at a time, each chunk appended (consecutive at the plow, as one append of them all would place them) and written out before the next is read: a window holds a lap's sixty-fourth, and one owner's furrows can fill it, so the whole group read into one vector and staged again by the append cost twice the window in memory (ferros's vault process, 2026-11-12: 32 MiB at a 1 GiB tract, past its 56 MiB heap at 2 GiB).
+                    // Each chunk's position patch and liveness delta follow its copy; a refused later chunk leaves the earlier ones' verified copies unreferenced (the leaf below is not replaced), orphans a later window reaps.
+                    let mut payload: Vec<Block> = Vec::with_capacity(group.len().min(REAP_CHUNK));
+                    for chunk in group.chunks(REAP_CHUNK) {
+                        payload.clear();
+                        for &(pos, _) in chunk {
+                            let mut b = ZERO_BLOCK;
+                            tract.read(mirror, pos, &mut b)?;
+                            payload.push(b);
                         }
-                        positions[i] = newpos;
+                        let placed = tract.append(mirror, oracle, &payload)?;
+                        for (&(_, idx), &newpos) in chunk.iter().zip(&placed) {
+                            let i = idx as usize;
+                            if i >= positions.len() {
+                                return Err(Error::Corrupt("furrow index beyond its extent".into()));
+                            }
+                            positions[i] = newpos;
+                        }
+                        for (b, &lba) in payload.iter().zip(&placed) {
+                            self.delta.added.push((lba, sealed_hp(b).unwrap()));
+                        }
+                        for (&(pos, _), b) in chunk.iter().zip(&payload) {
+                            self.delta.removed.push((pos, sealed_hp(b).unwrap()));
+                        }
+                        mirror.drain()?;
                     }
+                    // Patch the moved positions into the run list, coalescing.
                     let new_runs = compress_runs(&positions);
                     let new_leaf = encode_extent(&key, size, &new_runs)?;
                     let nl = tract.append(mirror, oracle, core::slice::from_ref(&new_leaf))?[0];
                     let nh = sealed_hp(&new_leaf).unwrap();
                     self.replace_leaf(mirror, tract, &key, (leaf_hash, leaf_lba), (nh, nl))?;
-                    for (b, &lba) in payload.iter().zip(&placed) {
-                        self.delta.added.push((lba, sealed_hp(b).unwrap()));
-                    }
-                    for (&(pos, _), b) in group.iter().zip(&payload) {
-                        self.delta.removed.push((pos, sealed_hp(b).unwrap()));
-                    }
                     self.delta.added.push((nl, nh));
                     self.delta.removed.push((leaf_lba, leaf_hash));
                 }
@@ -1087,6 +1096,8 @@ impl Hamt {
         }
 
         // 3. Standalone block moves: leaves first, then nodes (leaf repoints COW ancestor    nodes, superseding some — those are skipped, not moved). A block our own work    already retired (delta.removed) is garbage now.
+        // Written out every REAP_CHUNK moves, as the furrows above: a window of lone values or leaves stages one block each.
+        let mut staged = 0usize;
         for (pos, hp) in lones.into_iter().chain(leaves).chain(nodes) {
             if self.delta.removed.iter().any(|&(l, h)| l == pos && h == hp) {
                 continue;
@@ -1100,6 +1111,11 @@ impl Hamt {
             self.repair_relocs(mirror, tract, &[Reloc { hp, from: pos, to }])?;
             self.delta.added.push((to, hp));
             self.delta.removed.push((pos, hp));
+            staged += 1;
+            if staged == REAP_CHUNK {
+                mirror.drain()?;
+                staged = 0;
+            }
         }
 
         tract.reap = start + w;
