@@ -19,84 +19,176 @@ use hashbrown::HashMap;
 
 /// The vault's knowledge of what is referenced: tract lba → sealing hash. Rebuilt from the committed HAMT at open; maintained by deltas afterward. This IS the reap's liveness oracle.
 ///
-/// HashMap PROOF (AGENT.md consent: Nick, 2026-06-12): `is_live` is called once per scanned position in every reap window, and the map holds one entry per live tract block. A linear scan would make one window O(scanned × live); O(1) point lookup matches the access pattern exactly.
+/// A direct index by position, in pages (2026-11-13, ferros's vault process on the 8a), as `Visited` is a bitset: a tract position is a dense number below the tract's length (the walk refuses a pointer past it, `doc_of`; appends are taken modulo it), so a position's entry is found by arithmetic, with no hash, no probe and no rehash.
+/// Until then it was one hashbrown `HashMap<u64, [u8; 32]>` and a `HashSet<u64>` (consented 2026-06-12 against a linear scan), and each doubling allocated the whole new table beside the old one.
+/// At 2^19 buckets that is 21,495,816 bytes at once (2^19 × 40 + 2^19 + 8) beside the old 10,747,912, and the vault process (a 56 MiB heap) died on it twice: "serving a delete" 2026-11-12 and "serving a set" 2026-11-13, while Mahere stowed and wrote its cells.
+/// A page covers LIVE_PAGE positions: two bitmaps (live with a hash, live by position alone) and the hashes of its hashed positions packed in position order, a position's at the count of hashed positions below it in the page (a popcount over at most LIVE_PAGE / 64 words).
+/// The largest allocation is one page's hashes, LIVE_PAGE × 32 bytes (32 KiB); a page with nothing live is given back.
+/// Memory: 32 bytes a hashed block (and its vector's slack), a bit a position for one by position alone, 304 bytes a page in use; hashbrown's table is 41 bytes a bucket at a load of 7/16 to 7/8 (47 to 94 bytes an entry), and 9 bytes a bucket for each by position alone.
+/// Measured on the host against the two hashbrown tables (tests/live_memory.rs `live_lookup_cost`, 2^19 + 2^17 hashed and 2^17 by position alone in a 2^20-block tract, as the 8a grew past its deaths): 21.2 MB held against 45.4 MB, the largest allocation 32 KiB against 43 MB, built in 7 to 8 ms against 54 to 61, 2^23 lookups in 77 to 138 ms against 188 to 191. As an open leaves it (one block in 18 hashed, the rest by position alone, 786,432 live): 1.8 MB against 12.1 MB.
 ///
-/// In LIVE_SHARDS tables by the position's low bits (2026-11-13, ferros's vault process on the 8a): one table doubled as it grew, and each doubling was one allocation of the whole new table beside the old one.
-/// A hashed entry is 41 bytes of table (the u64, the 32-byte hash, a control byte), so the doubling from 2^18 to 2^19 buckets asked for 21,495,816 bytes at once with the old 10,747,912 still held, and the process (a 56 MiB heap) died on it serving a set while Mahere stowed and wrote its cells; its death of 2026-11-12 "serving a delete" was the doubling before it, 10,747,912 bytes.
-/// Split by position, each table holds a 256th of the entries and grows on its own: the largest allocation is a 256th of what it was (84 KiB at 2^19 entries), and a doubling holds one small table twice instead of the whole set.
-/// Positions are consecutive tract blocks, so their low bits spread them evenly over the tables.
-///
-/// TODO(scale): this map (RAM ∝ live blocks) and the open-time walk_live that rebuilds it are the two caches standing between the on-disk format (petabyte-ready: EWE fields, constant-fragment extents, size-independent spine) and a petabyte-practical implementation. Both are retirable: blocks self-address, so `is_live` can be answered by walking the index for the block's own key (O(log) reads, zero RAM) and resume can skip the walk entirely. Not pressing at photon/cairn scale — do this with the kernel-profile port.
+/// TODO(scale): this index (RAM ∝ live blocks) and the open-time walk_live that rebuilds it are the two caches standing between the on-disk format (petabyte-ready: EWE fields, constant-fragment extents, size-independent spine) and a petabyte-practical implementation. Both are retirable: blocks self-address, so `is_live` can be answered by walking the index for the block's own key (O(log) reads, zero RAM) and resume can skip the walk entirely. Not pressing at photon/cairn scale — do this with the kernel-profile port.
+#[derive(Default)]
 pub struct LiveSet {
-    map: Vec<HashMap<u64, [u8; 32]>>,
-    /// Blocks the committed TREE references without a recorded hash: the furrows and extent runs of a Direct/Extent leaf, marked at a TREE-ONLY open (Nick 2026-09-12: "there's zero reason we verify the whole vault — treed open was the initial design"). `is_referenced` is true for them, `is_live` (exact hash) is answered from the block's own seal by the callers that hold the block — the plow reads every block in its window anyway. Sharded as `map`.
-    referenced: Vec<hashbrown::HashSet<u64>>,
+    /// Page k covers positions k × LIVE_PAGE to (k + 1) × LIVE_PAGE − 1; None while none of them is live. Grown by insertion to the highest page reached.
+    pages: Vec<Option<Box<LivePage>>>,
+    /// Live blocks with a recorded hash, and by position alone.
+    hashed: usize,
+    tree: usize,
 }
 
-/// How many tables the live set is split into (`LiveSet`), by a position's low bits.
-pub const LIVE_SHARDS: usize = 1 << 8;
+/// Positions a page covers (`LiveSet`): its hashes are at most LIVE_PAGE × 32 bytes, 32 KiB.
+pub const LIVE_PAGE_LOG2: u32 = 10;
+pub const LIVE_PAGE: usize = 1 << LIVE_PAGE_LOG2;
+const WORDS: usize = LIVE_PAGE >> 6;
 
-/// The table a position's entry lives in.
-fn shard(lba: u64) -> usize {
-    (lba as usize) & (LIVE_SHARDS - 1)
+/// One page of the live set: which of its positions are live with a hash and which by position alone (a position is at most one of the two), how many by position alone, and the hashed positions' hashes in position order.
+struct LivePage {
+    hashed: [u64; WORDS],
+    /// The hashed positions in the words before each word: a rank is one of these and one popcount.
+    below: [u16; WORDS],
+    tree: [u64; WORDS],
+    n_tree: u32,
+    hashes: Vec<[u8; 32]>,
 }
 
-impl Default for LiveSet {
-    /// Empty tables allocate nothing until their first entry.
-    fn default() -> Self {
-        LiveSet { map: (0..LIVE_SHARDS).map(|_| HashMap::new()).collect(), referenced: (0..LIVE_SHARDS).map(|_| hashbrown::HashSet::new()).collect() }
+impl LivePage {
+    /// Where the hash of the position at word `w`, bit `bit` lies in `hashes`: the hashed positions below it in the page.
+    fn rank(&self, w: usize, bit: u64) -> usize {
+        self.below[w] as usize + (self.hashed[w] & (bit - 1)).count_ones() as usize
+    }
+
+    /// The position at word `w`, bit `bit` hashed (`up`) or no longer: its bit and the counts of the words after it.
+    fn mark_hashed(&mut self, w: usize, bit: u64, up: bool) {
+        if up {
+            self.hashed[w] |= bit;
+        } else {
+            self.hashed[w] &= !bit;
+        }
+        for b in self.below[w + 1..].iter_mut() {
+            *b = if up { *b + 1 } else { *b - 1 };
+        }
     }
 }
 
+/// A position's page, its word in the page's bitmaps, and its bit.
+fn place(lba: u64) -> (usize, usize, u64) {
+    let slot = (lba as usize) & (LIVE_PAGE - 1);
+    ((lba >> LIVE_PAGE_LOG2) as usize, slot >> 6, 1u64 << (slot & 63))
+}
+
 impl LiveSet {
+    /// The page holding `lba`, if one exists.
+    fn page(&self, lba: u64) -> Option<&LivePage> {
+        // WHY the get: pages exist up to the highest one an insertion reached; a position past them is one no entry ever reached, which is "not live" (the answer, not a guard).
+        self.pages.get((lba >> LIVE_PAGE_LOG2) as usize).and_then(|p| p.as_deref())
+    }
+
+    /// The page holding `lba`, made (and the directory grown to it) if need be.
+    fn page_mut(&mut self, lba: u64) -> &mut LivePage {
+        let k = (lba >> LIVE_PAGE_LOG2) as usize;
+        if k >= self.pages.len() {
+            self.pages.resize_with(k + 1, || None);
+        }
+        self.pages[k].get_or_insert_with(|| Box::new(LivePage { hashed: [0; WORDS], below: [0; WORDS], tree: [0; WORDS], n_tree: 0, hashes: Vec::new() }))
+    }
+
     /// ADDED FIRST, THEN REMOVED — the order is load-bearing (field 2026-09-08, photon: "relocation repointed nothing for block at 2078" ×3 on a fresh phone vault mid history-restore). A block can be added AND retired inside ONE delta: a key written twice in the same batch appends leaf L1, then the rewrite retires L1 and appends L2. Applying `removed` first found L1 absent (a no-op) and `added` then inserted it anyway, leaving L1 live in this map with no index route — bytes intact, "live", unrouted — which the plow moved and the repoint guard refused, forever, wedging every later window at that block. Added-then-removed is exactly right because the tract is append-only within a delta: an lba is added at most once per commit and any removal of it must come after its add, so a block that is both ends removed.
     pub fn apply(&mut self, delta: Delta) {
         for (lba, hp) in delta.added {
             self.insert(lba, hp);
         }
         for (lba, hp) in delta.removed {
-            let s = shard(lba);
-            if self.map[s].get(&lba) == Some(&hp) {
-                self.map[s].remove(&lba);
-            }
-            // A tree-only entry has no hash to match: the leaf that referenced it is being removed, so the block goes with it.
-            self.referenced[s].remove(&lba);
+            self.remove(lba, &hp);
         }
     }
 
-    /// Mark a block live with its recorded hash (it is no longer tree-only).
+    /// A block retired: its hashed entry if `hp` is the hash recorded for it, its entry by position alone whatever `hp` (the leaf that referenced it is being removed, so the block goes with it); the page given back once nothing in it is live.
+    fn remove(&mut self, lba: u64, hp: &[u8; 32]) {
+        let (k, w, bit) = place(lba);
+        // WHY the get: as `page`, a position no entry reached has nothing to remove.
+        let Some(Some(p)) = self.pages.get_mut(k) else { return };
+        if p.hashed[w] & bit != 0 {
+            let r = p.rank(w, bit);
+            if p.hashes[r] == *hp {
+                p.hashes.remove(r);
+                p.mark_hashed(w, bit, false);
+                self.hashed -= 1;
+                // Space given back as a page empties (a reap retires whole windows): kept at no more than twice what is held.
+                if p.hashes.len() << 2 <= p.hashes.capacity() {
+                    let keep = p.hashes.len() << 1;
+                    p.hashes.shrink_to(keep);
+                }
+            }
+        }
+        if p.tree[w] & bit != 0 {
+            p.tree[w] &= !bit;
+            p.n_tree -= 1;
+            self.tree -= 1;
+        }
+        if p.hashes.is_empty() && p.n_tree == 0 {
+            self.pages[k] = None;
+        }
+    }
+
+    /// Mark a block live with its recorded hash (it is no longer live by position alone).
     pub fn insert(&mut self, lba: u64, hp: [u8; 32]) {
-        let s = shard(lba);
-        self.referenced[s].remove(&lba);
-        self.map[s].insert(lba, hp);
+        let (_, w, bit) = place(lba);
+        let p = self.page_mut(lba);
+        let r = p.rank(w, bit);
+        if p.hashed[w] & bit != 0 {
+            p.hashes[r] = hp;
+            return;
+        }
+        let was_tree = p.tree[w] & bit != 0;
+        p.tree[w] &= !bit;
+        p.n_tree -= was_tree as u32;
+        p.mark_hashed(w, bit, true);
+        p.hashes.insert(r, hp);
+        self.tree -= was_tree as usize;
+        self.hashed += 1;
     }
 
     /// The hash recorded for a live block; None for one not live, or live by position alone.
     pub fn hash_at(&self, lba: u64) -> Option<&[u8; 32]> {
-        self.map[shard(lba)].get(&lba)
+        let (_, w, bit) = place(lba);
+        let p = self.page(lba)?;
+        if p.hashed[w] & bit == 0 {
+            return None;
+        }
+        Some(&p.hashes[p.rank(w, bit)])
     }
 
     /// Whether a block is live by position alone (tree-only).
     pub fn tree_only(&self, lba: u64) -> bool {
-        self.referenced[shard(lba)].contains(&lba)
+        let (_, w, bit) = place(lba);
+        self.page(lba).is_some_and(|p| p.tree[w] & bit != 0)
     }
 
     /// Mark a block live by position alone — the tree-only open's form for furrows and extent runs.
     pub fn mark_referenced(&mut self, lba: u64) {
-        let s = shard(lba);
-        if !self.map[s].contains_key(&lba) {
-            self.referenced[s].insert(lba);
+        let (_, w, bit) = place(lba);
+        let p = self.page_mut(lba);
+        if (p.hashed[w] | p.tree[w]) & bit == 0 {
+            p.tree[w] |= bit;
+            p.n_tree += 1;
+            self.tree += 1;
         }
     }
 
     /// Live blocks with a recorded hash, and live by position alone.
     pub fn counts(&self) -> (usize, usize) {
-        (self.map.iter().map(|m| m.len()).sum(), self.referenced.iter().map(|r| r.len()).sum())
+        (self.hashed, self.tree)
+    }
+
+    /// Bytes the set holds: the directory, the pages and their hashes (display-grade: the allocator's own overhead not counted).
+    pub fn bytes(&self) -> usize {
+        let pages = self.pages.iter().flatten();
+        self.pages.capacity() * core::mem::size_of::<Option<Box<LivePage>>>() + pages.map(|p| core::mem::size_of::<LivePage>() + p.hashes.capacity() * 32).sum::<usize>()
     }
 
     pub fn len(&self) -> usize {
-        let (hashed, tree) = self.counts();
-        hashed + tree
+        self.hashed + self.tree
     }
 
     /// Blocks the live entries occupy (each map value is a block position; referenced runs count one block each — the tree-only open's coarse view). Display-grade, not accounting-grade.
@@ -105,17 +197,30 @@ impl LiveSet {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.map.iter().all(|m| m.is_empty()) && self.referenced.iter().all(|r| r.is_empty())
+        self.len() == 0
+    }
+
+    /// The positions set in one bitmap of each page (`pick` chooses which), in order, each with its page.
+    fn set_bits<'a>(&'a self, pick: fn(&LivePage) -> &[u64; WORDS]) -> impl Iterator<Item = (u64, &'a LivePage)> + 'a {
+        self.pages.iter().enumerate().filter_map(|(k, p)| p.as_deref().map(|p| (k, p))).flat_map(move |(k, p)| {
+            (0..WORDS).flat_map(move |w| {
+                let word = pick(p)[w];
+                (0..64u64).filter(move |b| word >> b & 1 != 0).map(move |b| (((k << LIVE_PAGE_LOG2) + (w << 6)) as u64 + b, p))
+            })
+        })
     }
 
     /// Every live position with its recorded hash.
     pub fn hashed(&self) -> impl Iterator<Item = (u64, &[u8; 32])> + '_ {
-        self.map.iter().flat_map(|m| m.iter().map(|(l, h)| (*l, h)))
+        self.set_bits(|p| &p.hashed).map(|(lba, p)| {
+            let (_, w, bit) = place(lba);
+            (lba, &p.hashes[p.rank(w, bit)])
+        })
     }
 
     /// Every position live by position alone.
     pub fn tree_positions(&self) -> impl Iterator<Item = u64> + '_ {
-        self.referenced.iter().flat_map(|r| r.iter().copied())
+        self.set_bits(|p| &p.tree).map(|(lba, _)| lba)
     }
 
     /// Every live position, hashed or tree-only.
@@ -130,8 +235,8 @@ impl Liveness for LiveSet {
         self.hash_at(lba) == Some(hp) || self.tree_only(lba)
     }
     fn is_referenced(&self, lba: u64) -> bool {
-        let s = shard(lba);
-        self.map[s].contains_key(&lba) || self.referenced[s].contains(&lba)
+        let (_, w, bit) = place(lba);
+        self.page(lba).is_some_and(|p| (p.hashed[w] | p.tree[w]) & bit != 0)
     }
 }
 
