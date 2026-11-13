@@ -21,63 +21,117 @@ use hashbrown::HashMap;
 ///
 /// HashMap PROOF (AGENT.md consent: Nick, 2026-06-12): `is_live` is called once per scanned position in every reap window, and the map holds one entry per live tract block. A linear scan would make one window O(scanned × live); O(1) point lookup matches the access pattern exactly.
 ///
+/// In LIVE_SHARDS tables by the position's low bits (2026-11-13, ferros's vault process on the 8a): one table doubled as it grew, and each doubling was one allocation of the whole new table beside the old one.
+/// A hashed entry is 41 bytes of table (the u64, the 32-byte hash, a control byte), so the doubling from 2^18 to 2^19 buckets asked for 21,495,816 bytes at once with the old 10,747,912 still held, and the process (a 56 MiB heap) died on it serving a set while Mahere stowed and wrote its cells; its death of 2026-11-12 "serving a delete" was the doubling before it, 10,747,912 bytes.
+/// Split by position, each table holds a 256th of the entries and grows on its own: the largest allocation is a 256th of what it was (84 KiB at 2^19 entries), and a doubling holds one small table twice instead of the whole set.
+/// Positions are consecutive tract blocks, so their low bits spread them evenly over the tables.
+///
 /// TODO(scale): this map (RAM ∝ live blocks) and the open-time walk_live that rebuilds it are the two caches standing between the on-disk format (petabyte-ready: EWE fields, constant-fragment extents, size-independent spine) and a petabyte-practical implementation. Both are retirable: blocks self-address, so `is_live` can be answered by walking the index for the block's own key (O(log) reads, zero RAM) and resume can skip the walk entirely. Not pressing at photon/cairn scale — do this with the kernel-profile port.
-#[derive(Default)]
 pub struct LiveSet {
-    map: HashMap<u64, [u8; 32]>,
-    /// Blocks the committed TREE references without a recorded hash: the furrows and extent runs of a Direct/Extent leaf, marked at a TREE-ONLY open (Nick 2026-09-12: "there's zero reason we verify the whole vault — treed open was the initial design"). `is_referenced` is true for them, `is_live` (exact hash) is answered from the block's own seal by the callers that hold the block — the plow reads every block in its window anyway.
-    referenced: hashbrown::HashSet<u64>,
+    map: Vec<HashMap<u64, [u8; 32]>>,
+    /// Blocks the committed TREE references without a recorded hash: the furrows and extent runs of a Direct/Extent leaf, marked at a TREE-ONLY open (Nick 2026-09-12: "there's zero reason we verify the whole vault — treed open was the initial design"). `is_referenced` is true for them, `is_live` (exact hash) is answered from the block's own seal by the callers that hold the block — the plow reads every block in its window anyway. Sharded as `map`.
+    referenced: Vec<hashbrown::HashSet<u64>>,
+}
+
+/// How many tables the live set is split into (`LiveSet`), by a position's low bits.
+pub const LIVE_SHARDS: usize = 1 << 8;
+
+/// The table a position's entry lives in.
+fn shard(lba: u64) -> usize {
+    (lba as usize) & (LIVE_SHARDS - 1)
+}
+
+impl Default for LiveSet {
+    /// Empty tables allocate nothing until their first entry.
+    fn default() -> Self {
+        LiveSet { map: (0..LIVE_SHARDS).map(|_| HashMap::new()).collect(), referenced: (0..LIVE_SHARDS).map(|_| hashbrown::HashSet::new()).collect() }
+    }
 }
 
 impl LiveSet {
     /// ADDED FIRST, THEN REMOVED — the order is load-bearing (field 2026-09-08, photon: "relocation repointed nothing for block at 2078" ×3 on a fresh phone vault mid history-restore). A block can be added AND retired inside ONE delta: a key written twice in the same batch appends leaf L1, then the rewrite retires L1 and appends L2. Applying `removed` first found L1 absent (a no-op) and `added` then inserted it anyway, leaving L1 live in this map with no index route — bytes intact, "live", unrouted — which the plow moved and the repoint guard refused, forever, wedging every later window at that block. Added-then-removed is exactly right because the tract is append-only within a delta: an lba is added at most once per commit and any removal of it must come after its add, so a block that is both ends removed.
     pub fn apply(&mut self, delta: Delta) {
         for (lba, hp) in delta.added {
-            self.referenced.remove(&lba);
-            self.map.insert(lba, hp);
+            self.insert(lba, hp);
         }
         for (lba, hp) in delta.removed {
-            if self.map.get(&lba) == Some(&hp) {
-                self.map.remove(&lba);
+            let s = shard(lba);
+            if self.map[s].get(&lba) == Some(&hp) {
+                self.map[s].remove(&lba);
             }
             // A tree-only entry has no hash to match: the leaf that referenced it is being removed, so the block goes with it.
-            self.referenced.remove(&lba);
+            self.referenced[s].remove(&lba);
         }
+    }
+
+    /// Mark a block live with its recorded hash (it is no longer tree-only).
+    pub fn insert(&mut self, lba: u64, hp: [u8; 32]) {
+        let s = shard(lba);
+        self.referenced[s].remove(&lba);
+        self.map[s].insert(lba, hp);
+    }
+
+    /// The hash recorded for a live block; None for one not live, or live by position alone.
+    pub fn hash_at(&self, lba: u64) -> Option<&[u8; 32]> {
+        self.map[shard(lba)].get(&lba)
+    }
+
+    /// Whether a block is live by position alone (tree-only).
+    pub fn tree_only(&self, lba: u64) -> bool {
+        self.referenced[shard(lba)].contains(&lba)
     }
 
     /// Mark a block live by position alone — the tree-only open's form for furrows and extent runs.
     pub fn mark_referenced(&mut self, lba: u64) {
-        if !self.map.contains_key(&lba) {
-            self.referenced.insert(lba);
+        let s = shard(lba);
+        if !self.map[s].contains_key(&lba) {
+            self.referenced[s].insert(lba);
         }
     }
 
+    /// Live blocks with a recorded hash, and live by position alone.
+    pub fn counts(&self) -> (usize, usize) {
+        (self.map.iter().map(|m| m.len()).sum(), self.referenced.iter().map(|r| r.len()).sum())
+    }
+
     pub fn len(&self) -> usize {
-        self.map.len() + self.referenced.len()
+        let (hashed, tree) = self.counts();
+        hashed + tree
     }
 
     /// Blocks the live entries occupy (each map value is a block position; referenced runs count one block each — the tree-only open's coarse view). Display-grade, not accounting-grade.
     pub fn live_blocks(&self) -> u64 {
-        (self.map.len() + self.referenced.len()) as u64
+        self.len() as u64
     }
 
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty() && self.referenced.is_empty()
+        self.map.iter().all(|m| m.is_empty()) && self.referenced.iter().all(|r| r.is_empty())
+    }
+
+    /// Every live position with its recorded hash.
+    pub fn hashed(&self) -> impl Iterator<Item = (u64, &[u8; 32])> + '_ {
+        self.map.iter().flat_map(|m| m.iter().map(|(l, h)| (*l, h)))
+    }
+
+    /// Every position live by position alone.
+    pub fn tree_positions(&self) -> impl Iterator<Item = u64> + '_ {
+        self.referenced.iter().flat_map(|r| r.iter().copied())
     }
 
     /// Every live position, hashed or tree-only.
     pub fn positions(&self) -> impl Iterator<Item = u64> + '_ {
-        self.map.keys().copied().chain(self.referenced.iter().copied())
+        self.hashed().map(|(l, _)| l).chain(self.tree_positions())
     }
 }
 
 impl Liveness for LiveSet {
     fn is_live(&self, lba: u64, hp: &[u8; 32]) -> bool {
         // A tree-only entry answers by position: the caller holds the block and read `hp` off its seal, which is the hash the leaf would have recorded.
-        self.map.get(&lba) == Some(hp) || self.referenced.contains(&lba)
+        self.hash_at(lba) == Some(hp) || self.tree_only(lba)
     }
     fn is_referenced(&self, lba: u64) -> bool {
-        self.map.contains_key(&lba) || self.referenced.contains(&lba)
+        let s = shard(lba);
+        self.map[s].contains_key(&lba) || self.referenced[s].contains(&lba)
     }
 }
 
@@ -510,7 +564,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         let pruned_any = !stale.is_empty() || !dangling.is_empty();
         let mut live = LiveSet::default();
         for (lba, hp) in live_blocks {
-            live.map.insert(lba, hp);
+            live.insert(lba, hp);
         }
         for lba in referenced {
             live.mark_referenced(lba);
@@ -596,7 +650,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         let Some((lba, hash)) = leaf else {
             return Ok(false);
         };
-        if self.live.map.get(&lba) != Some(&hash) {
+        if self.live.hash_at(lba) != Some(&hash) {
             return Ok(false);
         }
         // A committed value that can no longer be READ is a value the vault does not hold — full stop. Field 2026-08-25: a reused furrow passes the repair walk (its own seal is valid, just someone else's content), then this get propagated the Seal and killed every subsequent put of that key BEFORE its write — the one operation that would have healed the key by overwriting it. Unreadable = not held = let the put proceed.
@@ -849,7 +903,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         }
         self.live = LiveSet::default();
         for (lba, hp) in live_blocks {
-            self.live.map.insert(lba, hp);
+            self.live.insert(lba, hp);
         }
         for lba in referenced {
             self.live.mark_referenced(lba);
@@ -1199,6 +1253,11 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         self.live.len()
     }
 
+    /// The live set's entries: blocks with a recorded hash (41 bytes of table each), and blocks live by position alone (9 bytes each), for an embedder's memory report.
+    pub fn live_counts(&self) -> (usize, usize) {
+        self.live.counts()
+    }
+
     /// TEST AID — the live map against the index, block for block: (in the map but unreachable from the root, reachable but not in the map). Both empty = the two agree, which is the invariant every commit must keep and the plow's classification depends on. Walks the whole index; test scale only.
     #[doc(hidden)]
     pub fn live_map_divergence(&mut self) -> Result<(Vec<u64>, Vec<u64>)> {
@@ -1211,8 +1270,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         }
         let index: HashMap<u64, [u8; 32]> = walked.into_iter().collect();
         // A tree-only entry has no recorded hash: it agrees with the index when the index holds that position at all.
-        let mut unrouted: Vec<u64> = self.live.map.iter().filter(|(lba, hp)| index.get(*lba) != Some(*hp)).map(|(lba, _)| *lba).chain(self.live.referenced.iter().filter(|lba| !index.contains_key(*lba)).copied()).collect();
-        let mut missing: Vec<u64> = index.iter().filter(|(lba, hp)| self.live.map.get(*lba) != Some(*hp) && !self.live.referenced.contains(*lba)).map(|(lba, _)| *lba).collect();
+        let mut unrouted: Vec<u64> = self.live.hashed().filter(|(lba, hp)| index.get(lba) != Some(*hp)).map(|(lba, _)| lba).chain(self.live.tree_positions().filter(|lba| !index.contains_key(lba))).collect();
+        let mut missing: Vec<u64> = index.iter().filter(|(lba, hp)| self.live.hash_at(**lba) != Some(*hp) && !self.live.tree_only(**lba)).map(|(lba, _)| *lba).collect();
         unrouted.sort_unstable();
         missing.sort_unstable();
         Ok((unrouted, missing))
