@@ -1358,9 +1358,14 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         self.live.len()
     }
 
-    /// The live set's entries: blocks with a recorded hash (41 bytes of table each), and blocks live by position alone (9 bytes each), for an embedder's memory report.
+    /// The live set's entries: blocks with a recorded hash, and blocks live by position alone, for an embedder's memory report.
     pub fn live_counts(&self) -> (usize, usize) {
         self.live.counts()
+    }
+
+    /// Bytes the live set holds (`LiveSet::bytes`), for an embedder's memory report.
+    pub fn live_bytes(&self) -> usize {
+        self.live.bytes()
     }
 
     /// TEST AID — the live map against the index, block for block: (in the map but unreachable from the root, reachable but not in the map). Both empty = the two agree, which is the invariant every commit must keep and the plow's classification depends on. Walks the whole index; test scale only.
