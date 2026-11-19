@@ -11,6 +11,7 @@ extern crate alloc;
 pub mod block;
 pub mod error;
 pub mod events;
+pub mod extent;
 pub mod hamt;
 #[cfg(all(feature = "std", any(unix, windows)))]
 pub mod host;
@@ -22,6 +23,7 @@ pub mod vault;
 
 pub use block::{Block, BlockDev, BLOCK, ZERO_BLOCK};
 pub use events::{EventSink, NullSink, StorageEvent};
+pub use extent::{Extent, Extents};
 #[cfg(all(feature = "std", any(unix, windows)))]
 pub use host::FileDev;
 pub use inspect::{inspect, InspectOptions, InspectReport};

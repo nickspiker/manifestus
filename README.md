@@ -45,6 +45,13 @@ Redundancy protects against the medium; crash-proofness protects against the int
 └─────────────────────────────────────────────────────────────┘
 ```
 
+## Single-copy extents (opt-in)
+
+`manifestus::extent` (2026-11-19, for ferros's RAW video): bulk data written once, at the medium's full rate, into an area the embedder gives it outside the tract, with no mirror and no write-verify (the owner: "single, no dual write").
+The vault keeps only the record: one table value under a key of its own (`extent::table_key`), committed and mirrored like any value, naming each extent's stretch of the area, its owner tag, its length and its BLAKE3 once sealed.
+The embedder writes the data to its area device itself; a crash mid-write leaves an open extent whose blocks stay taken until its owner seals or drops it.
+A vault that never calls it is untouched: no new block format, no change to the tract, the HAMT, the ring or the mirror, and the table is an ordinary value no other key can reach.
+
 ## No permissions
 
 There are no permission bits, no ACLs, no owners, and no path hierarchy — because there is nothing for them to protect that the address space doesn't already protect better.
