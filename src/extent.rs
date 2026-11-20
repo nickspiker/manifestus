@@ -135,6 +135,8 @@ impl Extents {
         if need > e.blocks {
             return Err(Error::Bounds(need));
         }
+        // WHY the max: a seal of zero bytes needs no blocks, but `decode` refuses an extent of zero blocks.
+        // PROOF: without it, an empty sealed extent would be stored as 0 blocks and the whole table would be refused at the next load, losing every extent's record.
         e.blocks = need.max(1);
         e.bytes = bytes;
         e.hash = hash;
