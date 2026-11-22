@@ -328,8 +328,8 @@ impl Hamt {
             let mut hashes = Vec::with_capacity(count as usize);
             let placed = tract.append_with(mirror, live, count, |i| {
                 let lo = i as usize * per;
-                let b = encode_furrow(key, i, &value[lo..(lo + per).min(value.len())]);
-                hashes.push(sealed_hp(&b).unwrap());
+                let (b, h) = encode_furrow_sealed(key, i, &value[lo..(lo + per).min(value.len())]);
+                hashes.push(h);
                 b
             })?;
             for (lba, h) in placed.iter().zip(hashes) {
@@ -636,6 +636,8 @@ impl Hamt {
         }
         let block = encode_node(&self.arena[idx]);
         let lba = tract.append(mirror, live, core::slice::from_ref(&block))?[0];
+        // The next walk starts here: kept in the index cache once verified on the media.
+        mirror.keep_cached(tract.base + lba);
         let hash = sealed_hp(&block).unwrap();
         self.delta.added.push((lba, hash));
         Ok((hash, lba))
@@ -1022,23 +1024,51 @@ impl Hamt {
         // Blocks this epoch already retired (an overwrite or delete earlier in the same uncommitted batch): the committed live set still answers live for them until the commit lands, but they are garbage now.
         // Step 3 re-checks the delta per block; furrows had no such check, so an old value's furrow found its key's NEW extent and was spliced into it at its index — the new value's own furrow left live but unrouted.
         let retired: hashbrown::HashSet<(u64, [u8; 32])> = self.delta.removed.iter().copied().collect();
-        let mut buf = ZERO_BLOCK;
-        for m in start..start + w {
-            let pos = m % tract.len;
-            tract.read(mirror, pos, &mut buf)?;
-            let Some(hp) = sealed_hp(&buf) else { continue };
-            if !oracle.is_live(pos, &hp) || retired.contains(&(pos, hp)) {
-                continue;
-            }
-            match decode_doc(&buf)? {
-                TractDoc::Lone { .. } => lones.push((pos, hp)),
-                TractDoc::Direct { .. } | TractDoc::Extent { .. } => leaves.push((pos, hp)),
-                TractDoc::Node(_) => nodes.push((pos, hp)),
-                TractDoc::Furrow { key, index, .. } => {
-                    furrow_owners.entry(key).or_default().push((pos, index))
+        // The window read REAP_CHUNK blocks a read, cut where the ring wraps (2026-11-22, ferros's Pro: a block a read was about 2000 device calls a window, and a 25 MB value kept in the reap regime, a window a commit, took 17 s).
+        // The standalone survivors (lone values, leaves, nodes) are kept as read, REAP_CHUNK of them at most, for step 3; the window's positions are not written until the retiring commit, so what was read is what step 3 would read again.
+        let mut held: Vec<(u64, Block)> = Vec::new();
+        let mut run: Vec<Block> = Vec::new();
+        let mut m = start;
+        while m < start + w {
+            let pos0 = m % tract.len;
+            // WHY the mins: a read is the window's rest, at most REAP_CHUNK blocks (the buffer's size), and never past the tract's end, where the window goes on from position 0 (Tract::read_run takes no wrap).
+            let n = ((start + w - m) as usize).min(REAP_CHUNK).min((tract.len - pos0) as usize);
+            run.clear();
+            run.resize(n, ZERO_BLOCK);
+            tract.read_run(mirror, pos0, &mut run)?;
+            for (i, buf) in run.iter().enumerate() {
+                let pos = pos0 + i as u64;
+                let Some(hp) = sealed_hp(buf) else { continue };
+                if !oracle.is_live(pos, &hp) || retired.contains(&(pos, hp)) {
+                    continue;
+                }
+                let standalone = match decode_doc(buf)? {
+                    TractDoc::Lone { .. } => {
+                        lones.push((pos, hp));
+                        true
+                    }
+                    TractDoc::Direct { .. } | TractDoc::Extent { .. } => {
+                        leaves.push((pos, hp));
+                        true
+                    }
+                    TractDoc::Node(_) => {
+                        nodes.push((pos, hp));
+                        true
+                    }
+                    TractDoc::Furrow { key, index, .. } => {
+                        furrow_owners.entry(key).or_default().push((pos, index));
+                        false
+                    }
+                };
+                if standalone && held.len() < REAP_CHUNK {
+                    held.push((pos, *buf));
                 }
             }
+            m += n as u64;
         }
+        drop(run);
+        // By position for step 3's lookup: a window that wraps read its end first.
+        held.sort_by_key(|e| e.0);
 
         // 2. Value-data moves, grouped per owner so each leaf is rebuilt once. Per move:
         //    physical copy first, index repair second, liveness delta last — an error    between steps leaves only verified copies that a later window reaps as orphans.
@@ -1056,10 +1086,16 @@ impl Hamt {
                     let mut payload: Vec<Block> = Vec::with_capacity(group.len().min(REAP_CHUNK));
                     for chunk in group.chunks(REAP_CHUNK) {
                         payload.clear();
-                        for &(pos, _) in chunk {
-                            let mut b = ZERO_BLOCK;
-                            tract.read(mirror, pos, &mut b)?;
-                            payload.push(b);
+                        payload.resize(chunk.len(), ZERO_BLOCK);
+                        // Consecutive positions one read: a value written in one stretch lies in index order, so a chunk is one run or a few.
+                        let mut i = 0;
+                        while i < chunk.len() {
+                            let mut j = i + 1;
+                            while j < chunk.len() && chunk[j].0 == chunk[j - 1].0 + 1 {
+                                j += 1;
+                            }
+                            tract.read_run(mirror, chunk[i].0, &mut payload[i..j])?;
+                            i = j;
                         }
                         let placed = tract.append(mirror, oracle, &payload)?;
                         for (&(_, idx), &newpos) in chunk.iter().zip(&placed) {
@@ -1103,7 +1139,10 @@ impl Hamt {
                 continue;
             }
             let mut b = ZERO_BLOCK;
-            tract.read(mirror, pos, &mut b)?;
+            match held.binary_search_by_key(&pos, |e| e.0) {
+                Ok(k) => b = held[k].1,
+                Err(_) => tract.read(mirror, pos, &mut b)?,
+            }
             if sealed_hp(&b) != Some(hp) {
                 continue; // changed underneath us — retired by an earlier step
             }
@@ -1293,10 +1332,12 @@ fn put_field(buf: &mut Block, cursor: &mut usize, name: &str, value: VsfType) {
     *cursor += v.len();
 }
 
-fn seal_block(buf: &mut Block, body_start: usize) {
+/// The block sealed: its body's BLAKE3 written as its `hp`, and returned.
+fn seal_block(buf: &mut Block, body_start: usize) -> [u8; 32] {
     let hash = blake3::hash(&buf[body_start..]);
     let hp = VsfType::hp(hash.as_bytes().to_vec()).flatten();
     buf[4..4 + hp.len()].copy_from_slice(&hp);
+    *hash.as_bytes()
 }
 
 fn begin_block(schema: &str) -> (Block, usize) {
@@ -1428,12 +1469,17 @@ fn encode_direct(key: &[u8; 32], size: u64, furrows: &[u64]) -> Block {
 }
 
 fn encode_furrow(key: &[u8; 32], index: u64, payload: &[u8]) -> Block {
+    encode_furrow_sealed(key, index, payload).0
+}
+
+/// A furrow and the hash it was sealed with: a put keeps the hash for its delta, where `sealed_hp` on the block just made hashed every furrow a second time (2026-11-22, ferros's Pro: BLAKE3 the larger part of a write's own time on one core, portable there).
+fn encode_furrow_sealed(key: &[u8; 32], index: u64, payload: &[u8]) -> (Block, [u8; 32]) {
     let (mut buf, mut cursor) = begin_block(SCHEMA_FURROW);
     put_field(&mut buf, &mut cursor, "key", VsfType::hp(key.to_vec()));
     put_field(&mut buf, &mut cursor, "i", VsfType::u(index as usize, false));
     put_field(&mut buf, &mut cursor, "v", VsfType::v(b'r', payload.to_vec()));
-    seal_block(&mut buf, body_start());
-    buf
+    let hash = seal_block(&mut buf, body_start());
+    (buf, hash)
 }
 
 fn encode_node(node: &Node) -> Block {

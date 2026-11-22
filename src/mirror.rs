@@ -81,6 +81,8 @@ pub struct Mirror<A: BlockDev, B: BlockDev> {
     /// Blocks the index walk read ([`Mirror::read_cached`]): position, last use, contents; sorted by position. Any write to a position drops it, so a hit is exactly what the device holds. The walk re-read the same nodes from the media on every get and put (2026-10-25: thirty-odd single-block reads a put).
     cache: Vec<(u64, u64, Box<Block>)>,
     uses: u64,
+    /// Staged positions whose blocks join the cache once written and verified ([`Mirror::keep_cached`]): the index nodes a commit writes, which the next walk reads first (2026-11-22, ferros's Pro: each commit's new nodes were read back from the media a block a call by the next batch's walks).
+    keep: Vec<u64>,
 }
 
 /// Blocks the index cache holds: 4 MB.
@@ -97,6 +99,7 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
             pending: Vec::new(),
             cache: Vec::new(),
             uses: 0,
+            keep: Vec::new(),
         }
     }
 
@@ -121,6 +124,7 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
             pending: Vec::new(),
             cache: Vec::new(),
             uses: 0,
+            keep: Vec::new(),
         })
     }
 
@@ -153,6 +157,30 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
                 let mut batch = Vec::with_capacity(1);
                 batch.push((lba, *b));
                 self.pending.push(batch);
+            }
+        }
+    }
+
+    /// The staged block at `lba` joins the cache once the next [`Self::drain`] has written and verified it (an index node): the cache then holds exactly what the device holds, as a read would have put there.
+    pub fn keep_cached(&mut self, lba: u64) {
+        self.keep.push(lba);
+    }
+
+    /// A block written and verified at `lba` put in the cache (the least recently used goes when it is full).
+    fn cache_put(&mut self, lba: u64, b: &Block) {
+        self.uses += 1;
+        match self.cache.binary_search_by_key(&lba, |e| e.0) {
+            Ok(i) => {
+                self.cache[i].1 = self.uses;
+                *self.cache[i].2 = *b;
+            }
+            Err(_) => {
+                if self.cache.len() >= CACHE_BLOCKS {
+                    let oldest = (0..self.cache.len()).min_by_key(|&i| self.cache[i].1).unwrap();
+                    self.cache.remove(oldest);
+                }
+                let at = self.cache.binary_search_by_key(&lba, |e| e.0).unwrap_err();
+                self.cache.insert(at, (lba, self.uses, Box::new(*b)));
             }
         }
     }
@@ -207,7 +235,15 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
                 false
             }
         });
-        self.write_verified_batch_now(&refs)
+        let keep = core::mem::take(&mut self.keep);
+        self.write_verified_batch_now(&refs)?;
+        for lba in keep {
+            if let Ok(i) = refs.binary_search_by_key(&lba, |e| e.0) {
+                let b = *refs[i].1;
+                self.cache_put(lba, &b);
+            }
+        }
+        Ok(())
     }
 
     /// Write `buf` at `lba` on every present device, verifying each by read-back before touching the next. See module docs for the failure matrix. Staged appends are written out first.
