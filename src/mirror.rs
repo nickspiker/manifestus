@@ -237,6 +237,8 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
         });
         let keep = core::mem::take(&mut self.keep);
         self.write_verified_batch_now(&refs)?;
+        // The lookup below is a binary search: `refs` was sorted by position and deduplicated above, so each position is there once and in order (Photon's review of 090ffae: a refs out of order would quietly keep nothing).
+        debug_assert!(refs.windows(2).all(|w| w[0].0 < w[1].0), "drain: refs sorted and deduplicated by position");
         for lba in keep {
             if let Ok(i) = refs.binary_search_by_key(&lba, |e| e.0) {
                 let b = *refs[i].1;
