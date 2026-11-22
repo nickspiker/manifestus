@@ -23,7 +23,7 @@ const PAR_BATCH_THRESHOLD: usize = 4;
 /// Write + verify every block of a batch on one device, with a device-local scratch (so concurrent device threads never share the read-back buffer).
 /// ONE flush for the whole batch, not one per block (field 2026-08-25: per-block F_FULLFSYNC made a one-note put cost 12-20 drive-cache flushes — a flat, size-independent 0.3-1.4s; ferros boots faster). The crash contract needs ORDERING (everything a spine entry references on media before the spine lands), which the caller's final spine write_one still provides; the media read-back property (F_NOCACHE) is preserved because verification happens AFTER the single flush. A verify miss retries write+flush+verify once for just the failed block — write_one's exact discipline, paid only on damage.
 /// Consecutive positions go as one run each way (BlockDev::write_run / read_run): a commit's appends are runs, and one I/O per 4KB block was a device round trip each.
-#[cfg(feature = "std")]
+/// The read-back goes VERIFY_RUN blocks at a time, so the verification never holds more than that beside the batch, whatever the run's length (a reap window's survivors can be thousands of blocks, and the ferros kernel's own vault runs this in a 12 MiB heap).
 fn write_each<D: BlockDev>(dev: &mut D, blocks: &[(u64, &Block)]) -> Result<()> {
     let mut scratch = ZERO_BLOCK;
     let runs = runs_of(blocks);
@@ -34,21 +34,28 @@ fn write_each<D: BlockDev>(dev: &mut D, blocks: &[(u64, &Block)]) -> Result<()> 
     dev.flush()?;
     let mut back: alloc::vec::Vec<Block> = alloc::vec::Vec::new();
     for r in &runs {
-        back.clear();
-        back.resize(r.len(), ZERO_BLOCK);
-        dev.read_run(blocks[r.start].0, &mut back)?;
-        for (i, got) in back.iter().enumerate() {
-            let (lba, buf) = blocks[r.start + i];
-            if got != buf {
-                write_one(dev, lba, buf, &mut scratch)?;
+        let mut at = r.start;
+        while at < r.end {
+            let n = (r.end - at).min(VERIFY_RUN);
+            back.clear();
+            back.resize(n, ZERO_BLOCK);
+            dev.read_run(blocks[at].0, &mut back)?;
+            for (i, got) in back.iter().enumerate() {
+                let (lba, buf) = blocks[at + i];
+                if got != buf {
+                    write_one(dev, lba, buf, &mut scratch)?;
+                }
             }
+            at += n;
         }
     }
     Ok(())
 }
 
+/// The most blocks one read-back reads (1 MiB: one command of ferros's vault process, the largest the kernel moves in a call).
+const VERIFY_RUN: usize = 1 << 8;
+
 /// The batch cut where positions stop being consecutive: index ranges of runs.
-#[cfg(feature = "std")]
 fn runs_of(blocks: &[(u64, &Block)]) -> alloc::vec::Vec<core::ops::Range<usize>> {
     let mut out = alloc::vec::Vec::new();
     let mut start = 0;
@@ -235,7 +242,7 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
         for &(lba, _) in blocks {
             self.forget(lba);
         }
-        // The parallel fan-out needs std threads; the kernel profile always takes the sequential path below (per-block discipline is identical, wall-clock is the only difference).
+        // The parallel fan-out needs std threads; a no_std embedder always takes the sequential path below (the same write, flush, read back and compare, the primary first).
         #[cfg(feature = "std")]
         {
             let both = self.a.is_some() && self.b.is_some();
@@ -257,31 +264,22 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
                 return Ok(());
             }
         }
-        // Sequential (single device / small batch): the same one-flush-per-device discipline — the smallest batches are the commonest (a one-note put), exactly where per-block flushing hurt most. The kernel profile keeps the per-block loop (no std, and its flush is not a drive-cache round-trip).
-        #[cfg(feature = "std")]
-        {
-            match (self.a.as_mut(), self.b.as_mut()) {
-                (Some(a), b) => {
-                    write_each(a, blocks)?;
-                    if let Some(b) = b {
-                        if write_each(b, blocks).is_err() {
-                            self.b = None;
-                            self.degraded = true;
-                            self.events.emit(StorageEvent::MirrorDegraded);
-                        }
+        // Sequential (single device, a small batch, and every no_std embedder): the same one-flush-per-device discipline, the primary's whole batch written and verified before the secondary's first block is touched (RING.md: never write to the second device until the first is verified).
+        // The no_std profile wrote and verified block by block until 2026-11-22: four device commands of 4 KiB per block across the two mirrors, about 29,500 for a 25 MB value (counted on the host), which at about 140 us a command is the 4.1 s a 25 MB still took to keep on ferros's Pro (the vault process's write_run and read_run move up to 1 MiB a command and were never called); now about 750.
+        match (self.a.as_mut(), self.b.as_mut()) {
+            (Some(a), b) => {
+                write_each(a, blocks)?;
+                if let Some(b) = b {
+                    if write_each(b, blocks).is_err() {
+                        self.b = None;
+                        self.degraded = true;
+                        self.events.emit(StorageEvent::MirrorDegraded);
                     }
-                    return Ok(());
                 }
-                (None, Some(b)) => return write_each(b, blocks),
-                (None, None) => return Err(Error::Corrupt("mirror has no devices".into())),
+                Ok(())
             }
-        }
-        #[cfg(not(feature = "std"))]
-        {
-            for &(lba, buf) in blocks {
-                self.write_verified(lba, buf)?;
-            }
-            Ok(())
+            (None, Some(b)) => write_each(b, blocks),
+            (None, None) => Err(Error::Corrupt("mirror has no devices".into())),
         }
     }
 
