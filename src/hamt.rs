@@ -314,7 +314,7 @@ impl Hamt {
     ) -> Result<()> {
         let lone_max = lone_capacity();
         // On devices of a fixed size, the value's blocks (a lone leaf, or its furrows and leaf) leave the reserve clean (`Tract::put_reserve`): refused as full before a byte is staged, so the ladder reaps or grows, and a vault that stays full says TractFull with its deletes still possible. The reserve pays for the index path each delete rewrites (and the spine's commit), which no full vault could land otherwise. A device that grows (a host file) keeps none: growing is its answer.
-        if mirror.max_blocks() != u64::MAX {
+        if mirror.max_blocks() != u64::MAX && !tract.reserve_waived {
             let need = if value.len() <= lone_max { 1 } else { value.len().div_ceil(furrow_capacity()) as u64 + 1 };
             if need + tract.put_reserve() > tract.clean_blocks() {
                 return Err(Error::TractFull);
@@ -1768,7 +1768,7 @@ mod tests {
 
     fn mem() -> (Mirror<MemDev, MemDev>, Tract) {
         let m = Mirror::from_parts(Some(MemDev(alloc::vec![ZERO_BLOCK; TRACT as usize])), None).unwrap();
-        (m, Tract { base: 0, len: TRACT, plow: TRACT, reap: 0, fence_limit: None })
+        (m, Tract { base: 0, len: TRACT, plow: TRACT, reap: 0, fence_limit: None, reserve_waived: false })
     }
 
     /// Writes a crafted block at tract position `lba` and returns its seal, the pointer an index would carry.

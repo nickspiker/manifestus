@@ -399,6 +399,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             plow: 0,
             reap: 0,
             fence_limit: None,
+            reserve_waived: false,
         };
         Ok(Self {
             ring,
@@ -502,6 +503,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             plow: 0,
             reap: 0,
             fence_limit: None,
+            reserve_waived: false,
         };
         Ok(Self {
             ring,
@@ -602,6 +604,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             plow: head.plow,
             reap: 0, // derived when the walk is done, once the live set is known
             fence_limit: None,
+            reserve_waived: false,
         };
         // Host-only truncation guard: the device must hold the committed geometry. The fs is a witness, never the authority.
         // WHY/PROOF: `tract_blocks` is a field of the head entry; `tract_base + tract_blocks` wrapped for a value near u64::MAX and passed this guard, and the walk's bitset was then sized by the claim.
@@ -1046,6 +1049,11 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         self.tract.reap = self.tract.plow - old_len;
         self.tract.len = new_tract_blocks;
         self.commit(now)
+    }
+
+    /// Hold (true, the default) or waive (false) the put reserve on a fixed device (`Tract::put_reserve`). A removal waives it while it writes the index pages and lists it must rewrite, and holds it again after: removals are what the reserve is kept for.
+    pub fn set_put_reserve(&mut self, held: bool) {
+        self.tract.reserve_waived = !held;
     }
 
     /// Whether the vault's devices are of a fixed size (ferros's windows and regions); a host file grows.
@@ -1683,6 +1691,7 @@ fn replicate_into<S: BlockDev, D: BlockDev>(
             plow: head.plow,
             reap: head.reap.unwrap_or(head.plow),
             fence_limit: None,
+            reserve_waived: false,
         };
         let mut hamt = Hamt::from_root(head.hamt_hash, head.hamt_lba);
         // The tree walk: the index's own blocks read, the values' furrows and extent runs by position, unread — the compare below reads every one of them on both sides anyway (2026-10-25: walk_live read every data block of the winner a block at a time first, and a diverged desktop vault took 42 s to open).

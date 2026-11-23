@@ -75,6 +75,8 @@ pub struct Tract {
     pub reap: u64,
     /// Absolute append budget (monotone domain). Recomputed by the vault from the last k spine entries: min(reap_i + len_i). None = unfenced (genesis era, fewer than k commits).
     pub fence_limit: Option<u64>,
+    /// Whether the put reserve is waived (`Vault::set_put_reserve`): while a removal writes its index and lists, which the reserve is there for (ferros's Pro, 2026-11-23: the hold's remove deleted a still's body and then could not rewrite the page its card was on).
+    pub reserve_waived: bool,
 }
 
 impl Tract {

@@ -141,3 +141,33 @@ fn deletes_in_a_dense_full_vault() {
         assert_eq!(v.get(&key_of(k)).unwrap().unwrap(), value(48 << 10, k as u8), "kept {k} reads after");
     }
 }
+
+/// A removal rewrites index and list values, puts like any other: with the put reserve waived (`Vault::set_put_reserve`) such a put lands in a full vault that refuses ordinary ones (ferros's Pro, 2026-11-23: the hold's remove deleted a still's body and then could not rewrite its card's page).
+#[test]
+fn a_removal_writes_its_index_in_a_full_vault() {
+    let max = 1u64 << 12;
+    let dev = || Fixed { blocks: vec![ZERO_BLOCK; 1 << 11], max };
+    let mut v = Vault::open(Mirror::new(dev(), dev()), 6, 1, DeletePolicy::UnlinkOnly).expect("vault");
+    let mut kept = 0u32;
+    loop {
+        let mut key = [0u8; 32];
+        key[..4].copy_from_slice(&kept.to_le_bytes());
+        if v.put(&key, &value(48 << 10, kept as u8), 2).is_err() {
+            break;
+        }
+        kept += 1;
+        assert!((kept as u64) < max, "a fixed device must fill");
+    }
+    let page = [0xEEu8; 32];
+    assert!(matches!(v.put(&page, &value(48 << 10, 1), 3), Err(Error::TractFull)), "an ordinary put is refused in the full vault");
+    v.set_put_reserve(false);
+    let mut gone = [0u8; 32];
+    gone[..4].copy_from_slice(&0u32.to_le_bytes());
+    assert!(v.delete(&gone, 3).unwrap());
+    v.put(&page, &value(48 << 10, 1), 3).expect("the removal's index put lands");
+    v.set_put_reserve(true);
+    assert_eq!(v.get(&page).unwrap().unwrap(), value(48 << 10, 1));
+    let mut other = [0xDDu8; 32];
+    other[0] = 1;
+    assert!(matches!(v.put(&other, &value(48 << 10, 2), 4), Err(Error::TractFull)), "held again, ordinary puts are refused again");
+}
