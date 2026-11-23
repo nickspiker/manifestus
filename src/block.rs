@@ -49,6 +49,11 @@ pub trait BlockDev: Send {
         Ok(())
     }
 
+    /// The most blocks this device can ever hold: a fixed window or partition says its size, so the vault grows its tract to fill it and then says full (`Error::TractFull`) instead of asking for more (ferros's Pro, 2026-11-23: a tract one window short asked to double past an 8 GiB window and every write failed as Corrupt). Default: no bound (a host file grows).
+    fn max_blocks(&self) -> u64 {
+        u64::MAX
+    }
+
     /// Durability barrier — when this returns, prior writes survive power loss.
     fn flush(&mut self) -> Result<()>;
 
@@ -70,6 +75,9 @@ pub trait BlockDev: Send {
 impl<D: BlockDev + ?Sized> BlockDev for &mut D {
     fn block_count(&self) -> u64 {
         (**self).block_count()
+    }
+    fn max_blocks(&self) -> u64 {
+        (**self).max_blocks()
     }
     fn read(&mut self, lba: u64, buf: &mut Block) -> Result<()> {
         (**self).read(lba, buf)

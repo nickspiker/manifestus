@@ -313,6 +313,13 @@ impl Hamt {
         value: &[u8],
     ) -> Result<()> {
         let lone_max = lone_capacity();
+        // On devices of a fixed size, the value's blocks (a lone leaf, or its furrows and leaf) leave the reserve clean (`Tract::put_reserve`): refused as full before a byte is staged, so the ladder reaps or grows, and a vault that stays full says TractFull with its deletes still possible. A device that grows (a host file) keeps none: growing is its answer.
+        if mirror.max_blocks() != u64::MAX {
+            let need = if value.len() <= lone_max { 1 } else { value.len().div_ceil(furrow_capacity()) as u64 + 1 };
+            if need + tract.put_reserve() > tract.clean_blocks() {
+                return Err(Error::TractFull);
+            }
+        }
         let (leaf_lba, leaf_hash) = if value.len() <= lone_max {
             let leaf = encode_lone(key, value);
             let lba = tract.append(mirror, live, core::slice::from_ref(&leaf))?[0];

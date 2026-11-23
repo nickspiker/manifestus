@@ -797,6 +797,14 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                         }
                     }
                 }
+                Err(Error::TractFull) if self.bounded_live_heavy() => {
+                    // Live-heavy on a fixed device: grow into what is left (none: full), never reap (2026-11-23, ferros's Pro: the ladder's reaps of live-dense windows spent the last clean blocks, and then nothing, not even a delete, could land).
+                    if grew {
+                        return Err(Error::TractFull);
+                    }
+                    self.grow_in_ladder(now)?;
+                    grew = true;
+                }
                 Err(Error::TractFull) => {
                     // The ordinary reap first; when IT can't move (fence-clamped or airlocked), the same rescue ladder as the Fenced arm — physical fullness and fence exhaustion are one disease at the terminal stage, and this arm returning bare TractFull was the last way churn could still die (the new-law test caught it).
                     if !self.reap_one_window(now)? {
@@ -984,6 +992,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         if new_tract_blocks <= old_len {
             return Ok(());
         }
+        let new_tract_blocks = self.grow_room(new_tract_blocks)?;
         let need = self.tract.base + new_tract_blocks;
         // The devices told the old extent, so a device larger than its extent zeroes only the new blocks (`BlockDev::grow_from`).
         self.ring.mirror().grow_from(self.tract.base + old_len, need)?;
@@ -1024,6 +1033,27 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         self.commit(now)
     }
 
+    /// The clean blocks a reap leaves for its retiring commit's index rewrite. The deletes' room on a fixed device is the put reserve (`Tract::put_reserve`), which only values are held out of: a reap may go below it, since a reap after removals frees more than it stages, and that is how a full vault's space comes back.
+    fn reap_reserve(&mut self) -> u64 {
+        4
+    }
+
+    /// Whether this vault is on devices of a fixed size with more than three quarters of its tract live: reaping cannot pay its way there (each relocated survivor rewrites its index path, making about as much garbage as it frees: `reclaim_ahead`'s LiveHeavy), so the put ladder stops reaping and says full while the deletes' room is still clean.
+    fn bounded_live_heavy(&mut self) -> bool {
+        self.ring.mirror().max_blocks() != u64::MAX && (self.live.len() as u64) * 4 > self.tract.len * 3
+    }
+
+    /// A grow's length, held to what the devices can hold past the tract's base ([`Mirror::max_blocks`]): the asked length when it fits, else every block left, and TractFull when none is left (the vault is full: the caller frees space or refuses, and says so).
+    fn grow_room(&mut self, asked: u64) -> Result<u64> {
+        // WHY: the base lies inside every device (the ring and the tract start there), so the subtraction holds; a device that says less than its base holds no tract room at all.
+        let most = self.ring.mirror().max_blocks().saturating_sub(self.tract.base);
+        let len = asked.min(most);
+        if len <= self.tract.len {
+            return Err(Error::TractFull);
+        }
+        Ok(len)
+    }
+
     /// Grow WITHOUT the barrier reload — for the one caller whose in-RAM index is MORE authoritative than the committed head: the repair open, whose prunes exist only in RAM. The normal grow discards RAM state and re-walks the committed head STRICTLY, which on a vault mid-repair (a) resurrects the pruned danglings and (b) fails Seal on them — the 2026-08-25 loop where the "repaired" vault re-pruned the same 84 pointers every boot while the disk never changed. Here the pruned hamt + its live set ride across the grow untouched; the trailing commit flushes them into the fresh clean region, landing the repair durably. Sound ONLY when the caller guarantees the RAM state is clean-by-construction (no half-applied put) — the repair open is exactly that.
     pub(crate) fn grow_preserving(&mut self, new_tract_blocks: u64, now: i64) -> Result<()> {
         // A lazy open's walk first: a write needs the live set (see open_lazy).
@@ -1032,6 +1062,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         if new_tract_blocks <= old_len {
             return Ok(());
         }
+        let new_tract_blocks = self.grow_room(new_tract_blocks)?;
         let need = self.tract.base + new_tract_blocks;
         // The devices told the old extent, so a device larger than its extent zeroes only the new blocks (`BlockDev::grow_from`).
         self.ring.mirror().grow_from(self.tract.base + old_len, need)?;
@@ -1141,7 +1172,9 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     fn maybe_reap(&mut self, now: i64) -> Result<()> {
         let used = (self.tract.plow - self.tract.reap).min(self.tract.len);
         let dead = used.saturating_sub(self.live.len() as u64);
-        if dead << 2 > self.tract.len {
+        // On a fixed device, also while clean space is under the put reserve and anything is dead (2026-11-23): removals from a full vault spend that reserve on their index paths, and only the reap gives it back; left until the dead quarter, the reserve was gone first and no window could stage its survivors.
+        let short = self.ring.mirror().max_blocks() != u64::MAX && self.tract.clean_blocks() < self.tract.put_reserve() && dead > 0;
+        if dead << 2 > self.tract.len || short {
             self.reap_one_window(now)?;
         }
         Ok(())
@@ -1172,7 +1205,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     pub fn rescue(&mut self, now: i64) -> Result<u64> {
         // A lazy open's walk first: a write needs the live set (see open_lazy).
         self.settle()?;
-        const RESERVE: u64 = 4;
+        // Survivors leave the retiring commit's few blocks clean (`reap_reserve`).
+        let reserve = self.reap_reserve();
         let mut windows = 0u64;
         let mut airlock_grown = false;
         let bound = (self.tract.len / REAP_WINDOW_MIN).max(8);
@@ -1182,7 +1216,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 break;
             }
             let comfortable = self.tract.fence_limit.map_or(true, |l| {
-                l.saturating_sub(self.tract.plow) >= self.reap_window() + RESERVE * 2
+                l.saturating_sub(self.tract.plow) >= self.reap_window() + reserve * 2
             });
             if comfortable && windows > 0 {
                 break;
@@ -1196,7 +1230,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 // Any referenced position is a survivor, hashed or tree-only: counting the map alone sized windows full of a tree-only open's furrows as pure-dead, whose relocations then ran out of room mid-window.
                 surv += self.live.is_referenced(pos) as u64;
                 // The reserve is charged only when something actually stages: a pure-dead window appends NOTHING, so even clean-of-zero reaps it whole — without this guard the field vault (91% dead, clean 3) was refused at its very first block and ground forward in 4-block bites (2026-08-24).
-                if surv > 0 && surv + RESERVE > clean {
+                if surv > 0 && surv + reserve > clean {
                     break;
                 }
                 w = i + 1;
@@ -1271,25 +1305,25 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         if occupied == 0 {
             return Ok(false);
         }
-        // Reserve a few clean blocks for the retiring commit's index rewrite; size the window to what the clean region can stage (worst case: every block survives).
-        const RESERVE: u64 = 4;
+        // Reserve a few clean blocks for the retiring commit's index rewrite (`reap_reserve`); size the window to what the clean region can stage (worst case: every block survives).
+        let reserve = self.reap_reserve();
         let mut w = self
             .reap_window()
             .min(cap)
             .min(occupied)
-            .min(self.tract.clean_blocks().saturating_sub(RESERVE));
+            .min(self.tract.clean_blocks().saturating_sub(reserve));
         if w == 0 {
             return Ok(false);
         }
         // Fence room for the survivor appends; slide the window first if it is tight.
         let budget = |t: &Tract| t.fence_limit.map(|l| l.saturating_sub(t.plow));
         if let Some(b) = budget(&self.tract) {
-            if b < w + RESERVE {
+            if b < w + reserve {
                 self.commit(now)?;
             }
         }
         if let Some(b) = budget(&self.tract) {
-            w = w.min(b.saturating_sub(RESERVE));
+            w = w.min(b.saturating_sub(reserve));
             if w == 0 {
                 return Ok(false);
             }

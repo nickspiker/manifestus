@@ -91,6 +91,12 @@ impl Tract {
         self.len - (self.plow - self.reap)
     }
 
+    /// Clean blocks a value's own blocks (its furrows and leaf, a lone value) may never take: a sixty-fourth of the tract, the reap's window (ferros's Pro, 2026-11-23: a vault filled to its last block refused every write, its deletes too, since a delete's index path and the spine need room of their own). The index's flush, the spine, a delete and the reap's survivors may use it, so a full vault can always remove what it holds and reap the space back.
+    pub fn put_reserve(&self) -> u64 {
+        self.len >> 6
+    }
+
+
     /// Append `blocks` contiguously at the plow (already sealed by the layer above).
     /// Returns the tract-relative lbas, in order — consecutive positions, wrapping at most once. Checks space, fence AND liveness BEFORE staging a byte: a refused append has no side effects. The blocks are staged in the mirror and reach the devices, verified, before the next spine write.
     pub fn append<A: BlockDev, B: BlockDev>(

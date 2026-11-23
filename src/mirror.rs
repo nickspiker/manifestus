@@ -321,6 +321,13 @@ impl<A: BlockDev, B: BlockDev> Mirror<A, B> {
         }
     }
 
+    /// The most blocks every present device can hold ([`BlockDev::max_blocks`]): the smallest of them.
+    pub fn max_blocks(&self) -> u64 {
+        let a = self.a.as_ref().map_or(u64::MAX, |d| d.max_blocks());
+        let b = self.b.as_ref().map_or(u64::MAX, |d| d.max_blocks());
+        a.min(b)
+    }
+
     /// Extend every present device to `new_blocks`, same failure matrix as writes: primary must grow or the op fails; a secondary that refuses is dropped for the session (`degraded` flips) — the primary carries the new geometry alone.
     pub fn grow(&mut self, new_blocks: u64) -> Result<()> {
         self.grow_with(None, new_blocks)
