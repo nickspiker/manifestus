@@ -57,6 +57,9 @@ const RUN_STEP: usize = 1 << 8;
 /// Survivors a reap copies before writing them out (`Hamt::reap_window`): the window is a sixty-fourth of the tract, so without this bound a reap held up to twice the window in memory, its survivors read and their staged copies, and the memory a reap needs grew with the tract (2 MiB at most now, whatever the tract).
 const REAP_CHUNK: usize = 1 << 8;
 
+/// Live blocks the repair walk holds before it puts them in the live set (`Hamt::walk_live_repair`): 160 KiB of them.
+const REPAIR_DRAIN: usize = 1 << 12;
+
 /// A committed pointer whose target reads as all-zero: a fast-deleted leaf whose index unlink never landed. `route` is a key that descends to the pointer (path chunks set, rest zero).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StalePointer {
@@ -861,18 +864,23 @@ impl Hamt {
     }
 
     /// REPAIR walk — `walk_live_collect` that survives dangling pointers instead of erroring. A pointer whose target fails the seal, fails decode, or names furrows that no longer verify is recorded in `dangling` (and contributes nothing to `out`); everything sound is collected exactly as `walk_live` would. Used by `Vault::open_repairing`.
+    /// The repair walk's live blocks go into `live` as the walk finds them, [`REPAIR_DRAIN`] at a time: collected whole, a vault of about two million live blocks asked for one block of tens of MiB (40 bytes each), as the lazy open's walk did on ferros's Pro (2026-11-23, Photon's review of 7c614b7).
     pub fn walk_live_repair<A: BlockDev, B: BlockDev>(
         &mut self,
         mirror: &mut Mirror<A, B>,
         tract: &Tract,
-        out: &mut Vec<(u64, [u8; 32])>,
+        live: &mut crate::vault::LiveSet,
         stale: &mut Vec<StalePointer>,
         dangling: &mut Vec<DanglingPointer>,
     ) -> Result<()> {
         let root = self.root.clone();
+        let mut out = Vec::with_capacity(REPAIR_DRAIN);
         if let Some(Child::Committed { hash, lba }) = root {
             let mut visited = Visited::new(tract.len);
-            self.walk_child_repair(mirror, tract, lba, &hash, [0u8; 32], 0, &mut visited, out, stale, dangling)?;
+            self.walk_child_repair(mirror, tract, lba, &hash, [0u8; 32], 0, &mut visited, &mut out, live, stale, dangling)?;
+        }
+        for (lba, hp) in out.drain(..) {
+            live.insert(lba, hp);
         }
         Ok(())
     }
@@ -888,9 +896,15 @@ impl Hamt {
         depth: u8,
         visited: &mut Visited,
         out: &mut Vec<(u64, [u8; 32])>,
+        live: &mut crate::vault::LiveSet,
         stale: &mut Vec<StalePointer>,
         dangling: &mut Vec<DanglingPointer>,
     ) -> Result<()> {
+        if out.len() >= REPAIR_DRAIN {
+            for (lba, hp) in out.drain(..) {
+                live.insert(lba, hp);
+            }
+        }
         let doc = match read_doc(mirror, tract, lba, hash) {
             Ok(None) => {
                 stale.push(StalePointer { route, hash: *hash, lba });
@@ -929,7 +943,7 @@ impl Hamt {
                     if let Some(Child::Committed { hash, lba }) = c {
                         let (h, l) = (*hash, *lba);
                         let child_route = route_with_chunk(route, depth, slot as u8);
-                        self.walk_child_repair(mirror, tract, l, &h, child_route, depth + 1, visited, out, stale, dangling)?;
+                        self.walk_child_repair(mirror, tract, l, &h, child_route, depth + 1, visited, out, live, stale, dangling)?;
                     }
                 }
             }

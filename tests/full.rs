@@ -142,7 +142,7 @@ fn deletes_in_a_dense_full_vault() {
     }
 }
 
-/// A removal rewrites index and list values, puts like any other: with the put reserve waived (`Vault::set_put_reserve`) such a put lands in a full vault that refuses ordinary ones (ferros's Pro, 2026-11-23: the hold's remove deleted a still's body and then could not rewrite its card's page).
+/// A removal rewrites index and list values, puts like any other: with the put reserve waived (`Vault::waived`) such a put lands in a full vault that refuses ordinary ones (ferros's Pro, 2026-11-23: the hold's remove deleted a still's body and then could not rewrite its card's page).
 #[test]
 fn a_removal_writes_its_index_in_a_full_vault() {
     let max = 1u64 << 12;
@@ -160,14 +160,48 @@ fn a_removal_writes_its_index_in_a_full_vault() {
     }
     let page = [0xEEu8; 32];
     assert!(matches!(v.put(&page, &value(48 << 10, 1), 3), Err(Error::TractFull)), "an ordinary put is refused in the full vault");
-    v.set_put_reserve(false);
     let mut gone = [0u8; 32];
     gone[..4].copy_from_slice(&0u32.to_le_bytes());
-    assert!(v.delete(&gone, 3).unwrap());
-    v.put(&page, &value(48 << 10, 1), 3).expect("the removal's index put lands");
-    v.set_put_reserve(true);
+    v.waived(|v| -> manifestus::Result<()> {
+        assert!(v.delete(&gone, 3)?);
+        v.put(&page, &value(48 << 10, 1), 3)?;
+        Ok(())
+    })
+    .expect("the removal's index put lands");
     assert_eq!(v.get(&page).unwrap().unwrap(), value(48 << 10, 1));
     let mut other = [0xDDu8; 32];
     other[0] = 1;
     assert!(matches!(v.put(&other, &value(48 << 10, 2), 4), Err(Error::TractFull)), "held again, ordinary puts are refused again");
+}
+
+/// Photon's review of 164c30d: a removal that fails part way (an early `?` inside the waived scope) leaves the reserve held again, so the full vault refuses ordinary puts afterwards as before.
+#[test]
+fn a_failed_removal_holds_the_reserve_again() {
+    let max = 1u64 << 12;
+    let dev = || Fixed { blocks: vec![ZERO_BLOCK; 1 << 11], max };
+    let mut v = Vault::open(Mirror::new(dev(), dev()), 6, 1, DeletePolicy::UnlinkOnly).expect("vault");
+    let mut kept = 0u32;
+    loop {
+        let mut key = [0u8; 32];
+        key[..4].copy_from_slice(&kept.to_le_bytes());
+        if v.put(&key, &value(48 << 10, kept as u8), 2).is_err() {
+            break;
+        }
+        kept += 1;
+        assert!((kept as u64) < max, "a fixed device must fill");
+    }
+    let mut gone = [0u8; 32];
+    gone[..4].copy_from_slice(&1u32.to_le_bytes());
+    let r = v.waived(|v| -> manifestus::Result<()> {
+        assert!(v.delete(&gone, 3)?);
+        // Part way: the removal's next step fails and returns early.
+        Err(Error::Corrupt("a removal failing part way".into()))?;
+        unreachable!()
+    });
+    assert!(r.is_err());
+    // Nested scopes: the inner end leaves the outer one's waiver.
+    v.waived(|v| v.waived(|_| ()));
+    let mut other = [0xDDu8; 32];
+    other[0] = 2;
+    assert!(matches!(v.put(&other, &value(48 << 10, 3), 4), Err(Error::TractFull)), "the reserve is held again after the failed removal");
 }

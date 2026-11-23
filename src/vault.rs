@@ -579,14 +579,14 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             Some(report) => {
                 // A repair open walks everything (that one exists to find what is broken), in one go.
                 v.settling = None;
-                let mut live_blocks = Vec::new();
+                let mut live = LiveSet::default();
                 let mut stale = Vec::new();
                 let mut dangling = Vec::new();
                 {
                     let Self { ring, tract, hamt, .. } = &mut v;
-                    hamt.walk_live_repair(ring.mirror(), tract, &mut live_blocks, &mut stale, &mut dangling)?;
+                    hamt.walk_live_repair(ring.mirror(), tract, &mut live, &mut stale, &mut dangling)?;
                 }
-                v.finish_open(live_blocks, Vec::new(), stale, dangling, Some(report))?;
+                v.finish_open_live(live, stale, dangling, Some(report))?;
             }
         }
         Ok(v)
@@ -668,15 +668,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         Ok(())
     }
 
-    /// The open's tail, once the walk has found what is live: prune the stale and dangling pointers, build the live set, derive the reap and the fence, land a repair, probe for the wedge.
-    fn finish_open(&mut self, live_blocks: Vec<(u64, [u8; 32])>, referenced: Vec<u64>, stale: Vec<StalePointer>, dangling: Vec<DanglingPointer>, repair: Option<&mut RepairReport>) -> Result<()> {
-        let mut live = LiveSet::default();
-        let (mut live_blocks, mut referenced) = (live_blocks, referenced);
-        drain_into(&mut live, &mut live_blocks, &mut referenced);
-        self.finish_open_live(live, stale, dangling, repair)
-    }
-
-    /// `finish_open` with the live set already built (the lazy walk builds it step by step).
+    /// The open's tail (the live set built as each walk goes: the lazy one step by step, the repair one as it finds blocks), once the walk has found what is live: prune the stale and dangling pointers, build the live set, derive the reap and the fence, land a repair, probe for the wedge.
     fn finish_open_live(&mut self, live: LiveSet, stale: Vec<StalePointer>, dangling: Vec<DanglingPointer>, repair: Option<&mut RepairReport>) -> Result<()> {
         // Pre-fix vaults (and a crash between a delete's zero and its retiring commit) leave stale pointers at zeroed slots. They are time bombs: the reap retires the slot, the plow reuses it, and the pointer flips from "reads as deleted" to Seal-on-open. Unlink them now, in RAM — the next commit persists the pruned index; a session that never commits changes nothing.
         {
@@ -1051,9 +1043,18 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         self.commit(now)
     }
 
-    /// Hold (true, the default) or waive (false) the put reserve on a fixed device (`Tract::put_reserve`). A removal waives it while it writes the index pages and lists it must rewrite, and holds it again after: removals are what the reserve is kept for.
-    pub fn set_put_reserve(&mut self, held: bool) {
-        self.tract.reserve_waived = !held;
+    /// `f` run on `ctx` with the put reserve of the vault that `vault` reaches in it waived (`Tract::put_reserve`), and the reserve as it was before however `f` ends: an early return inside `f` cannot leave it waived, and a nested scope leaves it waived until the outermost one ends. A removal runs its writes (its index pages, its lists) in one: removals are what the reserve is kept for. `ctx` is whatever holds the vault (ferros_store's Store), so the scope covers the holder's own work between the vault's calls.
+    pub fn with_reserve_waived<C, R>(ctx: &mut C, vault: fn(&mut C) -> &mut Self, f: impl FnOnce(&mut C) -> R) -> R {
+        let was = vault(ctx).tract.reserve_waived;
+        vault(ctx).tract.reserve_waived = true;
+        let r = f(ctx);
+        vault(ctx).tract.reserve_waived = was;
+        r
+    }
+
+    /// [`Self::with_reserve_waived`] for a caller holding the vault itself.
+    pub fn waived<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        Self::with_reserve_waived(self, |v| v, f)
     }
 
     /// Whether the vault's devices are of a fixed size (ferros's windows and regions); a host file grows.
