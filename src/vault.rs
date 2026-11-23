@@ -251,6 +251,9 @@ pub struct RepairReport {
 /// Window size scales with the tract (len/64, floor 16) so huge values fragment into at most ~64 runs crossing a full lap — far under the extent leaf's capacity.
 const REAP_WINDOW_MIN: u64 = 1 << 4;
 
+/// Clean blocks every reap leaves for its retiring commit's index rewrite (the four always kept).
+const REAP_COMMIT_BLOCKS: u64 = 4;
+
 /// The idle-edge reclaim's window ceiling (1 MiB of blocks): small enough that an op arriving mid-step barely waits, large enough that a lap is a few hundred steps.
 const RECLAIM_WINDOW_MAX: u64 = 1 << 8;
 
@@ -298,6 +301,8 @@ pub struct Vault<A: BlockDev, B: BlockDev> {
     /// A reaped window awaiting its retiring commit: the cursor value the reap reached, held back from `tract.reap` until that commit's flush has landed.
     /// The window's originals are what the COMMITTED head still references, so counting them as clean before the retiring entry exists let the flush plow straight into them whenever the fence was waived (rescue) — the lap guard caught it, which is the confession Emma's phone logged as "LIVE-LAP AVERTED at lba 19" inside a 3.3 s commit, and the TractFull it raised sent the put into a full grow barrier (fuzz repro 2026-10-21).
     pending_reap: Option<u64>,
+    /// A paying reap (`reap_paying_window`) left less clean space than it found: no more of them until a removal lands (`apply_items`), so a live-dense vault never reaps its deletes' room away window by window (Photon's review of 06bafbc).
+    paying_stalled: bool,
     /// A lazy open's walk, still to finish ([`Vault::open_lazy`]); None once settled. Every write finishes it first.
     settling: Option<Box<Settling>>,
 }
@@ -401,6 +406,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             root: None,
             policy,
             pending_reap: None,
+            paying_stalled: false,
             settling: None,
         })
     }
@@ -503,6 +509,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             root: Some(root),
             policy,
             pending_reap: None,
+            paying_stalled: false,
             settling: None,
         })
     }
@@ -615,6 +622,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             root,
             policy,
             pending_reap: None,
+            paying_stalled: false,
             settling,
         })
     }
@@ -960,6 +968,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                         }
                     };
                     dirty |= existed;
+                    // A removal: dead blocks the paying reap may find worth it again.
+                    self.paying_stalled &= !existed;
                 }
             }
         }
@@ -974,6 +984,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             let Self { ring, tract, hamt, policy, .. } = self;
             hamt.delete(ring.mirror(), tract, key, *policy)?
         };
+        // A removal: dead blocks the paying reap may find worth it again.
+        self.paying_stalled &= !existed;
         if existed {
             self.commit(now)?;
             self.maybe_reap(now)?;
@@ -1033,14 +1045,56 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         self.commit(now)
     }
 
-    /// The clean blocks a reap leaves for its retiring commit's index rewrite. The deletes' room on a fixed device is the put reserve (`Tract::put_reserve`), which only values are held out of: a reap may go below it, since a reap after removals frees more than it stages, and that is how a full vault's space comes back.
-    fn reap_reserve(&mut self) -> u64 {
-        4
+    /// Whether the vault's devices are of a fixed size (ferros's windows and regions); a host file grows.
+    fn bounded(&self) -> bool {
+        self.ring.mirror_ref().max_blocks() != u64::MAX
+    }
+
+    /// The clean blocks a reap's survivors leave: the four its retiring commit's index rewrite was always kept, and on a fixed device the put reserve too (`Tract::put_reserve`), the deletes' room, which a reap may not spend (Photon's review of 06bafbc, and tests/full.rs `deletes_in_a_dense_full_vault`: the put ladder's reaps spent all of it and the first delete of a full vault failed). Once removals have spent it, only a window that pays may reap (`reap_paying_window`).
+    fn reap_reserve(&self) -> u64 {
+        if self.bounded() { REAP_COMMIT_BLOCKS + self.tract.put_reserve() } else { REAP_COMMIT_BLOCKS }
     }
 
     /// Whether this vault is on devices of a fixed size with more than three quarters of its tract live: reaping cannot pay its way there (each relocated survivor rewrites its index path, making about as much garbage as it frees: `reclaim_ahead`'s LiveHeavy), so the put ladder stops reaping and says full while the deletes' room is still clean.
-    fn bounded_live_heavy(&mut self) -> bool {
-        self.ring.mirror().max_blocks() != u64::MAX && (self.live.len() as u64) * 4 > self.tract.len * 3
+    fn bounded_live_heavy(&self) -> bool {
+        self.bounded() && (self.live.len() as u64) * 4 > self.tract.len * 3
+    }
+
+    /// One window at the reap that pays for itself, for a fixed device whose clean space removals have taken under the put reserve: the longest window from the reap whose survivors fit in the clean space less the retiring commit's blocks and whose dead blocks are at least half its survivors (what a window frees is its dead blocks; what it costs past the staging is the index rewritten for the survivors' owners, a leaf and its path an owner, well under half its survivors for values of more than a block; a window of few dead in many survivors is left). Reaped and committed: true; none such: false.
+    fn reap_paying_window(&mut self, now: i64) -> Result<bool> {
+        if self.pending_reap.is_some() {
+            self.commit(now)?;
+        }
+        let occupied = self.tract.plow - self.tract.reap;
+        let clean = self.tract.clean_blocks();
+        let mut best = 0u64;
+        let mut surv = 0u64;
+        for i in 0..self.reap_window().min(occupied) {
+            surv += self.live.is_referenced((self.tract.reap + i) % self.tract.len) as u64;
+            if surv + REAP_COMMIT_BLOCKS > clean {
+                break;
+            }
+            let dead = i + 1 - surv;
+            if dead > 0 && dead * 2 >= surv {
+                best = i + 1;
+            }
+        }
+        if best == 0 {
+            return Ok(false);
+        }
+        // The fence's room for the survivors, as reap_one_window_capped asks it.
+        if let Some(l) = self.tract.fence_limit {
+            if l.saturating_sub(self.tract.plow) < best + REAP_COMMIT_BLOCKS {
+                return Ok(false);
+            }
+        }
+        self.reap_staged(best)?;
+        self.commit(now)?;
+        // Judged by what it did: the index rewritten for the survivors' owners can outweigh the window's dead blocks, and no count before the reap says so exactly.
+        if self.tract.clean_blocks() < clean {
+            self.paying_stalled = true;
+        }
+        Ok(true)
     }
 
     /// A grow's length, held to what the devices can hold past the tract's base ([`Mirror::max_blocks`]): the asked length when it fits, else every block left, and TractFull when none is left (the vault is full: the caller frees space or refuses, and says so).
@@ -1048,7 +1102,8 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         // WHY: the base lies inside every device (the ring and the tract start there), so the subtraction holds; a device that says less than its base holds no tract room at all.
         let most = self.ring.mirror().max_blocks().saturating_sub(self.tract.base);
         let len = asked.min(most);
-        if len <= self.tract.len {
+        // A grow re-aligns the cursors so its clean space is exactly the blocks it adds (the old tract all awaits the reap): one that adds no more than is clean now loses room, so the vault is full (tests/full.rs `deletes_in_a_dense_full_vault`: a grow into a device's last 64 blocks turned 518 clean blocks into 64).
+        if len <= self.tract.len || len - self.tract.len <= self.tract.clean_blocks() {
             return Err(Error::TractFull);
         }
         Ok(len)
@@ -1172,10 +1227,12 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
     fn maybe_reap(&mut self, now: i64) -> Result<()> {
         let used = (self.tract.plow - self.tract.reap).min(self.tract.len);
         let dead = used.saturating_sub(self.live.len() as u64);
-        // On a fixed device, also while clean space is under the put reserve and anything is dead (2026-11-23): removals from a full vault spend that reserve on their index paths, and only the reap gives it back; left until the dead quarter, the reserve was gone first and no window could stage its survivors.
-        let short = self.ring.mirror().max_blocks() != u64::MAX && self.tract.clean_blocks() < self.tract.put_reserve() && dead > 0;
-        if dead << 2 > self.tract.len || short {
-            self.reap_one_window(now)?;
+        if dead << 2 > self.tract.len && self.reap_one_window(now)? {
+            return Ok(());
+        }
+        // On a fixed device, also while clean space is under the put reserve and anything is dead (2026-11-23): removals from a full vault spend that reserve on their index paths, and only the reap gives it back; left until the dead quarter, the reserve was gone first and no window could stage its survivors. Only a window that pays (`reap_paying_window`), so a live-dense vault never spends more of the reserve than it returns (Photon's review of 06bafbc).
+        if self.bounded() && !self.paying_stalled && self.tract.clean_blocks() < self.tract.put_reserve() && dead > 0 {
+            self.reap_paying_window(now)?;
         }
         Ok(())
     }

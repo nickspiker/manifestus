@@ -86,3 +86,58 @@ fn a_full_vault_says_full() {
         assert_eq!(v.get(&key_of(k)).unwrap().unwrap(), value(48 << 10, k as u8), "kept {k} reads after");
     }
 }
+
+/// Photon's review of 06bafbc: removals from a full, live-dense vault, several keys to a commit as ferros_store drops a value's pieces (64 to a commit), must never fail, the reap the shortage triggers must not spend the deletes' room faster than removals free it, and a vault so removed from has room again. Prints the clean space round by round.
+#[test]
+fn deletes_in_a_dense_full_vault() {
+    let max: u64 = std::env::var("DENSE_LOG2").map_or(1 << 14, |v| 1 << v.parse::<u32>().unwrap());
+    let dev = || Fixed { blocks: vec![ZERO_BLOCK; (max >> 1) as usize], max };
+    let mut v = Vault::open(Mirror::new(dev(), dev()), 6, 1, DeletePolicy::UnlinkOnly).expect("vault");
+    let key_of = |k: u32| {
+        let mut key = [0u8; 32];
+        key[..4].copy_from_slice(&k.to_le_bytes());
+        key
+    };
+    let mut kept = 0u32;
+    loop {
+        let r = v.put(&key_of(kept), &value(48 << 10, kept as u8), 2);
+        if r.is_err() {
+            break;
+        }
+        kept += 1;
+        assert!((kept as u64) < max, "a fixed device must fill");
+    }
+    let clean = |v: &mut Vault<Fixed, Fixed>| {
+        let st = v.engine_stats();
+        st.tract_blocks - (st.plow - st.reap)
+    };
+    let (live0, len) = (v.live_blocks() as u64, v.tract_blocks());
+    let floor = clean(&mut v);
+    eprintln!("dense: {kept} kept, live {live0} of {len} ({}%), clean {floor}", live0 * 100 / len);
+    let mut lowest = floor;
+    // Four keys a commit, spread over the tract, half of what was kept.
+    let mut round = 0i64;
+    let victims: Vec<u32> = (0..kept).filter(|k| k % 2 == 0).collect();
+    for four in victims.chunks(4) {
+        let keys: Vec<[u8; 32]> = four.iter().map(|&k| key_of(k)).collect();
+        let ops: Vec<(&[u8; 32], Option<&[u8]>)> = keys.iter().map(|k| (k, None)).collect();
+        v.apply_batch(&ops, 3 + round).unwrap_or_else(|e| panic!("removal round {round}: {e:?}"));
+        round += 1;
+        let c = clean(&mut v);
+        lowest = lowest.min(c);
+        eprintln!("dense: round {round}: clean {c}, live {}", v.live_blocks());
+    }
+    assert!(lowest > 0, "the deletes' room never runs out");
+    // Room again: values go in once the removals are reaped.
+    let mut room = 0;
+    for k in 0..16u32 {
+        if v.put(&key_of(1 << 20 | k), &value(48 << 10, 9), 9).is_ok() {
+            room += 1;
+        }
+    }
+    eprintln!("dense: lowest clean {lowest}, {room} of 16 new values kept");
+    assert!(room > 0, "room again after removals");
+    for k in (0..kept).filter(|k| k % 2 != 0).take(16) {
+        assert_eq!(v.get(&key_of(k)).unwrap().unwrap(), value(48 << 10, k as u8), "kept {k} reads after");
+    }
+}

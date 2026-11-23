@@ -295,6 +295,11 @@ impl<A: BlockDev, B: BlockDev> Ring<A, B> {
         self.head.as_ref().map(|(_, e)| e)
     }
 
+    /// The mirror, to look at (its devices' size).
+    pub fn mirror_ref(&self) -> &Mirror<A, B> {
+        &self.mirror
+    }
+
     pub fn mirror(&mut self) -> &mut Mirror<A, B> {
         &mut self.mirror
     }

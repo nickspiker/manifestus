@@ -91,11 +91,11 @@ impl Tract {
         self.len - (self.plow - self.reap)
     }
 
-    /// Clean blocks a value's own blocks (its furrows and leaf, a lone value) may never take: a sixty-fourth of the tract, the reap's window (ferros's Pro, 2026-11-23: a vault filled to its last block refused every write, its deletes too, since a delete's index path and the spine need room of their own). The index's flush, the spine, a delete and the reap's survivors may use it, so a full vault can always remove what it holds and reap the space back.
+    /// Clean blocks a value's own blocks (its furrows and leaf, a lone value) may never take on a device of a fixed size: a sixteenth of the tract (ferros's Pro, 2026-11-23: a vault filled to its last block refused every write, its deletes too). The index's flush, the spine, a delete and the reap's survivors may use it, so a full vault can always remove what it holds and reap the space back. A sixteenth, measured (tests/full.rs `deletes_in_a_dense_full_vault`, devices of 2^14 to 2^16 blocks): the reap that turns removals back into room walks the ring from its head, moving every live block between it and the freed ones, and each move rewrites index blocks of its owner; at a sixty-fourth the removals' own index paths and those moves ran the room out before the freed blocks were reached, at a sixteenth they never came near it.
     pub fn put_reserve(&self) -> u64 {
-        self.len >> 6
+        // WHY the floor (2^9 blocks, 2 MiB): the reap moves survivors in windows no larger than the clean space allows, and each window's commit rewrites a leaf and its index path for every owner it moves; under a few hundred blocks those rewrites cost as much as the window frees (the same test at 4096 blocks). Only fixed devices keep a reserve, and theirs are far larger (the vault process's tract about 2^21 blocks, the kernel's 2^16).
+        (self.len >> 4).max(1 << 9)
     }
-
 
     /// Append `blocks` contiguously at the plow (already sealed by the layer above).
     /// Returns the tract-relative lbas, in order — consecutive positions, wrapping at most once. Checks space, fence AND liveness BEFORE staging a byte: a refused append has no side effects. The blocks are staged in the mirror and reach the devices, verified, before the next spine write.
