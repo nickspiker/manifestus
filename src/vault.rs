@@ -312,8 +312,10 @@ struct Settling {
     todo: Vec<crate::hamt::WalkItem>,
     /// The positions the walk has reached across its steps: a second arrival at one is the refusal of LIB-05.
     visited: crate::hamt::Visited,
+    /// One step's finds, drained into `live` after each step: held whole to the walk's end, the positions alone (8 bytes each) asked for one 16 MiB block at about two million live blocks, which a fragmented heap could not give (ferros's Pro, 2026-11-23: its vault process died at every first write after a boot, 205 stills in the vault).
     live_blocks: Vec<(u64, [u8; 32])>,
     referenced: Vec<u64>,
+    live: LiveSet,
     stale: Vec<StalePointer>,
 }
 
@@ -613,7 +615,7 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         }
         let hamt = Hamt::from_root(head.hamt_hash, head.hamt_lba);
         // TREE-ONLY OPEN (2026-09-12): the ordinary open reads the INDEX — nodes and leaves — and marks each leaf's furrows and extent runs live by position without reading them. It used to read every data block of every value to take its seal hash (a full read of the vault: 6 s on a phone with a season of kept waves, growing with each one).
-        let settling = Some(Box::new(Settling { todo: hamt.walk_start(), visited: crate::hamt::Visited::new(tract.len), live_blocks: Vec::new(), referenced: Vec::new(), stale: Vec::new() }));
+        let settling = Some(Box::new(Settling { todo: hamt.walk_start(), visited: crate::hamt::Visited::new(tract.len), live_blocks: Vec::new(), referenced: Vec::new(), live: LiveSet::default(), stale: Vec::new() }));
         Ok(Self {
             ring,
             tract,
@@ -646,13 +648,14 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
                 self.settling = Some(s);
                 return Err(e);
             }
+            drain_into(&mut s.live, &mut s.live_blocks, &mut s.referenced);
             if !s.todo.is_empty() {
                 self.settling = Some(s);
                 return Ok(false);
             }
         }
-        let Settling { live_blocks, referenced, stale, .. } = *s;
-        self.finish_open(live_blocks, referenced, stale, Vec::new(), None)?;
+        let Settling { live, stale, .. } = *s;
+        self.finish_open_live(live, stale, Vec::new(), None)?;
         Ok(true)
     }
 
@@ -664,6 +667,14 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
 
     /// The open's tail, once the walk has found what is live: prune the stale and dangling pointers, build the live set, derive the reap and the fence, land a repair, probe for the wedge.
     fn finish_open(&mut self, live_blocks: Vec<(u64, [u8; 32])>, referenced: Vec<u64>, stale: Vec<StalePointer>, dangling: Vec<DanglingPointer>, repair: Option<&mut RepairReport>) -> Result<()> {
+        let mut live = LiveSet::default();
+        let (mut live_blocks, mut referenced) = (live_blocks, referenced);
+        drain_into(&mut live, &mut live_blocks, &mut referenced);
+        self.finish_open_live(live, stale, dangling, repair)
+    }
+
+    /// `finish_open` with the live set already built (the lazy walk builds it step by step).
+    fn finish_open_live(&mut self, live: LiveSet, stale: Vec<StalePointer>, dangling: Vec<DanglingPointer>, repair: Option<&mut RepairReport>) -> Result<()> {
         // Pre-fix vaults (and a crash between a delete's zero and its retiring commit) leave stale pointers at zeroed slots. They are time bombs: the reap retires the slot, the plow reuses it, and the pointer flips from "reads as deleted" to Seal-on-open. Unlink them now, in RAM — the next commit persists the pruned index; a session that never commits changes nothing.
         {
             let Self { ring, tract, hamt, .. } = &mut *self;
@@ -675,13 +686,6 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
             }
         }
         let pruned_any = !stale.is_empty() || !dangling.is_empty();
-        let mut live = LiveSet::default();
-        for (lba, hp) in live_blocks {
-            live.insert(lba, hp);
-        }
-        for lba in referenced {
-            live.mark_referenced(lba);
-        }
         // The reap is DERIVED, not trusted: the maximal monotone value whose clean region [plow, reap + len) is verifiably live-free right now. Works identically for legacy (pre-reap) vaults, whose mixed layout simply derives near-zero clean space — ordinary cleaning then migrates them, no format break.
         self.tract.reap = derive_reap(self.tract.plow, self.tract.len, &live);
         self.live = live;
@@ -1020,20 +1024,19 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
         self.pending_reap = None;
         // TREE-ONLY rewalk, the open's own (2026-09-12): nodes and leaves read and verified, furrows and extent runs marked live by position unread.
         // The full walk read and hashed every data block of the vault — most likely the bulk of the field's 3.3 s and 5.7 s single-chunk commits on a phone holding hundreds of MB of attachments (2026-10-21), a grow the put ladder ran inside the caller's commit.
-        let mut live_blocks = Vec::new();
-        let mut referenced = Vec::new();
-        let mut stale = Vec::new();
+        // Each step's finds drained into the live set as the walk goes (see `Settling`): never one vector of every live position.
+        let (mut live_blocks, mut referenced, mut stale) = (Vec::new(), Vec::new(), Vec::new());
+        let mut live = LiveSet::default();
         {
             let Self { ring, tract, hamt, .. } = self;
-            hamt.walk_tree_collect(ring.mirror(), tract, &mut live_blocks, &mut referenced, &mut stale)?;
+            let mut todo = hamt.walk_start();
+            let mut visited = crate::hamt::Visited::new(tract.len);
+            while !todo.is_empty() {
+                Hamt::walk_tree_step(ring.mirror(), tract, &mut todo, &mut visited, &mut live_blocks, &mut referenced, &mut stale)?;
+                drain_into(&mut live, &mut live_blocks, &mut referenced);
+            }
         }
-        self.live = LiveSet::default();
-        for (lba, hp) in live_blocks {
-            self.live.insert(lba, hp);
-        }
-        for lba in referenced {
-            self.live.mark_referenced(lba);
-        }
+        self.live = live;
 
         // Re-align the cursors so the CLEAN region is exactly the appended zeros and the OCCUPIED region is exactly the old tract: plow' ≡ old_len (appends start at the first new block), reap' = plow' − old_len (≡ 0 — the whole old region awaits the reap, which migrates its live blocks and retires its dead ones window by window).
         // Monotone order is preserved (plow' ≥ plow), so fence comparisons stay sound; pre-grow entries keep their smaller budgets until they age out of the K-window.
@@ -1504,6 +1507,16 @@ impl<A: BlockDev, B: BlockDev> Vault<A, B> {
 
 /// min over the window of each generation's fence budget (reap_i + tract_blocks_i):
 /// appends stay inside space that was already clean at every windowed generation, and clean space contains nothing those generations reference (Vault_CleanInvariant) — so the last K generations are fully restorable. Legacy entries without a reap contribute plow_i (zero budget) and age out over K generations.
+/// A walk step's finds into the live set, the vectors left empty for the next step.
+fn drain_into(live: &mut LiveSet, live_blocks: &mut Vec<(u64, [u8; 32])>, referenced: &mut Vec<u64>) {
+    for (lba, hp) in live_blocks.drain(..) {
+        live.insert(lba, hp);
+    }
+    for lba in referenced.drain(..) {
+        live.mark_referenced(lba);
+    }
+}
+
 fn fence_from(budgets_newest_first: &[u64]) -> Option<u64> {
     if budgets_newest_first.len() < FENCE_K as usize {
         return None; // genesis era: fewer than K generations exist
